@@ -1,0 +1,886 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ARES — P1 vertical slice</title>
+<link rel="icon" type="image/svg+xml" href="../phase0-probe/favicon.svg">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  /* ============================================================================
+     DESIGN TOKENS — 2026-07-14 re-theme.
+     Palette: greys, dark greys, offwhites, neutral paper tones. NO bright white,
+     NO black-black, NO cyan/purple "AI UI" accents, NO glow. ONE accent (muted
+     amber) carries selection/primary — same single-accent discipline as the
+     Blender/Lens-Studio/Apollo references.
+     Default = DARK (built from dark greys). Light mode = the same neutrals
+     inverted to paper. Text is HIGH contrast in both — never grey-on-grey.
+     ============================================================================ */
+  :root {
+    color-scheme: dark;
+    --bg:        #1b1d20;    /* app ground — dark grey, never #000 */
+    --bg-panel:  #26282c;
+    --bg-rail:   #1f2125;
+    --surface:   #2c2f34;    /* raised: inputs, unselected controls */
+    --surface-h: #373b41;    /* hover */
+    --border:    rgba(255,255,255,0.10);
+    --border-st: rgba(255,255,255,0.16);  /* stronger: inputs, segmented control */
+    --text:      #f0efe9;    /* offwhite, not #fff */
+    --text-mid:  #cbc9c2;
+    --text-dim:  #a9a7a0;    /* lifted from the old #9a988e — contrast law */
+    --text-faint:#8e8c85;    /* lifted from the old #78766f — was grey-on-grey */
+    --accent:    #d98a3a;    /* the ONE accent */
+    --accent-h:  #e59a4c;
+    --accent-ink:#1b1d20;    /* text on accent */
+    --warn: #d9a441; --good: #62b87f; --bad: #d98a8a;
+    --series-a: #d98a3a;     /* ARES (data series only) */
+    --series-b: #8a8f98;     /* Draco — neutral, distinguishable by lightness not hue */
+    /* Density: padding 2-6px, never 16-24px. */
+    --pad-1: 2px; --pad-2: 4px; --pad-3: 6px;
+    /* ONE uniform control size for tools/buttons (owner: "1 uniform button size"). */
+    --ctl:   24px;           /* rail buttons, inputs, chips */
+    --ctl-lg: 30px;          /* transport / header */
+    --r: 4px;                /* restrained radius — pro tools aren't pill-shaped */
+    /* Height of the bottom transport + timeline dock. The side rails and the crop ruler stop at it
+       rather than running underneath, so the docks tile the frame instead of overlapping.
+       Drag-resized live by main.js (persisted in localStorage["ares.tl.h"]). */
+    --tl-h: 76px;
+    /* diagnostics.js pins its own 22px status bar to bottom:0 at z-index 40 — the timeline dock has
+       to sit ON TOP of that band, not under it. Keep in sync with diagnostics.js. */
+    --diag-h: 22px;
+  }
+  :root[data-theme="light"], :root.light {
+    color-scheme: light;
+    --bg:        #e9e7e2;    /* paper, not bright white */
+    --bg-panel:  #f3f1ed;
+    --bg-rail:   #eceae5;
+    --surface:   #fbfaf7;
+    --surface-h: #e4e1da;
+    --border:    rgba(0,0,0,0.13);
+    --border-st: rgba(0,0,0,0.22);
+    --text:      #212327;    /* high contrast on paper */
+    --text-mid:  #474a50;
+    --text-dim:  #61646a;
+    --text-faint:#787b81;
+    --accent:    #c2762a;
+    --accent-h:  #ad6822;
+    --accent-ink:#fbfaf7;
+    --warn: #a8721c; --good: #2f7d4f; --bad: #a84a4a;
+    --series-a: #c2762a; --series-b: #6c7078;
+  }
+  /* NO prefers-color-scheme auto-switch: the design law is DEFAULT DARK, with light as an
+     explicit opt-in (◐ in the header, persisted in localStorage["ares.theme"]). Letting the OS
+     decide would hand a light-mode machine the light theme by default, which contradicts it. */
+  * { box-sizing: border-box; }
+  html, body { margin: 0; height: 100%; overflow: hidden; background: var(--bg); color: var(--text);
+    font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif; }
+  /* Uniform control primitive — every rail button/input/chip is exactly --ctl tall (owner's
+     "1 uniform button size"). Icon buttons are square. Applied via .u (see rail markup). */
+  .u { height: var(--ctl); min-width: var(--ctl); padding: 0 7px; font: 600 11.5px system-ui;
+    color: var(--text); background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--r); cursor: pointer; display: inline-flex; align-items: center;
+    justify-content: center; gap: 4px; white-space: nowrap; }
+  .u:hover { background: var(--surface-h); }
+  .u:disabled { opacity: .38; cursor: default; }
+  .u.ico { padding: 0; width: var(--ctl); font-size: 13px; font-variant-emoji: text; }
+  .u[aria-pressed="true"], .u.on { background: var(--accent); border-color: var(--accent);
+    color: var(--accent-ink); }
+  .u.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  .u.primary:hover { background: var(--accent-h); }
+  /* Segmented control (reference shot's MESH|WIRED|X-RAY): one bordered group, no gaps. */
+  .seg { display: inline-flex; border: 1px solid var(--border-st); border-radius: var(--r); overflow: hidden; }
+  .seg > button { height: var(--ctl); padding: 0 8px; font: 600 11px system-ui; color: var(--text-dim);
+    background: transparent; border: 0; border-left: 1px solid var(--border); cursor: pointer;
+    display: inline-flex; align-items: center; gap: 4px; }
+  .seg > button:first-child { border-left: 0; }
+  .seg > button:hover { color: var(--text); background: var(--surface-h); }
+  .seg > button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
+  /* Rail field row: label left, control/value right (reference shot's spec rows). */
+  .row { display: flex; align-items: center; gap: 5px; min-height: var(--ctl); }
+  .row > .k { flex: 1; min-width: 0; font-size: 11px; color: var(--text-dim);
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .row > .v { font: 600 11px ui-monospace, monospace; color: var(--text); }
+  .inp { height: var(--ctl); min-width: 0; padding: 0 6px; background: var(--surface);
+    border: 1px solid var(--border-st); border-radius: var(--r); color: var(--text);
+    font: 11px ui-monospace, monospace; }
+  .inp:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
+  /* Tool cluster: uniform controls packed on one line, wrapping only when they must. */
+  .ctlGrid { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+  .ctlGrid input[type="range"] { flex: 1; min-width: 48px; height: var(--ctl); }
+  /* One accent for every slider in the rails — no stray browser-default blue/lavender. */
+  .rail input[type="range"] { accent-color: var(--accent); height: var(--ctl); }
+  #view { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
+  #view:active { cursor: grabbing; }
+  .panel { position: fixed; background: var(--bg-panel); backdrop-filter: blur(8px);
+    border: 1px solid var(--border); border-radius: 9px; }
+  /* tab bar */
+  /* The ONE header bar: tabs + viewport shading. */
+  #tabs { top: 10px; left: 50%; transform: translateX(-50%); padding: var(--pad-1) var(--pad-2);
+    display: flex; gap: 3px; align-items: center; z-index: 20; }
+  #tabs button[role="tab"] { height: var(--ctl-lg); font: 600 12px system-ui; color: var(--text-mid);
+    background: transparent; border: 1px solid transparent; border-radius: var(--r);
+    padding: 0 10px; cursor: pointer; }
+  #tabs button[role="tab"]:hover { color: var(--text); background: var(--surface-h); }
+  #tabs button[role="tab"][aria-selected="true"] { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
+  .hdrSep { width: 1px; align-self: stretch; margin: 3px 5px; background: var(--border-st); flex: none; }
+  #shadeSeg > button { height: var(--ctl-lg); min-width: 30px; font-size: 14px; }
+  #projSeg > button, #gridSeg > button { height: var(--ctl-lg); min-width: 30px; font-size: 14px; }
+  /* Grid increment picker rides INSIDE the grid segmented control — one control, one border. */
+  #gridSeg > select { height: var(--ctl-lg); border: 0; border-left: 1px solid var(--border);
+    background: transparent; color: var(--text-mid); font: 600 10.5px ui-monospace, monospace;
+    padding: 0 2px 0 4px; cursor: pointer; }
+  #gridSeg > select:hover { color: var(--text); background: var(--surface-h); }
+  #gridSeg > select:disabled { opacity: .4; }
+  .gridRead { font: 600 10.5px ui-monospace, monospace; color: var(--text-faint);
+    min-width: 42px; text-align: center; white-space: nowrap; }
+
+  /* ---- Slim edge rails (Viewer): #hud (left, readouts) + #editPanel (right, edit tools). Both
+     dock full-height below the tab bar, drag-resize from their inner edge, and one-click collapse
+     to a ~30px icon strip. No cards, no rounded chrome — a docked rail reads as part of the frame,
+     not a floating panel; that alone kills most of the "card" look the owner is rejecting. */
+  .rail { position: fixed; top: 52px; bottom: calc(var(--tl-h) + var(--diag-h)); z-index: 10; display: flex; flex-direction: column;
+    background: var(--bg-rail); backdrop-filter: blur(8px); border-radius: 0; }
+  .rail.dragging { user-select: none; }
+  .rail .railHandle { position: absolute; top: 0; bottom: 0; width: 7px; cursor: ew-resize; z-index: 2; }
+  .rail .railHandle:hover { background: rgba(127,216,240,.2); }
+  .rail.collapsed .railHandle { display: none; }
+  .rail .railHead { display: flex; align-items: center; gap: 6px; flex: none; min-height: 26px;
+    padding: var(--pad-3) var(--pad-3); border-bottom: 1px solid rgba(255,255,255,.08); }
+  .rail.collapsed .railHead { flex-direction: column; height: 100%; border-bottom: 0; cursor: pointer; padding-top: 8px; }
+  .rail .railChevron { flex: none; background: none; border: 0; color: var(--text-dim); cursor: pointer;
+    font-size: 12px; padding: 3px 4px; line-height: 1; border-radius: 4px; }
+  .rail .railChevron:hover { color: var(--text); background: rgba(255,255,255,.06); }
+  .rail .railTitle { font-size: 11px; font-weight: 700; color: var(--text-dim); text-transform: uppercase;
+    letter-spacing: .5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .rail.collapsed .railTitle { display: none; }
+  .rail .railBody { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; padding: var(--pad-3); min-width: 0; }
+  .rail.collapsed .railBody { display: none; }
+  .rail.collapsed { width: 30px !important; }
+  #hud.rail { left: 0; border-right: 1px solid var(--border); }
+  #hud.rail .railHandle { right: -4px; }
+  #editPanel.rail { right: 0; border-left: 1px solid var(--border); }
+  #editPanel.rail .railHandle { left: -4px; }
+  /* collapsed HUD strip: live fps + delivered-size readout, not just a label — collapsing must not
+     hide the two numbers the owner glances at most. */
+  #hud .railMini { display: none; flex-direction: column; align-items: center; gap: 10px; margin-top: 10px;
+    font: 11px ui-monospace, "Cascadia Code", monospace; text-align: center; }
+  #hud.collapsed .railMini { display: flex; }
+  #hud .railMini b { display: block; font-weight: 600; }
+  #hud .railMini .fps { color: var(--accent); }
+  #hud .railMini .mb { color: var(--text); }
+  #hud .sub { color: var(--text-dim); font-size: 11.5px; margin: 0 0 8px; }
+  #hud details.notes { margin-top: 8px; }
+  #hud details.notes summary { cursor: pointer; color: var(--text-dim); font-size: 10px; text-transform: uppercase;
+    letter-spacing: .4px; padding: 3px 0; list-style: none; }
+  #hud details.notes summary::-webkit-details-marker { display: none; }
+  #hud details.notes summary::before { content: "▸ "; color: var(--text-faint); }
+  #hud details[open].notes summary::before { content: "▾ "; }
+  /* editPanel sections: slim header rows with a ▸/▾ twist — the compact-collapsible unit the
+     design law asks for, so five tool groups (Crop/Tools/Ranges/SAM/Bake) cost one line each closed. */
+  .railSec { margin-bottom: 2px; }
+  .railSec + .railSec { border-top: 1px solid rgba(255,255,255,.06); padding-top: 2px; }
+  .railSec .secHead { display: flex; align-items: center; gap: 5px; padding: 5px 2px; cursor: pointer;
+    user-select: none; font-size: 11.5px; font-weight: 600; color: #c3c2b7; }
+  .railSec .secHead:hover { color: var(--text); }
+  .railSec .secHead .tw { display: inline-block; width: 9px; font-size: 9px; color: var(--text-faint);
+    transition: transform .1s; flex: none; }
+  .railSec.collapsed .secHead .tw { transform: rotate(-90deg); }
+  .railSec .secHead small { margin-left: auto; font-weight: 400; color: var(--text-faint); font-size: 10px; }
+  /* undo/redo: two tiny icon buttons riding in the Ranges section header, after the <small> label —
+     they need their own disabled dimming (.railChevron has none; it's normally always-clickable). */
+  .railChevron:disabled { opacity: .35; cursor: default; }
+  .railSec .secBody { padding: 2px 2px 8px 13px; }
+  .railSec.collapsed .secBody { display: none; }
+  .good { color: var(--good); }
+  .warn { color: var(--warn); }
+  /* ---- Media rail: toolbar (sort · layout · favorites · edit) + library (list or 2-wide icon grid,
+     grouped into collapsible folders) on top; condensed readouts pinned at the bottom; full compare
+     table folded into a <details>. Slim, no chrome, accent = active clip, amber = favorite. ---- */
+  #hudBody { display: flex; flex-direction: column; padding: 0; overflow: hidden; }
+  .mediaHead { display: flex; align-items: center; gap: 3px; padding: 5px 5px 4px; flex: none; border-bottom: 1px solid rgba(255,255,255,.05); }
+  .mediaHead .sp { flex: 1; }
+  .mediaHead .libsort { font: 600 10.5px system-ui; color: var(--text-mid); background: rgba(255,255,255,.05);
+    border: 1px solid var(--border); border-radius: 5px; padding: 2px 4px; cursor: pointer; }
+  .libbtn { background: none; border: 1px solid transparent; color: var(--text-faint); cursor: pointer;
+    font-size: 12px; line-height: 1; padding: 3px 5px; border-radius: 5px; min-width: 22px; }
+  .libbtn:hover { color: var(--text); background: rgba(255,255,255,.07); }
+  .mediaHead .libbtn.on { color: var(--text); background: rgba(127,216,240,.14); border-color: var(--accent); }
+  /* Rich hover detail popover for a library item (full provenance + timestamps). */
+  #clipDetail { position: fixed; z-index: 40; max-width: 300px; background: #17181c; border: 1px solid rgba(255,255,255,.13);
+    border-radius: 6px; padding: 7px 9px; font: 11px/1.5 system-ui; color: var(--text); box-shadow: 0 6px 20px rgba(0,0,0,.55); pointer-events: none; }
+  #clipDetail .cdttl { font-weight: 700; font-size: 12px; }
+  #clipDetail .cdsub { color: var(--text-mid); font-size: 10px; margin-bottom: 5px; word-break: break-all; }
+  #clipDetail .cdrow { display: flex; justify-content: space-between; gap: 14px; }
+  #clipDetail .cdk { color: var(--text-mid); white-space: nowrap; }
+  #clipDetail .cdv { color: var(--text); text-align: right; word-break: break-word; }
+  .mediaList { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; min-height: 46px; padding: 3px; container-type: inline-size; }
+  .libEmpty { color: var(--text-faint); font-size: 11px; text-align: center; padding: 14px 6px; }
+  .mediaItems.list { display: flex; flex-direction: column; gap: 1px; }
+  .mediaItems.grid { display: grid; grid-template-columns: 1fr; gap: 5px; padding: 2px; }
+  @container (min-width: 176px) { .mediaItems.grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }  /* max 2 wide, 1 if narrow */
+  /* favorite star (list + grid) */
+  .star { flex: none; background: none; border: 0; cursor: pointer; font-size: 12px; line-height: 1; padding: 2px; color: var(--text-faint); }
+  .star:hover, .star.on { color: var(--warn); }
+  /* list row */
+  .mrow { display: flex; align-items: center; gap: 1px; border-radius: 4px; }
+  .mrow > button.clip { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; text-align: left;
+    font: 600 12px system-ui; color: var(--text-mid); background: none; border: 0; border-left: 2px solid transparent;
+    padding: 4px 6px; cursor: pointer; }
+  .mrow > button.clip .lab { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .mrow > button.clip .sz { color: var(--text-faint); font-weight: 400; font-size: 10px; margin-left: auto; padding-left: 8px; }
+  .mrow > button.clip:hover { color: var(--text); background: rgba(255,255,255,.05); }
+  .mrow > button.clip[aria-pressed="true"] { color: var(--text); border-left-color: var(--accent); background: rgba(127,216,240,.10); }
+  /* grid card */
+  .gcard { display: flex; flex-direction: column; gap: 2px; border-radius: 6px; padding: 2px; }
+  .gcard.active { background: rgba(127,216,240,.10); outline: 1px solid var(--accent); }
+  .gthumb { position: relative; aspect-ratio: 4 / 3; background: #14161b; border-radius: 5px; overflow: hidden; cursor: pointer; border: 1px solid var(--border); }
+  .gthumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
+  .gthumb .ph { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center;
+    font: 700 22px system-ui; color: var(--text-faint); background: linear-gradient(160deg, #1c1f26, #14161b); }
+  .gthumb .star { position: absolute; top: 2px; right: 2px; background: rgba(0,0,0,.4); border-radius: 4px; }
+  .glab { font: 600 11px system-ui; color: var(--text-mid); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; padding: 0 2px; }
+  .gcard.active .glab { color: var(--text); }
+  .gsz { font-size: 9.5px; color: var(--text-faint); padding: 0 2px; }
+  /* edit-mode per-item controls */
+  .mctl { display: flex; align-items: center; gap: 1px; flex-wrap: wrap; }
+  .mediaItems.grid .mctl { padding: 0 2px 2px; }
+  .mctl .fsel { font: 10px system-ui; color: var(--text-mid); background: rgba(0,0,0,.3); border: 1px solid var(--border);
+    border-radius: 4px; padding: 1px 2px; max-width: 76px; cursor: pointer; }
+  .mctl .libbtn { padding: 2px 3px; font-size: 11px; min-width: 0; }
+  .renameIn { flex: 1 1 auto; min-width: 0; width: 100%; box-sizing: border-box; font: 600 12px system-ui; color: var(--text);
+    background: rgba(0,0,0,.35); border: 1px solid var(--accent); border-radius: 4px; padding: 3px 5px; }
+  /* folder group header (collapsible) */
+  .folderHd { display: flex; align-items: center; gap: 4px; padding: 5px 4px 3px; margin-top: 3px; cursor: pointer;
+    color: var(--text-dim); border-top: 1px solid rgba(255,255,255,.05); }
+  .folderHd:hover { color: var(--text); }
+  .folderHd .tw { font-size: 9px; color: var(--text-faint); transition: transform .12s; }
+  .folderHd.collapsed .tw { transform: rotate(-90deg); }
+  .folderHd .fn { font: 700 10.5px system-ui; text-transform: uppercase; letter-spacing: .4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .folderHd .fc { color: var(--text-faint); font-size: 10px; }
+  .folderHd .fx { margin-left: auto; color: #e58a8a; padding: 1px 4px; }
+  /* dangling entry: the .ares was deleted from disk but is still in the library */
+  .mrow.missing, .gcard.missing { opacity: .5; }
+  .mrow.missing .sz, .gcard.missing .gsz { color: var(--warn); }
+  /* orientation gizmo (top-right of the viewport; gizmo.js reposisions it left of the Edit rail) */
+  #axisGizmo { position: fixed; top: 58px; right: 12px; z-index: 6; overflow: visible; }
+  #axisGizmo text { user-select: none; }
+  #axisGizmo g:hover circle { stroke: var(--text); stroke-width: 1.5; }
+  /* condensed readouts: exactly one line each, dim key + bright value, never wrap */
+  .mediaReadouts { flex: none; border-top: 1px solid var(--border); padding: 5px 7px 6px; background: rgba(0,0,0,.16); }
+  .mediaReadouts #title { font-size: 11px; margin: 0 0 4px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .mediaReadouts .rl { display: flex; justify-content: space-between; gap: 8px; font: 11px ui-monospace, monospace;
+    line-height: 1.55; white-space: nowrap; overflow: hidden; }
+  .mediaReadouts .rl .k { color: var(--text-faint); flex: none; }
+  .mediaReadouts .rl .v { color: var(--text); overflow: hidden; text-overflow: ellipsis; text-align: right; }
+  .mediaReadouts .rl .v b { color: var(--accent); }
+  .mediaReadouts .rlBtn { background: none; border: 0; color: var(--text-faint); cursor: pointer; padding: 0 2px; font-size: 11px; }
+  .mediaReadouts .rlBtn:hover { color: var(--accent); }
+  #hudDetails { margin-top: 5px; border-top: 1px solid rgba(255,255,255,.07); padding-top: 3px; }
+  #hudDetails > summary { font-size: 10px; color: var(--text-faint); cursor: pointer; list-style: none; padding: 2px 0; }
+  #hudDetails[open] > summary { color: var(--text-dim); }
+  /* comparison table: metric | ARES | Draco-GLB seq — compact monospace-numeral rows in the HUD rail */
+  table.cmp { width: 100%; border-collapse: collapse; font-size: 11.5px; }
+  table.cmp th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: .3px;
+    color: var(--text-dim); font-weight: 600; padding: 0 0 4px; border-bottom: 1px solid rgba(255,255,255,0.1); }
+  table.cmp th.ares { color: var(--accent); }
+  table.cmp th.draco { color: var(--accent-2); }
+  table.cmp td { padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.05); vertical-align: baseline; }
+  table.cmp td.metric { color: var(--text-dim); width: 36%; }
+  table.cmp td.ares { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
+  table.cmp td.draco { color: var(--text-mid); font-variant-numeric: tabular-nums; width: 32%; }
+  table.cmp td small { color: var(--text-faint); font-weight: 400; }
+  #cmp { font-size: 11.5px; color: #c3c2b7; }
+  #cmp b { color: var(--text); }
+  /* size-comparison bars (Viewer HUD) */
+  .sizebars { margin-top: 7px; padding-top: 6px; border-top: 1px solid rgba(255,255,255,0.08); }
+  .sizebars .cap { font-size: 10px; text-transform: uppercase; letter-spacing: .3px; color: var(--text-dim); margin-bottom: 5px; }
+  .bar { display: grid; grid-template-columns: 80px 1fr auto; gap: 5px; align-items: center; margin: 3px 0; font-size: 11px; }
+  .bar .name { color: var(--text-mid); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .bar .track { height: 8px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; }
+  .bar .fill { height: 100%; border-radius: 4px; }
+  .bar .val { color: var(--text); font-variant-numeric: tabular-nums; font-weight: 600; min-width: 50px; text-align: right; }
+  /* source switcher */
+  /* (the old horizontal #sources bar was folded into the left Media rail — see .mediaList above) */
+  /* ---- Bottom dock: transport row + the NLE timeline strip. Full width, flush to the bottom edge,
+     no card and no floating pill — an editor's timeline is part of the frame. ---- */
+  #controls { position: fixed; left: 0; right: 0; bottom: var(--diag-h); height: var(--tl-h); z-index: 12;
+    display: flex; flex-direction: column; background: var(--bg-rail);
+    border-top: 1px solid var(--border); }
+  #tlResize { position: absolute; top: -3px; left: 0; right: 0; height: 7px; cursor: ns-resize; z-index: 3; }
+  #tlResize:hover { background: rgba(217,138,58,.25); }
+  #tlHead { display: flex; align-items: center; gap: 4px; padding: var(--pad-2) var(--pad-3) var(--pad-1);
+    flex: none; }
+  #tlHead .sp { flex: 1; }
+  #time { font: 12px ui-monospace, "Cascadia Code", monospace; font-variant-numeric: tabular-nums;
+    color: var(--text-dim); white-space: nowrap; padding-left: var(--pad-2); }
+  #trimRead { font: 11px ui-monospace, monospace; color: var(--text-dim); min-width: 30px;
+    white-space: nowrap; }
+  #trimRead.on { color: var(--accent); }
+  /* The strip itself. #tlRuler / #tlLanes / #tlPlayhead / the trim layer are written into here by
+     renderRanges(); they all position as % of THIS box, which is why they can never desync. */
+  #rangeTrack { position: relative; flex: 1 1 auto; min-height: 0; margin: 0 var(--pad-3) var(--pad-2);
+    overflow-x: hidden; overflow-y: auto; }
+  /* Trimmed-off head/tail: dimmed, exactly like the crop shade dims what a crop throws away. Same
+     idea, same honesty — if it's dimmed, a bake really drops it. */
+  .tlCut { position: absolute; top: 0; bottom: 0; background: rgba(12,13,15,.66); z-index: 2;
+    pointer-events: none; }
+  :root[data-theme="light"] .tlCut { background: rgba(190,187,180,.66); }
+  .tlTrimH { position: absolute; top: 0; bottom: 0; width: 9px; z-index: 4; cursor: ew-resize;
+    touch-action: none; display: flex; align-items: flex-start; justify-content: center; }
+  .tlTrimH i { width: 3px; height: 100%; background: var(--accent); opacity: .85; display: block; }
+  .tlTrimH:hover i, .tlTrimH.drag i { opacity: 1; }
+  .tlTrimH.in { margin-left: -3px; }
+  .tlTrimH.out { margin-left: -6px; }
+  .tlTrimH b { position: absolute; top: 0; font: 700 9px ui-monospace, monospace;
+    color: var(--accent-ink); background: var(--accent); padding: 0 3px; border-radius: 2px;
+    opacity: 0; white-space: nowrap; pointer-events: none; }
+  .tlTrimH.in b { left: 4px; } .tlTrimH.out b { right: 4px; }
+  .tlTrimH:hover b, .tlTrimH.drag b { opacity: 1; }
+  #err { top: 64px; right: 16px; max-width: 340px; padding: 10px 12px; display: none; color: var(--bad); z-index: 30; }
+  /* hint line: centered above the transport bar — the edge rails now own the left/right margins,
+     so bottom-corner placement would sit UNDER them. No card, no background, just a caption. */
+  /* Shortcut help = one unobtrusive ? beside the transport; the list is in its tooltip. */
+  #hint { position: fixed; bottom: calc(var(--tl-h) + var(--diag-h) + 8px); right: 10px; z-index: 11;
+    color: var(--text-dim); font-weight: 700; }
+  a { color: var(--accent); }
+  /* ---- Crop rulers + guides (like rulers in Photoshop / After Effects, not sliders in the tool
+     panel). Flat 1px accent lines — no glow, no card. */
+  #cropOverlay { position: fixed; inset: 0; z-index: 3; pointer-events: none;
+    font: 9px ui-monospace, ui-monospace, monospace; }
+  .cropRuler { position: absolute; background: var(--bg-rail); color: var(--text-faint); overflow: hidden; }
+  .cropRuler.h { height: 13px; border-bottom: 1px solid var(--border); }
+  .cropRuler.v { width: 13px; border-right: 1px solid var(--border); }
+  .cropRuler i { position: absolute; background: var(--text-faint); }        /* tick */
+  .cropRuler s { position: absolute; text-decoration: none; color: var(--text-dim); white-space: nowrap; }
+  .cropRuler em { position: absolute; font-style: normal; font-weight: 700; color: var(--accent);
+    background: var(--bg-rail); padding: 0 2px; }                            /* axis letter */
+  /* Guide = a fat invisible grab strip with a 1px line in it: easy to hit, thin to look at. */
+  .cropGuide { position: absolute; pointer-events: auto; touch-action: none; }
+  .cropGuide.gv { top: 0; bottom: 0; width: 11px; margin-left: -5px; cursor: ew-resize; }
+  .cropGuide.gh { left: 0; right: 0; height: 11px; margin-top: -5px; cursor: ns-resize; }
+  .cropGuide i { position: absolute; background: var(--accent); opacity: .7; }
+  .cropGuide.gv i { left: 5px; top: 0; bottom: 0; width: 1px; }
+  .cropGuide.gh i { top: 5px; left: 0; right: 0; height: 1px; }
+  .cropGuide:hover i, .cropGuide.drag i { opacity: 1; }
+  .cropGuide b { position: absolute; font: 600 9px ui-monospace, monospace; color: var(--accent-ink);
+    background: var(--accent); padding: 0 3px; border-radius: 2px; opacity: 0; white-space: nowrap; }
+  .cropGuide.gv b { top: 50%; left: 8px; transform: translateY(-50%); }
+  .cropGuide.gh b { left: 50%; top: 8px; transform: translateX(-50%); }
+  .cropGuide:hover b, .cropGuide.drag b { opacity: 1; }
+  /* Off-axis: the line is only a handle, not the cut (an axis plane projects to a line ONLY
+     edge-on). Dashed + faded says "approximate" without a paragraph explaining it. */
+  .cropGuide.off i { opacity: .45; }
+  .cropGuide.off.gv i { width: 0; border-left: 1px dashed var(--accent); }
+  .cropGuide.off.gh i { height: 0; border-top: 1px dashed var(--accent); }
+  .cropRuler em.off { color: var(--text-dim); }
+  /* What the crop throws away, dimmed. A 50% wash over a near-black viewport was invisible —
+     it has to actually read against var(--bg), so grey it toward the panel tone and desaturate. */
+  #cropShade div { position: absolute; background: rgba(38,40,44,.82); }
+  :root[data-theme="light"] #cropShade div { background: rgba(228,225,217,.82); }
+  /* Crop = ONE row: [⌗][⭯] then the three axis chips. The old layout gave each axis its own
+     full-width row with the value flushed right, so "X ————————— full" was mostly empty rail. The
+     chips are packed left, wrap only if the rail is dragged genuinely narrow, and the depth axis
+     (the one pointing into the screen, which you can't drag) is greyed rather than explained. */
+  /* Transform rows: three tight numeric fields (x/y/z) that share the row with their label. */
+  .inp.xf3 { flex: 1; min-width: 0; width: 0; text-align: right; }
+  #upSeg > button, #ctrSeg > button { min-width: 22px; padding: 0 5px; }
+  #xfRead { font: 10px ui-monospace, monospace; color: var(--text-faint); }
+  .cropRow { display: flex; align-items: center; gap: 3px; flex-wrap: wrap; }
+  #cropRead { display: flex; align-items: center; gap: 3px; flex: 1; min-width: 0; flex-wrap: wrap; }
+  #cropRead .cr { display: flex; align-items: baseline; gap: 2px; padding: 0 3px; border-radius: 3px;
+    background: rgba(255,255,255,.045); font: 10px ui-monospace, monospace; line-height: 16px; }
+  #cropRead .cr u { text-decoration: none; font-weight: 700; color: var(--accent); }
+  #cropRead .cr span { color: var(--text-dim); }
+  #cropRead .cr.depth u, #cropRead .cr.depth span { color: var(--text-faint); }
+  #cropRead .cr.set { background: rgba(217,138,58,.16); }
+  #cropRead .cr.set span { color: var(--text); }
+
+  /* tool panels (Compare / Convert / Settings) — full overlay above the canvas.
+     div.tool, NOT .tool: the editor's tool BUTTONS also carry class "tool", and the bare class
+     selector's display:none silently hid the whole tool row (Nav/Box/Brush/SAM). */
+  div.tool { position: fixed; inset: 60px 0 0 0; z-index: 15; overflow: auto; padding: 16px 16px 24px;
+    background: rgba(8,9,13,0.72); backdrop-filter: blur(4px); display: none; }
+  div.tool.active { display: block; }
+  .tool .wrap { max-width: 860px; margin: 0 auto; }
+  .tool h2 { margin: 4px 0 4px; font-size: 18px; }
+  .tool .lead { color: var(--text-dim); font-size: 13px; margin: 0 0 14px; }
+  /* display:block is load-bearing: a label is inline by default, and an inline element with
+     block children fragments its dashed border into stray segments. */
+  .drop { display: block; border: 1.5px dashed rgba(255,255,255,0.18); border-radius: 10px; padding: 20px 16px;
+    text-align: center; background: rgba(255,255,255,0.02); transition: border-color .15s, background .15s; cursor: pointer; }
+  .drop.over { border-color: var(--accent); background: rgba(127,216,240,0.08); }
+  .drop .big { font-size: 15px; color: var(--text); margin-bottom: 5px; }
+  .drop .small { font-size: 12px; color: var(--text-faint); }
+  .drop input { display: none; }
+  .card { margin-top: 10px; padding: 10px 12px; background: rgba(18,20,26,0.9);
+    border: 1px solid rgba(255,255,255,0.09); border-radius: 9px; }
+  .card h3 { margin: 0 0 8px; font-size: 14px; }
+  .kv { display: grid; grid-template-columns: 168px 1fr; gap: 5px 14px; font-size: 12.5px; }
+  .kv .k { color: var(--text-dim); } .kv .v { color: var(--text); font-variant-numeric: tabular-nums; }
+  .split { display: flex; height: 26px; border-radius: 6px; overflow: hidden; margin: 10px 0 4px; }
+  .split > div { display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 600; color: var(--accent-ink); }
+  .note { font-size: 12px; color: var(--text-dim); margin-top: 8px; }
+  .btn { font: 600 13px system-ui; color: var(--accent-ink); background: var(--accent); border: 0; border-radius: 7px;
+    padding: 7px 12px; cursor: pointer; margin-top: 10px; }
+  .btn:disabled { opacity: .4; cursor: default; }
+  .btn.ghost { color: var(--text); background: rgba(255,255,255,0.07); }
+  .prog { height: 8px; background: rgba(255,255,255,0.08); border-radius: 4px; overflow: hidden; margin-top: 10px; display: none; }
+  .prog > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
+  .badge { display: inline-block; font-size: 10.5px; font-weight: 600; padding: 2px 7px; border-radius: 5px;
+    background: rgba(127,216,240,0.15); color: var(--accent); margin-left: 6px; }
+  .badge.warn { background: rgba(224,169,74,0.15); color: var(--warn); }
+  .cvsel { padding: 6px 8px; background: rgba(0,0,0,.3); border: 1px solid rgba(255,255,255,.14);
+    border-radius: 6px; color: var(--text); font: 12px system-ui; margin-right: 4px; }
+  /* history rows (Convert tab — includes "inspect"-kind probe entries) */
+  .hrow { display: flex; gap: 10px; align-items: center; padding: 6px 8px; margin: 0 -8px; border-radius: 7px; font-size: 12px; }
+  .hrow:hover { background: rgba(255,255,255,.045); }
+  .hrow .chip { font-size: 9.5px; font-weight: 700; padding: 2px 7px; border-radius: 5px; flex: none;
+    text-transform: uppercase; letter-spacing: .5px; min-width: 62px; text-align: center; }
+  .hrow .nm { color: var(--text); font-weight: 600; flex: none; max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .hrow .pth { color: var(--text-faint); font: 11px ui-monospace, monospace; flex: 1; min-width: 40px;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
+  .hrow .mt { color: var(--text-dim); font-size: 11px; flex: none; }
+  .hrow .dt { color: var(--text-faint); font-size: 11px; flex: none; font-variant-numeric: tabular-nums; }
+  .hrow .act { display: flex; gap: 4px; flex: none; }
+  .hrow .act button { font: 600 11px system-ui; color: #b6b4a9; background: rgba(255,255,255,.06);
+    border: 1px solid rgba(255,255,255,.1); border-radius: 6px; padding: 3px 9px; cursor: pointer; }
+  .hrow .act button:hover { color: var(--text); border-color: rgba(255,255,255,.25); }
+  /* settings tab: dependency rows */
+  .dep { display: grid; grid-template-columns: 14px 250px 1fr auto; gap: 6px 12px; align-items: baseline;
+    padding: 8px; margin: 0 -8px; border-radius: 7px; }
+  .dep:hover { background: rgba(255,255,255,.03); }
+  .dep + .dep { border-top: 1px solid rgba(255,255,255,.05); }
+  .dep .dot { width: 8px; height: 8px; border-radius: 50%; align-self: center; }
+  .dep .lbl { color: var(--text); font-weight: 600; font-size: 13px; }
+  .dep .en { color: var(--text-dim); font-size: 12px; }
+  .dep .pth { grid-column: 2 / 4; color: var(--text-faint); font: 10.5px ui-monospace, monospace;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  .dep .note2 { grid-column: 2 / 4; color: var(--text-dim); font-size: 11.5px; }
+  .dep .side { grid-row: 1 / 3; grid-column: 4; display: flex; flex-direction: column; gap: 5px; align-items: flex-end; align-self: center; }
+  .dep .size { color: var(--text-faint); font-size: 11px; font-variant-numeric: tabular-nums; }
+  .seclbl { font-size: 10.5px; text-transform: uppercase; letter-spacing: .4px; color: var(--text-dim); margin-bottom: 6px; }
+  button.toggle[aria-pressed="false"] { opacity: .45; }
+  button.toggle[aria-pressed="true"] { border-color: var(--accent) !important; }
+  /* Compare stage — wipe mode: canvases stacked & pixel-aligned; B clipped by the divider. */
+  #cmpStage { --wipe: 50%; height: calc(100vh - 210px); min-height: 320px; }
+  #cmpStage.wipe { position: relative; }
+  #cmpStage.wipe canvas { position: absolute; inset: 0; width: 100%; height: 100%;
+    background: var(--bg); border-radius: 10px; touch-action: none; }
+  #cmpStage.wipe #cmpCanvasA { cursor: grab; }
+  #cmpStage.wipe #cmpCanvasB { pointer-events: none; clip-path: inset(0 0 0 var(--wipe)); }
+  #cmpStage.wipe #wipeHandle { display: block; }
+  #wipeHandle { position: absolute; top: 0; bottom: 0; left: var(--wipe); width: 0; cursor: ew-resize; z-index: 5; }
+  #wipeHandle::before { content: ""; position: absolute; top: 0; bottom: 0; left: -1px; width: 2px;
+    background: var(--accent); box-shadow: 0 0 8px rgba(127,216,240,.6); }
+  #wipeHandle .grip { position: absolute; top: 50%; left: 0; transform: translate(-50%, -50%);
+    width: 34px; height: 34px; border-radius: 50%; background: var(--accent); color: var(--accent-ink);
+    display: flex; align-items: center; justify-content: center; font: 700 15px system-ui; user-select: none; }
+  #wipeHandle { padding: 0 14px; margin-left: -14px; } /* fat hit area */
+  /* split mode: classic side-by-side */
+  #cmpStage.split { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; position: static; }
+  #cmpStage.split canvas { position: static; width: 100%; height: 100%; background: var(--bg);
+    border-radius: 10px; touch-action: none; clip-path: none; }
+  #cmpStage.split #cmpCanvasA { cursor: grab; }
+  #cmpStage.split #cmpCanvasB { pointer-events: none; }
+  #cmpStage.split #wipeHandle { display: none; }
+  code { font: 12px ui-monospace, "Cascadia Code", monospace; color: var(--series-b); }
+</style>
+
+<canvas id="view"></canvas>
+
+<div class="panel" id="tabs" role="tablist">
+  <button role="tab" data-tab="viewer" aria-selected="true" title="3D playback viewport — orbit, scrub, and edit the volumetric clip">Viewer</button>
+  <button role="tab" data-tab="compare" aria-selected="false" title="A/B two clips side-by-side at the same frame — check a re-bake against the original">Compare</button>
+  <button role="tab" data-tab="convert" aria-selected="false" title="import a capture folder (OBJ/PLY + atlas) and encode it into a .ares clip">Convert</button>
+  <button role="tab" data-tab="settings" aria-selected="false" title="models, tools, and downloads">⚙</button>
+  <button role="tab" data-tab="compute" aria-selected="false" title="RunPod compute — launch, watch, run experiments">☁</button>
+  <!-- Viewport shading lives in the ONE header bar (owner ask #15). Segmented = mutually
+       exclusive, like the reference shot's MESH|WIRED|X-RAY. Icons carry it; the tooltip
+       carries the explanation (never inline prose). -->
+  <span class="hdrSep viewer-only"></span>
+  <div class="seg viewer-only" id="shadeSeg" role="group" aria-label="viewport shading">
+    <button data-shade="shaded" aria-pressed="true" title="Shaded — the baked texture on the mesh, lit. The delivery look: judge colour, seams and texture sharpness here. Z cycles shading, W toggles wireframe.">◍</button>
+    <button data-shade="clay" aria-pressed="false" title="Untextured clay — same lighting, texture off, so you judge FORM alone: dents, melts and wrong-surface snaps the texture hides. Z cycles shading.">◑</button>
+    <button data-shade="wire" aria-pressed="false" title="Wireframe — triangle edges only. Read topology + density, and spot stretched/torn edges across a coherent run. W toggles it, Z cycles shading.">▦</button>
+  </div>
+  <span class="hdrSep"></span>
+  <!-- Projection. Perspective is for looking, ortho is for measuring: it kills the wide-angle
+       distortion and makes axis-aligned crop planes read as exact straight lines. Glyphs say it
+       without words — a trapezoid converges, a rectangle doesn't. -->
+  <div class="seg viewer-only" id="projSeg" role="group" aria-label="camera projection">
+    <button data-proj="persp" aria-pressed="true" title="Perspective (P) — how a real lens sees: far things shrink, parallel edges converge. Natural for judging a capture, but it bends straight edges toward the frame corners.">⏢</button>
+    <button data-proj="ortho" aria-pressed="false" title="Orthographic (P) — no perspective divide, no wide-angle fisheye: parallel edges stay parallel and scale is constant everywhere. Use it to crop and to judge alignment — it's the only projection where an axis-aligned crop plane is an exact straight line.">▭</button>
+  </div>
+  <span class="hdrSep viewer-only"></span>
+  <!-- Ground grid. NOT an edit tool — it is a viewport REFERENCE, so it lives in the header beside
+       shading/projection and is ON by default. The increment select carries its own units, and the
+       readout beside it says the cell size actually being drawn (which "auto" changes as you zoom). -->
+  <div class="seg viewer-only" id="gridSeg" role="group" aria-label="ground grid">
+    <button id="gridToggle" aria-pressed="true" title="Ground grid + origin axes (G) — the floor plane and the 0,0,0 tripod. It extends forever and fades into the distance, so you can always read where the ground is, which way the capture faces, and whether it actually stands on the floor instead of hovering.">⊞</button>
+    <select id="gridStep" title="Grid cell size. Auto resizes the cells to the zoom, so the floor stays readable whether you are looking at a whole room or a fingertip; the finer lines cross-fade as you pull out. Pick a fixed increment to measure against a known size instead. The readout to the right always shows the cell you are actually seeing."></select>
+  </div>
+  <span class="gridRead viewer-only" id="gridRead" title="the grid cell size currently on screen, in real-world units">—</span>
+  <span class="hdrSep"></span>
+  <button id="themeBtn" class="u ico" style="height:var(--ctl-lg);width:var(--ctl-lg);font-size:13px" title="Light / dark theme. Dark is the default; your choice is remembered on this machine.">◐</button>
+</div>
+<script>
+  // Theme: DARK by default (design law), light is opt-in and remembered. Applied inline before
+  // paint so a light-mode reload never flashes dark first.
+  (function () {
+    var t = localStorage.getItem("ares.theme");
+    if (t === "light" || t === "dark") document.documentElement.setAttribute("data-theme", t);
+    addEventListener("DOMContentLoaded", function () {
+      var b = document.getElementById("themeBtn");
+      if (!b) return;
+      b.onclick = function () {
+        var now = document.documentElement.getAttribute("data-theme") === "light" ? "dark" : "light";
+        document.documentElement.setAttribute("data-theme", now);
+        localStorage.setItem("ares.theme", now);
+      };
+    });
+  })();
+</script>
+
+<!-- Viewer tab: left readout rail. Collapsed = fps + delivered MB only; expanded = metric table +
+     size-comparison bars; the long prose moves into <details> so it stops eating space. -->
+<div class="panel viewer-only rail" id="hud">
+  <div class="railHandle" id="hudHandle"></div>
+  <div class="railHead">
+    <button id="hudCollapse" class="railChevron" title="collapse — click the strip to expand">‹</button>
+    <span class="railTitle">Media</span>
+    <div class="railMini" id="hudMini"><b class="fps" id="hudMiniFps">--</b><b class="mb" id="hudMiniMB">--</b></div>
+  </div>
+  <!-- Media rail: library/store (all clips) on top, condensed 1-line readouts for the loaded clip
+       pinned at the bottom, full comparison table tucked in a collapsed <details> below. -->
+  <div class="railBody" id="hudBody">
+    <div class="mediaHead" id="mediaHead"></div>
+    <div id="mediaList" class="mediaList"></div>
+    <div id="mediaReadouts" class="mediaReadouts">
+      <p class="sub" id="title">loading .ares…</p>
+      <div id="readoutLines"></div>
+      <details class="notes" id="hudDetails"><summary>compare vs Draco / 4DViews</summary>
+        <table class="cmp">
+          <thead><tr><th>Metric</th><th class="ares" title="this .ares clip, measured live">ARES</th><th class="draco" title="Draco-GLB per-frame sequence, measured">Draco</th></tr></thead>
+          <tbody id="cmpBody"></tbody>
+        </table>
+        <div id="sizebars" class="sizebars" hidden><div class="cap">Delivered size · same 272f capture (4DViews est.)</div><div id="barsBody"></div></div>
+        <div id="cmp"></div>
+      </details>
+    </div>
+  </div>
+</div>
+
+<!-- Transport + NLE timeline: a full-width dock across the bottom, the way every video editor puts
+     it. Replaces the old centered pill with a plain <input type=range> scrubber. The strip itself
+     (ruler + range lanes + playhead + clip trim) is rendered by main.js renderRanges() into
+     #rangeTrack, which used to be buried in the Edit rail — same code, finally in the right place.
+     Drag the top edge to resize; the rails stop above it via --tl-h. -->
+<div class="viewer-only" id="controls">
+  <div id="tlResize" title="drag to resize the timeline"></div>
+  <div id="tlHead">
+    <button id="play" class="u ico" style="height:var(--ctl-lg);width:var(--ctl-lg);font-size:15px" title="play / pause — Space">⏸</button>
+    <button id="loopMode" class="u ico" style="height:var(--ctl-lg);width:var(--ctl-lg);font-size:15px" title="at the clip end: Loop / Ping-pong / Once — click to cycle">⟳</button>
+    <button id="orbit" class="u ico toggle" style="height:var(--ctl-lg);width:var(--ctl-lg);font-size:15px" title="auto-orbit on/off — O (disabled while the view is locked)">◍</button>
+    <span id="time">0/0 · 0.00s</span>
+    <span id="lockTag" style="display:none;font-size:10px;font-weight:600;color:var(--warn)" title="view locked — rotation &amp; auto-orbit disabled; scrub, zoom, pan, and selection tools still work. Press L (or the Lock-view button in Edit → Tools) to release.">🔒 view locked</span>
+    <span class="sp"></span>
+    <!-- Clip trim. The two brackets ARE the in/out points; everything outside them is dimmed on the
+         strip, playback loops between them, and a Bake encodes only that window (encoder
+         --trim-in/--trim-out) — so the dimmed frames are really gone, not just hidden. -->
+    <button id="trimIn" class="u ico" title="Set the clip IN point at the playhead ( [ ) — everything before it is trimmed off: dimmed on the strip, skipped by playback, and dropped by a bake. Drag the bracket on the strip to adjust it.">⇥</button>
+    <button id="trimOut" class="u ico" title="Set the clip OUT point at the playhead ( ] ) — everything after it is trimmed off: dimmed on the strip, skipped by playback, and dropped by a bake. Drag the bracket on the strip to adjust it.">⇤</button>
+    <button id="trimReset" class="u ico" title="Clear the trim — the whole clip plays and bakes again. Nothing was destroyed; a trim only chooses which frames survive the next bake.">⭯</button>
+    <span id="trimRead" title="the trimmed clip: surviving frames and duration">full</span>
+  </div>
+  <div id="rangeTrack"></div>
+</div>
+
+<!-- Mesh editor rail: docks right, full height, drag-resizable + one-click collapse. Sections
+     (Crop/Tools/Ranges/SAM/Bake) are slim collapsible rows — no cards, 2-6px padding throughout.
+     It is ALWAYS present on the Viewer tab: the rail IS the editor, so a separate Edit button that
+     conjured it was a second front door to the same room. Collapse it with its own ‹ chevron (or E)
+     like the Media rail — that is the one affordance, and it persists. -->
+<div class="panel viewer-only rail" id="editPanel">
+  <div class="railHandle" id="railHandle"></div>
+  <div class="railHead">
+    <button id="railCollapse" class="railChevron" title="collapse — click the strip to expand">›</button>
+    <span class="railTitle">Edit</span>
+  </div>
+  <div class="railBody" id="railBody">
+    <!-- Every section below is ICONS + uniform .u controls; ALL explanation lives in title=
+         tooltips (owner: no paragraphs of prose inside the rail — mouse-over explains). -->
+    <!-- Crop is authored in the VIEWPORT (rulers + guides), not in here. The rail keeps ONE row:
+         the two buttons and a per-axis readout, packed on a single line. Six sliders for a spatial
+         task was the thing the owner called terrible design; three label/value rows spread across
+         the rail's full width was the same mistake in a smaller font. -->
+    <section class="railSec" data-sec="crop">
+      <div class="secHead"><span class="tw">▾</span>Crop<small>guides</small></div>
+      <div class="secBody">
+        <div class="cropRow">
+          <button id="cropGuidesToggle" class="u ico" aria-pressed="false" title="Crop rulers &amp; guides (R) — rulers along the top and left edges read the two axes currently facing you. The four guide lines ARE the crop planes: drag one to move that plane. The third axis points into the screen and can't be dragged from here — orbit (or press 1/3/7) to bring it round.">⌗</button>
+          <button id="cropReset" class="u ico" title="Reset the crop — clears all six planes and shows the full captured volume again. Nothing is destroyed by cropping; it only trims what you see and what a bake would keep.">⭯</button>
+          <div id="cropRead"></div>
+        </div>
+      </div>
+    </section>
+    <!-- Transform: the import-time orientation fix. Live preview here == what a Bake writes into the
+         geometry (encoder --up-axis/--center/--scale/--rotate/--translate, same core evaluator).
+         Unity hotkeys: W move · E rotate · R scale · F focus. -->
+    <section class="railSec" data-sec="xform">
+      <div class="secHead" title="Orient an imported capture: which way is up, where the origin sits, and what units it's in. Captures don't agree — a Microsoft/SVF export is Y-up millimetres, most scanner/DCC exports are Z-up, a 4DViews bake is metres. The preview here is exactly what a Bake writes into the geometry.">
+        <span class="tw">▾</span>Transform<small>W/E/R</small>
+      </div>
+      <div class="secBody">
+        <div class="row">
+          <span class="k" title="Which axis of the SOURCE capture points up. It gets rotated so that axis becomes +Y (the runtime's up). Proper rotations only — never a mirror, which would flip the model and reverse any text on it.">up</span>
+          <div class="seg" id="upSeg" role="group" aria-label="source up axis">
+            <button data-up="x" title="The source's +X is up.">X</button>
+            <button data-up="y" aria-pressed="true" title="The source's +Y is up — Microsoft/SVF exports and anything already upright.">Y</button>
+            <button data-up="z" title="The source's +Z is up — most scanner and DCC exports.">Z</button>
+          </div>
+        </div>
+        <div class="row">
+          <span class="k" title="Where the model's origin lands after the up-axis fix. Computed once over the WHOLE clip, never per frame — per-frame centring would re-centre the subject every frame and a walk would moonwalk in place.">origin</span>
+          <div class="seg" id="ctrSeg" role="group" aria-label="centring">
+            <button data-ctr="bottom" title="Stand it on the ground: centred in X/Z with its lowest point exactly on y=0, on the grid. This is the right default for an import — the ground plane is the one reference every capture shares — and it's what a bake uses as soon as any transform is set.">⊥</button>
+            <button data-ctr="mass" title="Centre through the middle: the bounding box's centre goes to the origin.">✛</button>
+            <button data-ctr="none" aria-pressed="true" title="Leave the source coordinates exactly where they are. The resting state, so loading a clip never silently moves it.">∅</button>
+          </div>
+        </div>
+        <div class="row">
+          <span class="k" title="Uniform scale. 0.001 takes a millimetre capture to metres.">scale</span>
+          <input id="xfScale" class="inp" type="number" step="0.001" value="1" style="width:66px">
+          <button id="xfMm2M" class="u" title="Set scale to 0.001 — millimetres to metres. The daniel/Microsoft captures are mm (a person is ~1700 units tall); 4DViews bakes are already metres.">mm→m</button>
+        </div>
+        <div class="row">
+          <span class="k" title="Extra rotation in degrees, applied after the up-axis fix. E arms the rotate tool; the ±90 buttons step a quarter turn.">rot°</span>
+          <input id="xfRotX" class="inp xf3" type="number" step="1" value="0" title="rotation about X, degrees">
+          <input id="xfRotY" class="inp xf3" type="number" step="1" value="0" title="rotation about Y, degrees">
+          <input id="xfRotZ" class="inp xf3" type="number" step="1" value="0" title="rotation about Z, degrees">
+        </div>
+        <div class="row">
+          <span class="k" title="Nudge, in world units, applied AFTER centring.">move</span>
+          <input id="xfPosX" class="inp xf3" type="number" step="1" value="0" title="translate X, world units">
+          <input id="xfPosY" class="inp xf3" type="number" step="1" value="0" title="translate Y, world units">
+          <input id="xfPosZ" class="inp xf3" type="number" step="1" value="0" title="translate Z, world units">
+        </div>
+        <div class="ctlGrid" style="margin-top:4px">
+          <button class="u ico xtool" data-xtool="move" aria-pressed="false" title="Move (W) — drag in the viewport to translate the model. Hold X / Y / Z to constrain to one axis; Shift for fine steps.">✥</button>
+          <button class="u ico xtool" data-xtool="rotate" aria-pressed="false" title="Rotate (E) — drag in the viewport to rotate the model. Hold X / Y / Z to constrain to one axis; Shift for fine steps.">⟲</button>
+          <button class="u ico xtool" data-xtool="scale" aria-pressed="false" title="Scale (R) — drag in the viewport to scale the model uniformly. Shift for fine steps.">⤢</button>
+          <span style="width:1px;height:16px;background:var(--border-st);margin:0 2px"></span>
+          <button id="xfFocus" class="u ico" title="Focus (F) — frame the subject: point the camera at the model's bounds and pull back to fit.">◎</button>
+          <button id="xfReset" class="u ico" title="Reset the transform — back to the capture's own raw coordinates.">⭯</button>
+        </div>
+        <div class="row" style="margin-top:2px">
+          <span class="k" id="xfRead" title="the clip's size and floor height as the viewer currently sees it, with the transform applied">—</span>
+        </div>
+      </div>
+    </section>
+    <section class="railSec" data-sec="tools">
+      <div class="secHead"><span class="tw">▾</span>Tools</div>
+      <div class="secBody">
+        <!-- The ground grid used to sit here. It is not a tool — it is a viewport reference, like
+             shading and projection — so it moved to the header bar and is on by default. -->
+        <div class="ctlGrid">
+          <button id="xray" class="u ico" aria-pressed="false" title="X-ray (X) — Blender-style: selections cut THROUGH the mesh, hitting back-facing surfaces too. Off = only what you can actually see is selected. Turn on to delete something inside or behind the body.">◫</button>
+          <button id="viewLock" class="u ico" aria-pressed="false" title="Lock view (L) — freezes rotation and auto-orbit so you can scrub the whole timeline and select/delete from one exact angle without the camera drifting. Middle-drag pan and wheel zoom still work.">🔒</button>
+        </div>
+        <div class="ctlGrid" style="margin-top:4px">
+          <button class="u ico tool" data-tool="nav" aria-pressed="true" title="Navigate (V) — camera only, no selection. Esc returns here from any tool.">✥</button>
+          <button class="u ico tool" data-tool="sbox" aria-pressed="false" title="Box select (M) — drag a screen-space rectangle to mark geometry for deletion, keyframed at the current frame. Pair with X-ray to cut through the body.">▢</button>
+          <button class="u ico tool" data-tool="brush" aria-pressed="false" title="Brush (B) — paint directly on the surface to mark geometry for deletion. Radius slider sits beside it (mm).">✎</button>
+          <button class="u ico tool" data-tool="sam" aria-pressed="false" title="SAM select (S) — click an object and the segmentation model selects the whole thing. Shift-click excludes a region. Commit it below as Delete / Recolor / Copy; the Del key always commits as a delete.">✂</button>
+          <input id="brushR" type="range" min="5" max="150" value="35" title="Brush radius in millimetres — how wide a patch each stroke marks.">
+        </div>
+      </div>
+    </section>
+    <section class="railSec" data-sec="ranges">
+      <div class="secHead" title="Edits that span time. Click a row to make it ▶ active; Delete/Backspace removes the active row (not while typing) — but with a pending SAM selection those keys commit it as a delete instead. Ctrl+S saves immediately.">
+        <span class="tw">▾</span>Ranges<small>over time</small>
+        <button id="undoBtn" class="railChevron" style="margin-left:auto" disabled title="Undo the last edit — Ctrl+Z">↶</button>
+        <button id="redoBtn" class="railChevron" disabled title="Redo — Ctrl+Shift+Z or Ctrl+Y">↷</button>
+      </div>
+      <div class="secBody">
+        <div class="ctlGrid">
+          <button id="rangeStart" class="u" title="Start a range at the current frame — the edit applies from here onward. Then shape the selection (it auto-keyframes here), scrub elsewhere and reshape to add keyframes, and press End to close it. The range tweens between keyframes.">⬤</button>
+          <button id="rangeKey" class="u" disabled title="Add a keyframe at the current frame so the edit's shape can change across the range. The shape interpolates between neighbouring keyframes.">◆</button>
+          <button id="rangeEnd" class="u" disabled title="End the range at the current frame — closes the open range so it applies only up to here.">■</button>
+        </div>
+        <!-- The range STRIP lives in the bottom timeline dock now (#rangeTrack, see #controls) —
+             time belongs on the timeline, not in a 270px-wide side rail. This section keeps the
+             per-range rows, whose payload controls are not time-shaped. -->
+        <div id="rangeList" style="margin-top:4px"></div>
+      </div>
+    </section>
+    <section class="railSec" data-sec="sam">
+      <div class="secHead" title="Click-to-select via the local SAM segmentation service. Multi-frame: each commit keyframes the mask at the current frame — scrub elsewhere, re-run SAM and commit again to add another keyframe; the range tweens between them. Text prompts segment by description instead of a click.">
+        <span class="tw">▾</span>SAM<small>local service</small>
+      </div>
+      <div class="secBody">
+        <div style="display:flex;gap:6px;align-items:center">
+          <span id="samDot" style="width:7px;height:7px;border-radius:50%;background:#5a5852;flex:none;transition:background .3s"></span>
+          <button id="samStart" class="u" title="Start the local SAM segmentation service. Click-to-select and text prompts both need it running; it loads the model on a background thread and reports below.">Start</button>
+          <span id="samStatus" style="font:10px ui-monospace,monospace;color:var(--text-dim)">checking…</span>
+        </div>
+        <div id="samTextRow" style="display:flex;gap:5px;align-items:center;margin-top:6px">
+          <input id="samTextInput" type="text" placeholder="describe an object…" disabled maxlength="200"
+            style="flex:1;min-width:0;padding:4px 6px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:5px;color:var(--text);font-size:11px" title="text/concept prompt — Enter to segment (SAM tool) — Esc clears">
+          <button id="samTextGo" class="u" disabled title="Segment by text description (Enter). Captures the current view and asks the concept model for every matching instance.">Go</button>
+        </div>
+        <div id="samTextHint" style="display:none;margin-top:3px;font:10px ui-monospace,monospace;color:var(--text-faint)"></div>
+        <div id="samTextChips" style="display:none;gap:4px;flex-wrap:wrap;margin-top:5px"></div>
+        <div id="samSelRow" style="display:none;margin-top:6px;align-items:center;gap:5px;flex-wrap:wrap">
+          <span id="samSelInfo" style="flex:1;min-width:90px;font:10px ui-monospace,monospace;color:var(--text-dim)"></span>
+          <select id="samActSel" style="padding:3px 4px;margin:0;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:4px;color:var(--text);font-size:10.5px" title="the action the commit button below performs on this selection">
+            <option value="delete">Delete</option>
+            <option value="recolor">Recolor…</option>
+            <option value="copy">Copy…</option>
+          </select>
+          <button id="samApply" class="u primary" title="Commit this selection as the action chosen beside it, keyframed at the current frame. The Del key always commits as a delete.">Commit</button>
+          <button id="samClear" class="u" title="Discard the pending SAM selection and start over (Esc).">Clear</button>
+        </div>
+      </div>
+    </section>
+    <section class="railSec" data-sec="bake">
+      <div class="secHead"><span class="tw">▾</span>Bake to .ares</div>
+      <div class="secBody">
+        <div style="display:flex;gap:5px;align-items:center;margin-bottom:5px">
+          <input id="bakePath" placeholder="source frames folder — click 📁" style="flex:1;min-width:0;padding:4px 6px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:5px;color:var(--text);font:10.5px ui-monospace,monospace">
+          <button id="bakePick" class="u ico" title="Choose the source frames folder with a native dialog — the path fills itself in.">📁</button>
+        </div>
+        <div style="display:flex;gap:5px;align-items:center">
+          <input id="bakeName" value="daniel-crop" style="flex:1;padding:4px 6px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:5px;color:var(--text);font:11px system-ui"><span style="color:var(--text-faint);font-size:10px">.ares</span>
+          <button id="bakeGo" class="u primary" title="Encode the picked capture folder into a .ares clip, applying the edit ranges above. Progress streams below.">Bake</button>
+        </div>
+        <div id="bakeLog" style="font:10px ui-monospace,monospace;color:var(--text-dim);margin-top:6px;max-height:80px;overflow:auto;white-space:pre-wrap"></div>
+      </div>
+    </section>
+  </div>
+</div>
+
+<!-- Compare tab: one shared clock drives BOTH players (exact frame lock). Wipe = stacked canvases
+     with a draggable divider (A left of it, B right); Split = classic side-by-side. -->
+<div class="tool" id="tab-compare">
+  <div class="wrap" style="max-width:1500px">
+    <div id="cmpBar" style="display:flex;gap:10px;justify-content:center;align-items:center;margin:2px 0 12px;flex-wrap:wrap">
+      <select id="cmpA" class="cvsel"></select>
+      <span style="color:var(--text-faint);font-size:12px">vs</span>
+      <select id="cmpB" class="cvsel"></select>
+      <button id="cmpPlay" class="btn" style="margin:0;padding:7px 14px" title="play / pause both clips together — Space">Pause</button>
+      <button id="cmpOrbit" class="btn ghost toggle" style="margin:0;padding:7px 14px" title="auto-orbit both clips in sync so you compare from the same angle">Orbit</button>
+      <button id="cmpMode" class="btn ghost" style="margin:0;padding:7px 14px" title="switch between split-screen and overlaid A/B — click to cycle">Split view</button>
+      <!-- Same shading modes as the Viewer, driving BOTH players in lockstep — an A/B is only fair
+           if both sides are shaded identically (owner ask: Compare needs these too). -->
+      <div class="seg" id="cmpShadeSeg" role="group" aria-label="viewport shading (both clips)">
+        <button data-shade="shaded" aria-pressed="true" title="Shaded — the baked texture, lit. Judge colour, seams and texture sharpness. Applies to BOTH clips.">◍</button>
+        <button data-shade="clay" aria-pressed="false" title="Untextured clay — texture off, same lighting, so you judge FORM alone: dents, melts and wrong-surface snaps the texture hides. Applies to BOTH clips.">◑</button>
+        <button data-shade="wire" aria-pressed="false" title="Wireframe — triangle edges only. Compare topology and spot stretched/torn edges. Applies to BOTH clips.">▦</button>
+      </div>
+      <input type="range" id="cmpScrub" min="0" max="1000" value="0" style="width:220px;accent-color:var(--accent)">
+      <span id="cmpTime" style="color:var(--text-dim);font-size:12px;font-variant-numeric:tabular-nums;min-width:74px"></span>
+    </div>
+    <div id="cmpStage" class="wipe">
+      <canvas id="cmpCanvasA"></canvas>
+      <canvas id="cmpCanvasB"></canvas>
+      <div id="wipeHandle" title="drag to wipe"><div class="grip">⇔</div></div>
+    </div>
+    <div style="display:flex;justify-content:space-between;margin-top:6px">
+      <div id="cmpLabelA" class="note" style="color:var(--accent)"></div>
+      <div id="cmpLabelB" class="note" style="color:var(--series-b)"></div>
+    </div>
+  </div>
+</div>
+
+<!-- Convert tab — unified import: a frames folder (Microsoft volcap / PLY sequences / DepthKit
+     exports) analyses + converts; a single .ares/.4ds file is structurally probed instead (the
+     former standalone Inspect tab was merged in here 2026-07-11 — same probe, same findings,
+     now the first step of "can I convert this" rather than a separate destination). -->
+<div class="tool" id="tab-convert">
+  <div class="wrap">
+    <h2>Convert to .ares</h2>
+    <p class="lead">Pick a <b>folder</b> of per-frame <b>OBJ/PLY meshes + PNG atlases</b> — no typing, no command line.
+      Encoding runs on this machine; nothing is uploaded. Drop a single <b>.ares</b> or <b>.4ds</b> file instead
+      and it's structurally probed <b>locally in your browser</b> — only the container skeleton (header, frame
+      directory, block lengths) is read, never the mesh or texture content.</p>
+    <div class="note" style="margin:0 0 10px">Formats: <b>Microsoft volcap</b> OBJ+PNG <span class="good">✓ converts</span>
+      · <b>PLY sequences</b> <span class="good">✓ converts</span>
+      · <b>DepthKit</b> Textured Geometry Sequence (OBJ/PLY + PNG/JPG, one of each per frame) — drop the exported
+      frames folder, same path as above
+      · <b>4DViews</b> <code>.4ds</code> <span class="good">✓ converts</span> (DXT1 desktop captures, ~2 fps decode; needs the
+      codec DLL — <a href="#" id="fourdsSettingsLink">⚙ Settings</a> if missing)</div>
+    <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
+      <button class="btn" id="convertPick" style="margin:0" title="pick the capture folder to import — a sequence of per-frame OBJ/PLY meshes + atlas PNGs">📁 Choose folder…</button>
+      <span class="note" style="margin:0">opens a native folder dialog — the path fills itself in</span>
+      <label class="btn ghost" for="convertProbeFile" style="margin:0;display:inline-block">📄 Choose .ares/.4ds…</label>
+      <span class="note" style="margin:0">inspect a single container file</span>
+      <input type="file" id="convertProbeFile" accept=".4ds,.ares" style="display:none">
+    </div>
+    <label class="drop" id="convertDrop">
+      <div class="big">…or drop a folder / mesh+atlas files — or a single .ares/.4ds — here</div>
+      <div class="small">drag-drop works for a quick preview, or a full structural probe</div>
+      <input type="file" id="convertFile" multiple webkitdirectory>
+    </label>
+    <div id="convertOut"></div>
+    <div id="convertHistory"></div>
+  </div>
+</div>
+
+<!-- Settings tab: dependency status + guided installs. Presence is informational — nothing here
+     gates the app from opening; features warn at the point of use with a pointer back to this tab. -->
+<div class="tool" id="tab-settings">
+  <div class="wrap">
+    <h2>Settings — models and tools</h2>
+    <p class="lead">Optional models, libraries, and data the app can use. Green means installed;
+      anything missing shows what it enables and where to get it. The app runs regardless — features
+      that need a missing piece warn when used and link back here.</p>
+    <div id="depsOut"><div class="card"><div class="note">checking…</div></div></div>
+  </div>
+</div>
+
+<div class="tool" id="tab-compute">
+  <div class="wrap">
+    <h2>Compute — RunPod</h2>
+    <p class="lead">Launch cloud GPUs, watch them live, and run the motion-robust registration
+      experiments — from inside the app. The API key stays on the dev server; nothing spends until
+      a pod is launched.</p>
+    <div id="rpOut"><div class="card"><div class="note">checking…</div></div></div>
+  </div>
+</div>
+
+<!-- Orientation gizmo: world XYZ as the camera sees them; click a ball to snap to that view (gizmo.js) -->
+<svg id="axisGizmo" class="viewer-only" viewBox="0 0 68 68" width="68" height="68" aria-label="orientation gizmo — click an axis to snap the view"></svg>
+
+<!-- Crop rulers + guides: the crop is authored HERE, over the model, the way Photoshop/AE do it —
+     not by six sliders in a rail. Container is pointer-events:none so orbit and every tool keep
+     working underneath; only the guide grab-strips take the pointer. z-index sits under
+     #selectOverlay (4) so an active box/brush/SAM drag wins over a guide. -->
+<div id="cropOverlay" class="viewer-only" data-self-managed style="display:none">
+  <div id="cropShade"></div>
+  <div id="cropRulerH" class="cropRuler h"></div>
+  <div id="cropRulerV" class="cropRuler v"></div>
+  <div id="cropGuides"></div>
+</div>
+
+<!-- Transform drag layer (W/E/R). Only present while a transform tool is armed, and z-indexed ABOVE
+     #selectOverlay so an armed transform can't also be running a box-select on the same drag. -->
+<div id="xformOverlay" style="position:fixed;inset:0;z-index:5;display:none;cursor:move;touch-action:none"></div>
+
+<!-- Selection capture layer (editor tools): sits over the canvas, under the panels -->
+<div id="selectOverlay" style="position:fixed;inset:0;z-index:4;display:none;cursor:crosshair;touch-action:none">
+  <canvas id="samMask" style="position:absolute;display:none;pointer-events:none"></canvas>
+  <div id="marquee" style="position:absolute;border:1.5px dashed var(--warn);background:rgba(224,169,74,.12);display:none"></div>
+</div>
+
+<div class="panel" id="err"></div>
+<!-- Shortcuts were a paragraph pinned across the viewport (owner: no prose in the chrome).
+     Now one hoverable ? — the full list lives in its tooltip. -->
+<button id="hint" class="u ico viewer-only" aria-label="keyboard &amp; mouse shortcuts" title="NAVIGATE — left-drag orbit · middle-drag pan · scroll zoom · 1/3/7 snap front/right/top (Ctrl = opposite face) · P ortho/perspective · L lock view · F focus the subject · tools stay live: right/middle-drag &amp; wheel still navigate&#10;&#10;TRANSFORM (Unity keys) — W move · E rotate · R scale · F focus · hold X/Y/Z while dragging to constrain to one axis · Shift for fine steps&#10;&#10;PLAYBACK — Space play/pause · ←/→ step 1 frame (Shift = 10) · Home/End first/last&#10;&#10;TIMELINE — [ set clip IN at playhead · ] set clip OUT · drag the brackets to adjust · drag anywhere on the strip to scrub&#10;&#10;VIEWPORT — Z cycle shading · Shift+W wireframe · G grid · Shift+R crop guides · X x-ray&#10;&#10;EDIT — Shift+E collapse/expand the rail · Q/V nav · M box · B brush · S SAM · Ctrl+Z undo · Ctrl+Shift+Z or Ctrl+Y redo · Ctrl+S save now · Del commits a pending SAM selection as a delete, otherwise removes the active range">?</button>
+
+<script type="importmap">
+{
+  "imports": {
+    "meshoptimizer": "/node_modules/meshoptimizer/meshopt_decoder.mjs",
+    "meshoptimizer/encoder": "/node_modules/meshoptimizer/meshopt_encoder.mjs",
+    "@ares/core": "/packages/core/dist/index.js"
+  }
+}
+</script>
+<script type="module" src="./main.js"></script>

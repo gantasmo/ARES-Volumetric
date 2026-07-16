@@ -1,0 +1,30 @@
+# Normalize to LF in the repo; check out native on Windows.
+* text=auto
+
+# Explicitly text — keeps diffs sane across platforms.
+*.ts    text
+*.tsx   text
+*.js    text
+*.mjs   text
+*.cjs   text
+*.json  text
+*.md    text
+*.html  text
+*.css   text
+*.py    text
+*.cs    text
+
+# Windows-only scripts must keep CRLF or they misbehave.
+*.ps1   text eol=crlf
+*.cmd   text eol=crlf
+*.bat   text eol=crlf
+*.vbs   text eol=crlf
+
+# Binary — never touch, never diff.
+*.png   binary
+*.jpg   binary
+*.svg   text
+*.ares  binary
+*.dll   binary
+*.exe   binary
+*.pdf   binary

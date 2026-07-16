@@ -1,0 +1,5 @@
+{
+  "// why": "main.py runs inside the dedicated service env (tools/sam-service/env, created 2026-07-10: torch cu124 + transformers 5 + segment-anything). Pointing the type checker at that interpreter makes the imports resolve for real — configuration-as-truth, not warning suppression.",
+  "venvPath": ".",
+  "venv": "env"
+}

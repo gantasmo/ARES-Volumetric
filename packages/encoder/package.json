@@ -1,0 +1,22 @@
+{
+  "name": "@ares/encoder",
+  "license": "MIT",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "bin": {
+    "ares": "./dist/cli.js"
+  },
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "dependencies": {
+    "@ares/core": "*",
+    "meshoptimizer": "^1.2.0"
+  },
+  "devDependencies": {
+    "@types/node": "^26.1.1"
+  }
+}

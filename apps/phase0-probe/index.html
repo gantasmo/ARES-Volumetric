@@ -1,0 +1,123 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ARES Phase 0 — Capability Probe</title>
+<link rel="icon" type="image/svg+xml" href="favicon.svg">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  body { font: 15px/1.5 system-ui, sans-serif; max-width: 60em; margin: 2em auto; padding: 0 1em; color: #1a1a1a; }
+  h1 { border-bottom: 3px solid #7c3a12; padding-bottom: .2em; }
+  table { border-collapse: collapse; width: 100%; margin: 1em 0; }
+  th, td { border: 1px solid #ccc; padding: .45em .7em; text-align: left; }
+  th { background: #efe9e2; }
+  .ok { color: #157347; font-weight: 600; }
+  .no { color: #b02a37; font-weight: 600; }
+  .warn { color: #997404; font-weight: 600; }
+  code { background: #f2efe9; padding: .05em .3em; border-radius: 3px; }
+  small { color: #555; }
+</style>
+<h1>ARES Phase 0 — Capability Probe</h1>
+<p>Validates the spec's load-bearing assumptions on <em>this</em> device/browser:
+<strong>A1</strong> = WebGPU available, <strong>A2</strong> = hardware AV1/VP9 decode via WebCodecs.
+Serve via <code>npm start</code> or the repo's <code>Launch ARES Probe.vbs</code> — both send the
+COOP/COEP headers cross-origin isolation needs.</p>
+
+<h2>A1 — WebGPU</h2>
+<table id="gpu"><tr><th>Check</th><th>Result</th></tr></table>
+
+<h2>A2 — WebCodecs video decode</h2>
+<table id="codecs"><tr><th>Codec</th><th>Supported</th><th>Hardware accel</th><th>Config</th></tr></table>
+
+<h2>Runtime environment</h2>
+<table id="env"><tr><th>Property</th><th>Value</th></tr></table>
+
+<p id="verdict"></p>
+
+<script type="module">
+const row = (t, cells) => {
+  const tr = document.createElement("tr");
+  tr.innerHTML = cells.map((c) => `<td>${c}</td>`).join("");
+  document.getElementById(t).appendChild(tr);
+};
+const yes = (b) => b ? '<span class="ok">yes</span>' : '<span class="no">no</span>';
+
+// --- A1: WebGPU — probe BOTH adapters on dual-GPU systems (e.g. NVIDIA dGPU + AMD iGPU).
+// The runtime requests powerPreference:"high-performance" (spec §10.3); the probe verifies
+// that actually lands on the discrete GPU and reports what the low-power path would get.
+let gpuOk = false;
+if (!navigator.gpu) {
+  row("gpu", ["navigator.gpu", yes(false) + ' <small>needs Chrome/Edge 113+ (Windows) or equivalent</small>']);
+} else {
+  row("gpu", ["navigator.gpu", yes(true)]);
+  row("gpu", ["preferred canvas format", `<code>${navigator.gpu.getPreferredCanvasFormat()}</code>`]);
+  const describe = (i = {}) =>
+    [i.vendor, i.architecture, i.description || i.device].filter(Boolean).join(" · ") || "(no adapter info)";
+  // Features the volumetric runtime cares about (splat f16 storage, GPU profiling, wave ops, BC atlases).
+  const FEATURES = ["shader-f16", "timestamp-query", "subgroups", "texture-compression-bc"];
+  const seen = new Map();
+  for (const pref of ["high-performance", "low-power"]) {
+    try {
+      const adapter = await navigator.gpu.requestAdapter({ powerPreference: pref });
+      if (!adapter) { row("gpu", [`adapter (${pref})`, yes(false)]); continue; }
+      const info = adapter.info || (adapter.requestAdapterInfo && await adapter.requestAdapterInfo()) || {};
+      const name = describe(info);
+      seen.set(pref, name);
+      row("gpu", [`adapter (${pref})`, name]);
+      if (pref === "high-performance") {
+        row("gpu", ["max buffer size", (adapter.limits?.maxBufferSize ?? 0).toLocaleString() + " B"]);
+        row("gpu", ["features", FEATURES.map((f) =>
+          adapter.features.has(f) ? `<span class="ok">${f}</span>` : `<span class="warn">${f}✗</span>`).join(" ")]);
+        const dev = await adapter.requestDevice();
+        gpuOk = !!dev;
+        row("gpu", ["device (high-performance)", yes(!!dev)]);
+      }
+    } catch (e) { row("gpu", [`adapter (${pref})`, `<span class="no">${e.message}</span>`]); }
+  }
+  if (seen.size === 2 && seen.get("high-performance") === seen.get("low-power")) {
+    row("gpu", ["dual-GPU note", `<small class="warn">Browser exposes one adapter for both preferences.
+      On a dual-GPU Windows box, check Settings → System → Display → Graphics and set the browser
+      (or leave it "Let Windows decide") — the discrete GPU should appear for high-performance.</small>`]);
+  }
+}
+
+// --- A2: WebCodecs ---
+const codecs = [
+  ["AV1",  "av01.0.05M.08"],
+  ["VP9",  "vp09.00.10.08"],
+  ["HEVC", "hev1.1.6.L93.B0"],
+  ["H.264","avc1.42001f"],
+];
+let av1hw = false, anyVideo = false;
+if (!("VideoDecoder" in window)) {
+  row("codecs", ["WebCodecs", '<span class="no">VideoDecoder unavailable</span>', "-", "-"]);
+} else {
+  for (const [name, codec] of codecs) {
+    try {
+      const cfg = { codec, codedWidth: 1024, codedHeight: 1024, hardwareAcceleration: "prefer-hardware" };
+      const r = await VideoDecoder.isConfigSupported(cfg);
+      const hw = r.supported && r.config?.hardwareAcceleration !== "prefer-software";
+      if (r.supported) anyVideo = true;
+      if (name === "AV1" && r.supported) av1hw = hw;
+      row("codecs", [name, yes(!!r.supported), r.supported ? (hw ? '<span class="ok">likely</span>' : '<span class="warn">software</span>') : "-", `<code>${codec}</code>`]);
+    } catch (e) { row("codecs", [name, `<span class="no">${e.message}</span>`, "-", `<code>${codec}</code>`]); }
+  }
+}
+
+// --- Environment ---
+const coiHint = self.crossOriginIsolated ? "" :
+  ' <small>page not served with COOP/COEP — use <code>npm start</code> / Launch ARES Probe.vbs, not npx serve</small>';
+row("env", ["crossOriginIsolated (SharedArrayBuffer)", yes(self.crossOriginIsolated) + coiHint]);
+row("env", ["hardwareConcurrency", navigator.hardwareConcurrency ?? "?"]);
+row("env", ["deviceMemory (GB)", navigator.deviceMemory ?? "unknown"]);
+row("env", ["SharedArrayBuffer", yes(typeof SharedArrayBuffer !== "undefined")]);
+row("env", ["OffscreenCanvas", yes(typeof OffscreenCanvas !== "undefined")]);
+row("env", ["userAgent", `<small>${navigator.userAgent}</small>`]);
+
+// --- Verdict ---
+const v = document.getElementById("verdict");
+const a1 = gpuOk, a2 = av1hw || anyVideo;
+v.innerHTML = `<strong>Verdict:</strong> A1 (WebGPU) ${yes(a1)} · A2 (video decode) ${yes(a2)}` +
+  (a1 && av1hw ? ' — <span class="ok">primary path (WebGPU + HW AV1) available.</span>'
+   : a1 && a2 ? ' — <span class="warn">WebGPU ok; AV1 not hardware — consider VP9 primary (spec §7.2).</span>'
+   : ' — <span class="no">primary path unavailable; use fallbacks (spec §10.4 WebGL2, §7.2 codecs).</span>') +
+  (self.crossOriginIsolated ? "" : ' <span class="warn">Worker decode path (§10.2) blocked until crossOriginIsolated.</span>');
+</script>

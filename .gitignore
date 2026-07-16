@@ -1,0 +1,116 @@
+# ==========================================================================
+# ARES — repository ignore rules
+#
+# Repo root is ares/. The reference capture, the SAM 3 weights, the archive
+# capture tree and the research PDFs all live in the PARENT folder, outside
+# this repo entirely — they need no rules here and cannot be added by
+# accident.
+# ==========================================================================
+
+# --- Dependencies & build output ------------------------------------------
+node_modules/
+dist/
+*.tsbuildinfo
+
+# Python
+__pycache__/
+*.py[cod]
+
+# Large optional install: the SAM service venv (~4.8 GB of torch/CUDA).
+# Rebuilt from tools/sam-service/requirements.txt; the in-app Settings tab
+# documents the sources and installs it in one click.
+tools/sam-service/env/
+
+# --- Secrets --------------------------------------------------------------
+# SSH keypairs used to drive RunPod GPU pods. NEVER commit.
+# NOTE: .runpod/account-pubkey-backup.txt is misleadingly named — it is an
+# unencrypted PRIVATE key (armor-stripped openssh-key-v1), not a public key.
+.runpod/
+*.pem
+*.ppk
+id_rsa
+id_ed25519
+.env
+.env.*
+
+# --- Third-party / proprietary binaries -----------------------------------
+# 4DViews native codec, licensed to the owner via his own SDK agreement.
+tools/4ds/bin/
+# Vendored realesrgan-ncnn-vulkan (BSD-3) — 50 MB of upstream weights + exe.
+tools/bin/
+
+# --- Generated data: clips & their sidecars -------------------------------
+# .ares clips are encoder output (~3 GB across 34 files here) and several are
+# captures of third parties. apps/demo/demo.ares regenerates via:
+#   node packages/encoder/dist/cli.js synth -o apps/demo/demo.ares
+*.ares
+# Bound-by-blood metadata sidecars — embed absolute source paths.
+*.ares.meta.json
+# Edit sidecars and the app's rolling backups of them. The .bak suffix means
+# *.edits.json alone does NOT match them — hence the explicit rule.
+*.edits.json
+*.edits.json.bak
+*.bak
+*.orig
+
+# Per-user app state written server-side by the demo app.
+apps/demo/history.json
+apps/demo/showcase.json
+apps/demo/.thumbs/
+
+# --- Generated data: bake pipeline ----------------------------------------
+# Coherent-GOP intermediates, ~4.3 GB. All regenerate from the source capture
+# via tools/coherent/run-coherent-bake.mjs.
+.coherent-bake-work/
+.coherent-bake-work-v4/
+.coherent-preview-src/
+.coherent-ckpt-*/
+# Bake manifest: regenerated, and records absolute local paths.
+coherent-manifest.json
+
+# SAM-3D inference output (~88 MB); re-runs from the sam3d tools.
+sam3d-results/
+
+# Benchmark output — bench/src/run.ts writes these. The harness, its README
+# and the hand-written bench/report/index.html ARE tracked.
+bench/results/
+bench/data/
+
+# --- Logs & scratch -------------------------------------------------------
+*.log
+tools/sam-service/uvicorn-out.txt
+tools/sam-service/uvicorn-err.txt
+scratchpad/
+scratch-*.mjs
+
+# --- Internal working notes (not for the repo) ----------------------------
+# Session handoffs, agent-to-agent logs, dated status reports, decision logs.
+# Kept on disk locally; deliberately excluded from version control.
+HANDOFF.md
+BACKLOG.md
+DECISIONS.md
+REPORT-webgl2-worker.md
+docs/reports/
+docs/audit-*.md
+docs/recon-audit.md
+docs/sam-enhance-integration.md
+docs/remeshing-decision.md
+docs/ui-design-notes.md
+docs/ai_text_tropes_guide.md
+# Machine-specific inventory: hostname, GPU, local install paths.
+docs/local-ai-inventory.md
+
+# Tool READMEs kept local pending a rewrite for public consumption.
+tools/4ds/README.md
+tools/svf-extract/README-runbook.md
+
+# Superseded screenshot, referenced by nothing.
+docs/images/convert-tab.png
+
+# --- Editor / OS / agent scratch ------------------------------------------
+.DS_Store
+Thumbs.db
+.vscode/
+.idea/
+.claude/
+.playwright-mcp/

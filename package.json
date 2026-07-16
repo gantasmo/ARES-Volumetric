@@ -1,0 +1,23 @@
+{
+  "name": "ares-monorepo",
+  "license": "MIT",
+  "private": true,
+  "version": "0.0.0",
+  "description": "ARES Volumetric — single-file .ares container + browser runtime for volumetric video (reference implementation)",
+  "workspaces": [
+    "packages/*",
+    "apps/*",
+    "bench"
+  ],
+  "scripts": {
+    "build": "tsc -b",
+    "clean": "tsc -b --clean",
+    "probe": "node tools/serve.mjs",
+    "start": "node tools/serve.mjs",
+    "bench": "node bench/dist/run.js",
+    "postinstall": "node tools/fix-ide-symlinks.mjs"
+  },
+  "devDependencies": {
+    "typescript": "^7.0.2"
+  }
+}

@@ -1,0 +1,513 @@
+<!doctype html>
+<meta charset="utf-8">
+<title>ARES P0 — Intra Bench Report</title>
+<link rel="icon" type="image/svg+xml" href="../../apps/phase0-probe/favicon.svg">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<style>
+  .viz-root {
+    --surface-1: #fcfcfb;
+    --page: #f9f9f7;
+    --ink-1: #0b0b0b;
+    --ink-2: #52514e;
+    --ink-3: #898781;
+    --grid: #e1e0d9;
+    --axis: #c3c2b7;
+    --border: rgba(11,11,11,0.10);
+    --raw: #2a78d6;     /* slot 1 blue   — raw-f32 family */
+    --qbin: #1baf7a;    /* slot 2 aqua   — quantized binary (Opt C/D) */
+    --meshopt: #eda100; /* slot 3 yellow — meshopt (§6.7 default) */
+    --draco: #008300;   /* slot 4 green  — Draco (optional profile) */
+  }
+  @media (prefers-color-scheme: dark) {
+    .viz-root {
+      --surface-1: #1a1a19;
+      --page: #0d0d0d;
+      --ink-1: #ffffff;
+      --ink-2: #c3c2b7;
+      --ink-3: #898781;
+      --grid: #2c2c2a;
+      --axis: #383835;
+      --border: rgba(255,255,255,0.10);
+      --raw: #3987e5;
+      --qbin: #199e70;
+      --meshopt: #c98500;
+      --draco: #008300;
+    }
+  }
+  * { box-sizing: border-box; }
+  body.viz-root {
+    margin: 0; padding: 24px 16px 48px;
+    background: var(--page); color: var(--ink-1);
+    font: 14px/1.5 system-ui, -apple-system, "Segoe UI", sans-serif;
+  }
+  main { max-width: 1080px; margin: 0 auto; }
+  h1 { font-size: 22px; margin: 0 0 4px; }
+  .sub { color: var(--ink-2); margin: 0 0 20px; }
+  .filters { display: flex; gap: 8px; align-items: center; margin: 0 0 16px; flex-wrap: wrap; }
+  .filters .flabel { color: var(--ink-3); font-size: 13px; margin-right: 4px; }
+  .filters button {
+    font: 600 13px/1 system-ui, sans-serif; color: var(--ink-2);
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 999px;
+    padding: 7px 14px; cursor: pointer;
+  }
+  .filters button:hover { color: var(--ink-1); }
+  .filters button[aria-pressed="true"] { color: var(--ink-1); border-color: var(--ink-2); }
+  .card {
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 10px;
+    padding: 18px 18px 12px; margin: 0 0 16px;
+  }
+  .card h2 { font-size: 15px; margin: 0 0 2px; }
+  .card .desc { color: var(--ink-3); font-size: 13px; margin: 0 0 10px; }
+  .row { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+  @media (max-width: 780px) { .row { grid-template-columns: 1fr; } }
+  svg text { font: 12px system-ui, sans-serif; fill: var(--ink-3); }
+  svg .dl { font: 600 12px system-ui, sans-serif; fill: var(--ink-2); }
+  svg .axis-title { font: 12px system-ui, sans-serif; fill: var(--ink-3); }
+  .legend { display: flex; gap: 16px; flex-wrap: wrap; margin: 8px 2px 2px; font-size: 13px; color: var(--ink-2); }
+  .legend .k { display: inline-flex; align-items: center; gap: 6px; }
+  .legend .swatch { width: 10px; height: 10px; border-radius: 50%; display: inline-block; }
+  .legend .swatch.hollow { background: var(--surface-1) !important; border: 2.5px solid; }
+  .legend .lkey { width: 16px; height: 2px; display: inline-block; }
+  .stat-row { display: flex; gap: 24px; flex-wrap: wrap; margin: 6px 0 8px; }
+  .stat { min-width: 150px; }
+  .stat .l { font-size: 13px; color: var(--ink-3); }
+  .stat .v { font-size: 26px; font-weight: 600; }
+  .stat .d { font-size: 12px; color: var(--ink-3); }
+  .tablewrap { overflow-x: auto; }
+  table { border-collapse: collapse; width: 100%; font-size: 13px; }
+  th, td { text-align: right; padding: 6px 10px; border-bottom: 1px solid var(--grid); white-space: nowrap; }
+  th:first-child, td:first-child { text-align: left; }
+  th { color: var(--ink-3); font-weight: 600; }
+  td { font-variant-numeric: tabular-nums; color: var(--ink-2); }
+  td.codec { color: var(--ink-1); font-weight: 600; }
+  .note { color: var(--ink-3); font-size: 12.5px; }
+  #tooltip {
+    position: fixed; pointer-events: none; display: none; z-index: 10;
+    background: var(--surface-1); border: 1px solid var(--border); border-radius: 8px;
+    padding: 8px 10px; font-size: 12.5px; box-shadow: 0 4px 14px rgba(0,0,0,.14);
+    color: var(--ink-2); max-width: 260px;
+  }
+  #tooltip .tv { font-weight: 700; color: var(--ink-1); font-size: 13px; }
+  #tooltip .trow { display: flex; align-items: center; gap: 6px; margin-top: 2px; }
+  #tooltip .tkey { width: 12px; height: 2.5px; flex: none; }
+  #err { color: var(--ink-2); padding: 24px; }
+</style>
+<body class="viz-root">
+<main>
+  <h1>ARES Phase 0 — intra representation bench</h1>
+  <p class="sub" id="envline">Loading results…</p>
+  <div id="err" hidden></div>
+
+  <div class="filters" id="clipFilters" role="group" aria-label="Clip">
+    <span class="flabel">Clip</span>
+  </div>
+
+  <div class="card">
+    <h2>Size × decode CPU — the Pareto view (spec §13.4)</h2>
+    <p class="desc">Each point is one intra codec on the selected clip. Down-left is better.
+      Hollow points are the same stream wrapped in Brotli (q5). Hairline steps trace the Pareto front.</p>
+    <svg id="pareto" width="100%" height="380" role="img" aria-label="Scatter plot of encoded size versus decode time per codec"></svg>
+    <div class="legend" id="paretoLegend"></div>
+  </div>
+
+  <div class="row">
+    <div class="card">
+      <h2>Quantization sweep — size</h2>
+      <p class="desc">Encoded geometry per frame vs position bits (§6.3). qbin stores u16 regardless of
+        bits — only entropy-coded codecs shrink.</p>
+      <svg id="sweepSize" width="100%" height="300" role="img" aria-label="Line chart of size versus quantization bits"></svg>
+      <div class="legend" id="sweepLegend"></div>
+    </div>
+    <div class="card">
+      <h2>Quantization sweep — geometry error</h2>
+      <p class="desc">Measured RMS position error (relative to bbox diagonal) vs bits — codec-independent,
+        set by quantization alone.</p>
+      <svg id="sweepErr" width="100%" height="300" role="img" aria-label="Line chart of geometry error versus quantization bits"></svg>
+    </div>
+  </div>
+
+  <div class="card">
+    <h2>Decoder footprint (§6.7 "WASM size")</h2>
+    <div class="stat-row" id="wasmStats"></div>
+  </div>
+
+  <div class="card">
+    <h2>All numbers — table view</h2>
+    <p class="desc" id="tableDesc"></p>
+    <div class="tablewrap"><table id="tbl"></table></div>
+    <p class="note" id="footnote"></p>
+  </div>
+</main>
+<div id="tooltip" role="status"></div>
+
+<script type="module">
+const FAMILY = {
+  "raw-f32": "raw", "raw-f32+br": "raw",
+  "qbin14": "qbin", "qbin14+br": "qbin",
+  "meshopt14": "meshopt", "meshopt14+br": "meshopt",
+  "draco14": "draco",
+};
+const FAMILY_ORDER = ["raw", "qbin", "meshopt", "draco"];
+const FAMILY_LABEL = { raw: "raw f32", qbin: "quantized binary", meshopt: "meshopt", draco: "Draco" };
+
+const css = (name) => getComputedStyle(document.body).getPropertyValue(name).trim();
+const colors = () => ({ raw: css("--raw"), qbin: css("--qbin"), meshopt: css("--meshopt"), draco: css("--draco"),
+  grid: css("--grid"), axis: css("--axis"), ink2: css("--ink-2"), ink3: css("--ink-3"), surface: css("--surface-1") });
+
+const S = (tag, attrs = {}) => {
+  const el = document.createElementNS("http://www.w3.org/2000/svg", tag);
+  for (const [k, v] of Object.entries(attrs)) el.setAttribute(k, v);
+  return el;
+};
+const fmtKB = (b) => b >= 1024 * 1024 ? (b / 1048576).toFixed(1) + " MB" : (b / 1024).toFixed(b < 102400 ? 1 : 0) + " KB";
+const fmtMs = (ms) => ms < 0.01 ? "~0 ms" : ms.toFixed(2) + " ms";
+
+const tooltip = document.getElementById("tooltip");
+function showTip(evt, rows) {
+  tooltip.replaceChildren();
+  for (const r of rows) {
+    const d = document.createElement("div");
+    if (r.key) {
+      d.className = "trow";
+      const k = document.createElement("span");
+      k.className = "tkey"; k.style.background = r.key;
+      d.append(k);
+    }
+    const span = document.createElement("span");
+    if (r.strong) { span.className = "tv"; }
+    span.textContent = r.text;
+    d.append(span);
+    tooltip.append(d);
+  }
+  tooltip.style.display = "block";
+  const pad = 14;
+  let x = evt.clientX + pad, y = evt.clientY + pad;
+  const r = tooltip.getBoundingClientRect();
+  if (x + r.width > innerWidth - 8) x = evt.clientX - r.width - pad;
+  if (y + r.height > innerHeight - 8) y = evt.clientY - r.height - pad;
+  tooltip.style.left = x + "px"; tooltip.style.top = y + "px";
+}
+const hideTip = () => { tooltip.style.display = "none"; };
+
+let DATA = null;
+let clip = null;
+
+async function load() {
+  let res;
+  try {
+    res = await fetch("../results/intra-latest.json");
+    if (!res.ok) throw new Error(res.status);
+  } catch {
+    document.getElementById("err").hidden = false;
+    document.getElementById("err").textContent =
+      "No results found. Run the bench first: double-click “Run ARES Bench.vbs” (repo root) or `npm run bench` in ares/.";
+    document.getElementById("envline").textContent = "";
+    return;
+  }
+  DATA = await res.json();
+  const e = DATA.env;
+  document.getElementById("envline").textContent =
+    `${new Date(DATA.generated).toLocaleString()} · ${e.cpu} (${e.cores} threads, ${e.memGB} GB) · node ${e.node} · ` +
+    `${e.frames} frames/clip · ${e.bits}-bit positions · decode median of ${e.reps} reps · single thread`;
+  clip = DATA.results[0]?.clip ?? null;
+  buildFilters();
+  renderAll();
+  matchMedia("(prefers-color-scheme: dark)").addEventListener("change", renderAll);
+}
+
+function buildFilters() {
+  const holder = document.getElementById("clipFilters");
+  for (const r of DATA.results) {
+    const b = document.createElement("button");
+    b.textContent = `${r.clip}${r.synthetic ? "" : " (real)"}`;
+    b.setAttribute("aria-pressed", String(r.clip === clip));
+    b.addEventListener("click", () => {
+      clip = r.clip;
+      holder.querySelectorAll("button").forEach((x) => x.setAttribute("aria-pressed", "false"));
+      b.setAttribute("aria-pressed", "true");
+      renderAll();
+    });
+    holder.append(b);
+  }
+}
+
+function renderAll() {
+  renderPareto();
+  renderSweeps();
+  renderWasm();
+  renderTable();
+}
+
+/* ---------- shared scale helpers ---------- */
+function niceLogTicks(min, max) {
+  const out = [];
+  let v = Math.pow(2, Math.floor(Math.log2(min)));
+  while (v <= max * 1.01) { if (v >= min * 0.99) out.push(v); v *= 2; }
+  return out;
+}
+
+/* ------------------------------ Pareto scatter ------------------------------ */
+function renderPareto() {
+  const C = colors();
+  const svg = document.getElementById("pareto");
+  svg.replaceChildren();
+  const r = DATA.results.find((x) => x.clip === clip);
+  if (!r) return;
+  const W = svg.clientWidth || 1000, H = 380;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const m = { l: 64, r: 24, t: 12, b: 44 };
+  const pts = r.codecs.map((c) => ({
+    name: c.codec, fam: FAMILY[c.codec] ?? "raw", br: c.codec.endsWith("+br"),
+    size: c.bytesPerFrame, dec: c.decodeMsMedian, enc: c.encodeMsMean,
+    ratio: c.ratioVsRaw, err: c.errRms, analytic: c.analyticError,
+  }));
+  const xs = pts.map((p) => p.size);
+  const xmin = Math.min(...xs) * 0.7, xmax = Math.max(...xs) * 1.4;
+  const ymax = Math.max(...pts.map((p) => p.dec)) * 1.18;
+  const X = (v) => m.l + (Math.log2(v) - Math.log2(xmin)) / (Math.log2(xmax) - Math.log2(xmin)) * (W - m.l - m.r);
+  const Y = (v) => H - m.b - (v / ymax) * (H - m.t - m.b);
+
+  // grid + axes (hairline, recessive)
+  for (const t of niceLogTicks(xmin, xmax)) {
+    svg.append(S("line", { x1: X(t), y1: m.t, x2: X(t), y2: H - m.b, stroke: C.grid, "stroke-width": 1 }));
+    const lbl = S("text", { x: X(t), y: H - m.b + 18, "text-anchor": "middle" });
+    lbl.textContent = fmtKB(t);
+    svg.append(lbl);
+  }
+  const ySteps = ymax > 4 ? 1 : 0.5;
+  for (let t = 0; t <= ymax; t += ySteps) {
+    svg.append(S("line", { x1: m.l, y1: Y(t), x2: W - m.r, y2: Y(t), stroke: C.grid, "stroke-width": 1 }));
+    const lbl = S("text", { x: m.l - 8, y: Y(t) + 4, "text-anchor": "end" });
+    lbl.textContent = t.toFixed(ySteps < 1 ? 1 : 0);
+    svg.append(lbl);
+  }
+  svg.append(S("line", { x1: m.l, y1: H - m.b, x2: W - m.r, y2: H - m.b, stroke: C.axis, "stroke-width": 1 }));
+  const xt = S("text", { x: (m.l + W - m.r) / 2, y: H - 6, "text-anchor": "middle", class: "axis-title" });
+  xt.textContent = "encoded geometry per frame (log)";
+  svg.append(xt);
+  const yt = S("text", { x: 14, y: (m.t + H - m.b) / 2, class: "axis-title",
+    transform: `rotate(-90 14 ${(m.t + H - m.b) / 2})`, "text-anchor": "middle" });
+  yt.textContent = "decode, ms/frame";
+  svg.append(yt);
+
+  // Pareto front (non-dominated: smaller size AND faster decode)
+  const sorted = [...pts].sort((a, b) => a.size - b.size);
+  let best = Infinity;
+  const front = [];
+  for (const p of sorted) if (p.dec < best) { front.push(p); best = p.dec; }
+  if (front.length > 1) {
+    let d = `M ${X(front[0].size)} ${Y(front[0].dec)}`;
+    for (let i = 1; i < front.length; i++)
+      d += ` L ${X(front[i].size)} ${Y(front[i - 1].dec)} L ${X(front[i].size)} ${Y(front[i].dec)}`;
+    svg.append(S("path", { d, fill: "none", stroke: C.axis, "stroke-width": 1 }));
+  }
+
+  // marks + labels + hit targets
+  for (const p of pts) {
+    const cx = X(p.size), cy = Y(p.dec);
+    const col = C[p.fam];
+    svg.append(S("circle", { cx, cy, r: 7.5, fill: p.br ? C.surface : col, stroke: p.br ? col : C.surface, "stroke-width": p.br ? 2.5 : 2 }));
+    const dl = S("text", { x: cx + 11, y: cy - 8, class: "dl" });
+    dl.textContent = p.name;
+    svg.append(dl);
+    const hit = S("circle", { cx, cy, r: 16, fill: "transparent", tabindex: "0", role: "img",
+      "aria-label": `${p.name}: ${fmtKB(p.size)} per frame, decode ${fmtMs(p.dec)}` });
+    const rows = () => [
+      { text: `${fmtKB(p.size)} / frame · dec ${fmtMs(p.dec)}`, strong: true },
+      { text: p.name, key: col },
+      { text: `${(p.ratio * 100).toFixed(1)}% of raw · enc ${fmtMs(p.enc)}` },
+      { text: `err RMS ${p.err.toExponential(1)}${p.analytic ? " (analytic bound)" : ""}` },
+    ];
+    hit.addEventListener("pointermove", (e) => showTip(e, rows()));
+    hit.addEventListener("pointerleave", hideTip);
+    hit.addEventListener("focus", (e) => {
+      const b = hit.getBoundingClientRect();
+      showTip({ clientX: b.x + b.width / 2, clientY: b.y }, rows());
+    });
+    hit.addEventListener("blur", hideTip);
+    svg.append(hit);
+  }
+
+  // legend: family hues + fill key for brotli
+  const lg = document.getElementById("paretoLegend");
+  lg.replaceChildren();
+  for (const f of FAMILY_ORDER) {
+    const k = document.createElement("span"); k.className = "k";
+    const sw = document.createElement("span"); sw.className = "swatch"; sw.style.background = C[f];
+    const t = document.createElement("span"); t.textContent = FAMILY_LABEL[f];
+    k.append(sw, t); lg.append(k);
+  }
+  const k2 = document.createElement("span"); k2.className = "k";
+  const sw2 = document.createElement("span"); sw2.className = "swatch hollow"; sw2.style.borderColor = C.ink3;
+  const t2 = document.createElement("span"); t2.textContent = "hollow = + Brotli (q5)";
+  k2.append(sw2, t2); lg.append(k2);
+}
+
+/* ------------------------------ sweep charts ------------------------------ */
+function renderSweeps() {
+  const C = colors();
+  const rows = DATA.sweep.filter((s) => s.clip === clip);
+  const bits = [...new Set(rows.map((s) => s.bits))].sort((a, b) => a - b);
+  const seriesDefs = [
+    { id: "qbin", label: "quantized binary", short: "qbin", col: C.qbin, hollow: false },
+    { id: "meshopt", label: "meshopt", short: "meshopt", col: C.meshopt, hollow: false },
+    { id: "meshopt+br", label: "meshopt + Brotli", short: "+br", col: C.meshopt, hollow: true },
+  ];
+
+  drawLines("sweepSize", bits, seriesDefs.map((sd) => ({
+    ...sd, pts: bits.map((b) => rows.find((s) => s.bits === b && s.codec === sd.id)?.bytesPerFrame ?? null),
+  })), { ylog: true, yfmt: fmtKB, ytitle: "encoded size / frame (log)" });
+
+  // error is codec-independent: one series (qbin's measured error)
+  drawLines("sweepErr", bits, [{
+    id: "err", label: "quantization error", col: C.qbin, hollow: false,
+    pts: bits.map((b) => rows.find((s) => s.bits === b && s.codec === "qbin")?.errRms ?? null),
+  }], { ylog: true, yfmt: (v) => v.toExponential(0), ytitle: "RMS error, rel. bbox diag (log)", noLegend: true });
+
+  const lg = document.getElementById("sweepLegend");
+  lg.replaceChildren();
+  for (const sd of seriesDefs) {
+    const k = document.createElement("span"); k.className = "k";
+    const line = document.createElement("span"); line.className = "lkey"; line.style.background = sd.col;
+    const dot = document.createElement("span"); dot.className = "swatch" + (sd.hollow ? " hollow" : "");
+    if (sd.hollow) dot.style.borderColor = sd.col; else dot.style.background = sd.col;
+    const t = document.createElement("span"); t.textContent = sd.label;
+    k.append(line, dot, t); lg.append(k);
+  }
+}
+
+function drawLines(id, bits, series, opt) {
+  const C = colors();
+  const svg = document.getElementById(id);
+  svg.replaceChildren();
+  const W = svg.clientWidth || 500, H = 300;
+  svg.setAttribute("viewBox", `0 0 ${W} ${H}`);
+  const m = { l: 64, r: 70, t: 12, b: 40 };
+  const all = series.flatMap((s) => s.pts).filter((v) => v != null);
+  if (!all.length) return;
+  const ymin = opt.ylog ? Math.min(...all) / 1.6 : 0;
+  const ymax = Math.max(...all) * (opt.ylog ? 1.6 : 1.1);
+  const X = (b) => m.l + (bits.indexOf(b) / (bits.length - 1)) * (W - m.l - m.r);
+  const Y = (v) => opt.ylog
+    ? H - m.b - (Math.log10(v) - Math.log10(ymin)) / (Math.log10(ymax) - Math.log10(ymin)) * (H - m.t - m.b)
+    : H - m.b - (v / ymax) * (H - m.t - m.b);
+
+  // y grid: powers for log, else quarters
+  const yticks = [];
+  if (opt.ylog) {
+    let p = Math.ceil(Math.log10(ymin));
+    for (; Math.pow(10, p) <= ymax; p++) yticks.push(Math.pow(10, p));
+    if (yticks.length < 3) { // add 2× and 5× subdivisions when the decade span is short
+      const extra = [];
+      for (const t of yticks) { extra.push(t * 2, t * 5); }
+      let base = Math.pow(10, Math.ceil(Math.log10(ymin)) - 1);
+      extra.push(base * 2, base * 5);
+      for (const e of extra) if (e >= ymin && e <= ymax) yticks.push(e);
+      yticks.sort((a, b) => a - b);
+    }
+  } else {
+    for (let i = 0; i <= 4; i++) yticks.push((ymax / 4) * i);
+  }
+  for (const t of yticks) {
+    svg.append(S("line", { x1: m.l, y1: Y(t), x2: W - m.r, y2: Y(t), stroke: C.grid, "stroke-width": 1 }));
+    const lbl = S("text", { x: m.l - 8, y: Y(t) + 4, "text-anchor": "end" });
+    lbl.textContent = opt.yfmt(t);
+    svg.append(lbl);
+  }
+  for (const b of bits) {
+    const lbl = S("text", { x: X(b), y: H - m.b + 18, "text-anchor": "middle" });
+    lbl.textContent = b;
+    svg.append(lbl);
+  }
+  svg.append(S("line", { x1: m.l, y1: H - m.b, x2: W - m.r, y2: H - m.b, stroke: C.axis, "stroke-width": 1 }));
+  const xt = S("text", { x: (m.l + W - m.r) / 2, y: H - 4, "text-anchor": "middle", class: "axis-title" });
+  xt.textContent = "position bits / axis";
+  svg.append(xt);
+  const yt = S("text", { x: 14, y: (m.t + H - m.b) / 2, class: "axis-title",
+    transform: `rotate(-90 14 ${(m.t + H - m.b) / 2})`, "text-anchor": "middle" });
+  yt.textContent = opt.ytitle;
+  svg.append(yt);
+
+  for (const s of series) {
+    let d = "";
+    s.pts.forEach((v, i) => { if (v != null) d += `${d ? "L" : "M"} ${X(bits[i])} ${Y(v)} `; });
+    svg.append(S("path", { d, fill: "none", stroke: s.col, "stroke-width": 2, "stroke-linejoin": "round", "stroke-linecap": "round" }));
+    s.pts.forEach((v, i) => {
+      if (v == null) return;
+      svg.append(S("circle", { cx: X(bits[i]), cy: Y(v), r: 4.5,
+        fill: s.hollow ? C.surface : s.col, stroke: s.hollow ? s.col : C.surface, "stroke-width": s.hollow ? 2.5 : 2 }));
+    });
+    // direct end label (short form — measured to fit the right margin)
+    const last = s.pts.length - 1;
+    if (s.pts[last] != null && !opt.noLegend) {
+      const dl = S("text", { x: X(bits[last]) + 10, y: Y(s.pts[last]) + 4, class: "dl" });
+      dl.textContent = s.short ?? s.label;
+      svg.append(dl);
+    }
+  }
+
+  // crosshair: nearest bits column, tooltip lists every series at that X
+  const hair = S("line", { y1: m.t, y2: H - m.b, stroke: C.axis, "stroke-width": 1, visibility: "hidden" });
+  svg.append(hair);
+  const hit = S("rect", { x: m.l, y: m.t, width: W - m.l - m.r, height: H - m.t - m.b, fill: "transparent" });
+  hit.addEventListener("pointermove", (e) => {
+    const rect = svg.getBoundingClientRect();
+    const px = (e.clientX - rect.x) * (W / rect.width);
+    let bi = 0, bd = Infinity;
+    bits.forEach((b, i) => { const d = Math.abs(X(b) - px); if (d < bd) { bd = d; bi = i; } });
+    hair.setAttribute("x1", X(bits[bi])); hair.setAttribute("x2", X(bits[bi]));
+    hair.setAttribute("visibility", "visible");
+    showTip(e, [
+      { text: `${bits[bi]} bits / axis`, strong: true },
+      ...series.map((s) => ({ text: `${s.label}: ${s.pts[bi] != null ? opt.yfmt(s.pts[bi]) : "—"}`, key: s.col })),
+    ]);
+  });
+  hit.addEventListener("pointerleave", () => { hair.setAttribute("visibility", "hidden"); hideTip(); });
+  svg.append(hit);
+}
+
+/* ------------------------------ wasm + table ------------------------------ */
+function renderWasm() {
+  const holder = document.getElementById("wasmStats");
+  holder.replaceChildren();
+  for (const [name, bytes] of Object.entries(DATA.decoderFootprint ?? {})) {
+    if (bytes <= 0) continue;
+    const d = document.createElement("div"); d.className = "stat";
+    const l = document.createElement("div"); l.className = "l"; l.textContent = name;
+    const v = document.createElement("div"); v.className = "v"; v.textContent = (bytes / 1024).toFixed(0) + " KB";
+    const dd = document.createElement("div"); dd.className = "d"; dd.textContent = "shipped to every client";
+    d.append(l, v, dd); holder.append(d);
+  }
+}
+
+function renderTable() {
+  const r = DATA.results.find((x) => x.clip === clip);
+  if (!r) return;
+  document.getElementById("tableDesc").textContent =
+    `${r.clip} — class ${r.cls}${r.synthetic ? ", synthetic" : ", real capture"} · ~${r.meanVerts.toLocaleString()} verts / ${r.meanTris.toLocaleString()} tris · ${r.frames} frames`;
+  const tbl = document.getElementById("tbl");
+  tbl.replaceChildren();
+  const head = document.createElement("tr");
+  for (const h of ["codec", "KB / frame", "bytes / vertex", "% of raw", "encode ms", "decode ms (med)", "err RMS", "err max"]) {
+    const th = document.createElement("th"); th.textContent = h; head.append(th);
+  }
+  tbl.append(head);
+  for (const c of r.codecs) {
+    const tr = document.createElement("tr");
+    const cells = [
+      [c.codec, "codec"], [(c.bytesPerFrame / 1024).toFixed(1)], [c.bytesPerVertex.toFixed(2)],
+      [(c.ratioVsRaw * 100).toFixed(1) + "%"], [c.encodeMsMean.toFixed(2)], [c.decodeMsMedian.toFixed(2)],
+      [c.errRms.toExponential(1) + (c.analyticError ? " *" : "")], [c.errMax.toExponential(1) + (c.analyticError ? " *" : "")],
+    ];
+    for (const [text, cls] of cells) {
+      const td = document.createElement("td"); if (cls) td.className = cls;
+      td.textContent = text; tr.append(td);
+    }
+    tbl.append(tr);
+  }
+  document.getElementById("footnote").textContent = DATA.note ?? "";
+}
+
+load();
+addEventListener("resize", () => { if (DATA) renderAll(); });
+</script>

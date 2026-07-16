@@ -1,0 +1,22 @@
+{
+  "name": "@ares/three",
+  "license": "MIT",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "peerDependencies": {
+    "three": ">=0.160"
+  },
+  "dependencies": {
+    "@ares/core": "*"
+  },
+  "devDependencies": {
+    "three": "^0.185.1",
+    "@types/three": "^0.185.1"
+  }
+}

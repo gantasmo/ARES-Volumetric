@@ -1,0 +1,16 @@
+# SAM service environment — pinned to the versions verified working on 2026-07-10
+# (RTX 3060 6 GB, CUDA 12.4). Install with the cu124 wheel index:
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
+# The Settings tab's "Create env" button runs exactly that.
+torch==2.6.0+cu124
+torchvision==0.21.0+cu124
+transformers==5.13.0
+fastapi==0.139.0
+uvicorn==0.51.0
+pydantic==2.13.4
+pillow==12.3.0
+numpy==2.5.1
+segment-anything==1.0
+safetensors==0.8.0
+huggingface_hub==1.23.0
+hf-xet==1.5.1

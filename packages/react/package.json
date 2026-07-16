@@ -1,0 +1,27 @@
+{
+  "name": "@ares/react",
+  "license": "MIT",
+  "private": true,
+  "version": "0.0.0",
+  "type": "module",
+  "main": "./dist/index.js",
+  "types": "./dist/index.d.ts",
+  "scripts": {
+    "build": "tsc -b"
+  },
+  "peerDependencies": {
+    "react": ">=18",
+    "three": ">=0.160",
+    "@react-three/fiber": ">=8"
+  },
+  "dependencies": {
+    "@ares/three": "*"
+  },
+  "devDependencies": {
+    "react": "^19.2.7",
+    "@types/react": "^19.2.17",
+    "three": "^0.185.1",
+    "@react-three/fiber": "^9.6.1",
+    "@types/three": "^0.185.1"
+  }
+}

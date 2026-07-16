@@ -1,0 +1,10 @@
+{
+  "files": [],
+  "references": [
+    { "path": "packages/core" },
+    { "path": "packages/encoder" },
+    { "path": "packages/three" },
+    { "path": "packages/react" },
+    { "path": "bench" }
+  ]
+}

@@ -1,0 +1,21 @@
+{
+  "name": "@ares/bench",
+  "license": "MIT",
+  "version": "0.0.0",
+  "private": true,
+  "type": "module",
+  "scripts": {
+    "build": "tsc -b",
+    "bench": "node dist/run.js"
+  },
+  "dependencies": {
+    "@ares/core": "*",
+    "@ares/encoder": "*",
+    "meshoptimizer": "^1.2.0",
+    "draco3d": "^1.5.7"
+  },
+  "devDependencies": {
+    "@types/draco3d": "^1.4.10",
+    "@types/node": "^26.1.1"
+  }
+}
