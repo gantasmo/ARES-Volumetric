@@ -3,7 +3,7 @@
   "license": "MIT",
   "private": true,
   "version": "0.1.0",
-  "description": "ARES Volumetric — single-file .ares container + browser runtime for volumetric video (reference implementation)",
+  "description": "Volumetric video in a browser from a single file: the .ares container format, its WebGPU/WebGL2 runtime, and the encoder that produces it (reference implementation)",
   "workspaces": [
     "packages/*",
     "apps/*",
@@ -12,9 +12,9 @@
   "scripts": {
     "build": "tsc -b",
     "clean": "tsc -b --clean",
-    "start": "node tools/launch.mjs",
+    "start": "node ARES.mjs",
     "serve": "node tools/serve.mjs",
-    "probe": "node tools/launch.mjs probe",
+    "probe": "node ARES.mjs probe",
     "bench": "node bench/dist/run.js",
     "test": "tsc -b && node --test \"packages/*/test/*.test.mjs\"",
     "postinstall": "node tools/fix-ide-symlinks.mjs",
@@ -32,6 +32,10 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/gantasmo/ares.git"
+    "url": "git+https://github.com/gantasmo/ARES-Volumetric.git"
+  },
+  "homepage": "https://github.com/gantasmo/ARES-Volumetric#readme",
+  "bugs": {
+    "url": "https://github.com/gantasmo/ARES-Volumetric/issues"
   }
 }

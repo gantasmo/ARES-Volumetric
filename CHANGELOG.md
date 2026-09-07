@@ -2,7 +2,17 @@
 
 ## 0.1.0 — 2026-09-07 (unreleased)
 
-First versioned cut, following the 2026-09-07 audit ([AUDIT.md](AUDIT.md)).
+**ARES Volumetric plays volumetric video in a browser, from a single file.** A capture that would
+normally arrive as thousands of meshes and gigabytes of PNGs becomes one `.ares` file: quantized,
+meshopt-compressed geometry interleaved with a hardware-decodable AV1/VP9 video texture in one
+GOP-aligned stream, with an optional Opus audio track. The player fetches that one file, dequantizes
+vertex positions in the vertex shader, and uploads each decoded video frame straight to the GPU. A
+real 272-frame capture is 49.7 MB in one request, against 1.58 GB across 544 files as raw OBJ+PNG.
+
+This is the first versioned cut — the format, the browser runtime, the `ares` CLI, the Three.js and
+React wrappers, the demo app and the specification, as they stand after the 2026-09-07 audit
+([AUDIT.md](AUDIT.md)). **Added** below is what this release contains rather than a delta from an
+earlier version; **Fixed** is relative to the unversioned initial public drop (commit `0907ee5`).
 
 ### Added
 - Gaussian splat profile (spec §6.8, §11.6.3): `SPLT` geometry track, meshopt-coded splat streams
@@ -35,9 +45,17 @@ First versioned cut, following the 2026-09-07 audit ([AUDIT.md](AUDIT.md)).
   only the container skeleton and shows profile + audio.
 
 ### Changed
-- One launcher for the whole app: `tools/launch.mjs` (`npm start`, or `ARES.vbs` on Windows) with
-  modes `app | probe | bench | sam`. It replaces the four root `.vbs` launchers and their three
+- One launcher for the whole app, at the repo root: `ARES.mjs` (`npm start`, or `ARES.vbs` to
+  double-click on Windows, `ARES-console.cmd` for a visible console) with modes
+  `app | probe | bench | sam`. It replaces the four root `.vbs` launchers and their three
   PowerShell workers; `npm run serve` still starts the bare dev server.
+- Package manifests point at the real repository (`gantasmo/ARES-Volumetric`) and carry
+  `homepage`, `bugs` and a monorepo `repository.directory`. Each publishable package now ships its
+  own README and a copy of the MIT licence, `@webgpu/types` moved to `dependencies` (its types
+  appear in `@ares/core`'s public declarations), the browser packages no longer demand Node 22.15,
+  and `@ares/three` publishes its bundle deterministically.
+- `npm run release` builds the downloadable archive for a GitHub release: browser bundles, the four
+  npm tarballs, the spec and the notices, as a directory, a zip and a release-notes file.
 
 ### Fixed
 - WebGL2 renderer: crop preview and wireframe were silent no-ops.

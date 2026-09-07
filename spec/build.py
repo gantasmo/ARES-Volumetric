@@ -124,11 +124,13 @@ def to_html(md_text):
 
 def main():
     files, md = collect()
-    # Render BEFORE opening the outputs: open(..., "w") truncates, so rendering inside the
-    # `with` turned a missing `markdown` into a 0-byte ARES-Runtime-Specification.html.
-    html = to_html(md)
+    # The Markdown build must not depend on the HTML one: write it first, so a missing
+    # `markdown` module still leaves a current .md (to_html exits the process).
     with open(OUT_MD, "w", encoding="utf-8") as fh:
         fh.write(md)
+    # Render BEFORE opening the HTML: open(..., "w") truncates, so rendering inside the
+    # `with` turned a missing `markdown` into a 0-byte ARES-Runtime-Specification.html.
+    html = to_html(md)
     with open(OUT_HTML, "w", encoding="utf-8") as fh:
         fh.write(html)
     words = len(md.split())

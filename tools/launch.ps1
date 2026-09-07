@@ -1,10 +1,10 @@
 # ARES Windows bootstrap — the only job here is getting Node.js, then handing over to
-# tools\launch.mjs, which is the launcher for every platform. Run via "ARES.vbs" (windowless)
-# or tools\launch-console.cmd (visible console). Windows PowerShell 5.1 compatible.
+# ARES.mjs at the repo root, which is the launcher for every platform. Run via "ARES.vbs"
+# (windowless) or ARES-console.cmd (visible console). Windows PowerShell 5.1 compatible.
 #
 #   powershell -File tools\launch.ps1 [app|probe|bench|sam] [launcher options]
 #
-# Everything else — dependencies, build, demo clip, dev server, browser — lives in launch.mjs
+# Everything else — dependencies, build, demo clip, dev server, browser — lives in ARES.mjs
 # and is logged to tools\launch.log. Failures raise a message box, because the windowless path
 # has nowhere else to report.
 param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $LaunchArgs)
@@ -13,7 +13,7 @@ $ErrorActionPreference = "Continue"
 $ToolsDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $AresDir  = Split-Path -Parent $ToolsDir
 $LogFile  = Join-Path $ToolsDir "launch.log"
-$LaunchJs = Join-Path $ToolsDir "launch.mjs"
+$LaunchJs = Join-Path $AresDir "ARES.mjs"
 
 Add-Type -AssemblyName System.Windows.Forms | Out-Null
 function Fail($msg) {

@@ -31,7 +31,9 @@ moved drives), `npm install` recreates them.
 - Byte layouts are shared law: a change to a block layout touches `@ares/core` (decoder),
   `@ares/encoder` (encoder), `spec/11-file-format.md`, and a round-trip test, in one change.
 - The demo app (`apps/demo`) has no build step; it loads `packages/*/dist` through an import map.
-  UI follows `docs/ui-design-notes.md` (tokens only, no indicator lights, no emoji icons).
+  UI rules, in full: use the CSS custom-property tokens and the shared `.u` / `.inp` classes rather
+  than new one-off styles; no neon or saturated accents, no indicator lights, no emoji icons; data
+  colours stay muted; panels fit their space instead of introducing scrollbars.
 - Do not launch the browser to verify UI in a shared session; verify statically (`node --check`,
   reading diffs) and let the owner reload.
 
@@ -46,6 +48,12 @@ A test that needs ffmpeg must skip cleanly when it is absent.
 Packages are versioned together (`0.1.0` today). `npm run release:check` builds, tests, bundles
 and dry-runs `npm pack` for every workspace. Publishing is `npm publish --workspace @ares/core`
 (then encoder, three, react) once the `@ares` npm scope is confirmed available to the owner.
+
+`npm run release` builds the downloadable archive for a GitHub release:
+`dist/release/ares-volumetric-<version>/` (browser bundles, the four npm tarballs, the spec and
+the licence/notice files), the same tree as `ares-volumetric-<version>.zip`, and
+`ares-volumetric-<version>-notes.md` to pass to `gh release create --notes-file`. `dist/` is
+git-ignored; the archive is an attachment, never a commit.
 
 ## Spec
 

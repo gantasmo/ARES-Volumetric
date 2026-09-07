@@ -9,7 +9,12 @@
   },
   "repository": {
     "type": "git",
-    "url": "git+https://github.com/gantasmo/ares.git"
+    "url": "git+https://github.com/gantasmo/ARES-Volumetric.git",
+    "directory": "packages/encoder"
+  },
+  "homepage": "https://github.com/gantasmo/ARES-Volumetric#readme",
+  "bugs": {
+    "url": "https://github.com/gantasmo/ARES-Volumetric/issues"
   },
   "publishConfig": {
     "access": "public"
@@ -36,7 +41,8 @@
       "types": "./dist/index.d.ts",
       "import": "./dist/index.js",
       "default": "./dist/index.js"
-    }
+    },
+    "./package.json": "./package.json"
   },
   "bin": {
     "ares": "./dist/cli.js"

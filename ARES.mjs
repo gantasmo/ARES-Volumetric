@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 /**
- * ARES launcher — the single entry point for the app.
+ * ARES launcher — the single entry point for the app. It lives at the repo root on purpose:
+ * a launcher nobody can find is not a launcher.
  *
  * One implementation for every way of starting ARES, replacing the four root .vbs launchers
  * and their three near-identical PowerShell workers (2026-09-07 audit, "project hygiene":
@@ -8,9 +9,10 @@
  * so the launcher is Node; `ARES.vbs` -> `tools/launch.ps1` is only the Windows double-click
  * bootstrap (it finds or installs Node, then runs this file).
  *
- *   node tools/launch.mjs [app|probe|bench|sam] [options]   any OS
- *   npm start                                               same, mode app
- *   ARES.vbs [mode]                                         Windows, windowless double-click
+ *   node ARES.mjs [app|probe|bench|sam] [options]   any OS
+ *   npm start                                       same, mode app
+ *   ARES.vbs [mode]                                 Windows, windowless double-click
+ *   ARES-console.cmd [mode]                         Windows, visible console
  *
  * Modes
  *   app    (default) the demo app: Viewer | Compare | Inspect | Convert, plus the editor
@@ -35,7 +37,7 @@ import { appendFileSync, existsSync, statSync } from "node:fs";
 import { dirname, join, resolve as resolvePath } from "node:path";
 import { fileURLToPath } from "node:url";
 
-const ROOT = dirname(dirname(fileURLToPath(import.meta.url)));
+const ROOT = dirname(fileURLToPath(import.meta.url)); // this file sits at the repo root
 const LOG_FILE = join(ROOT, "tools", "launch.log");
 const SERVE_JS = join(ROOT, "tools", "serve.mjs");
 const CLI_JS = join(ROOT, "packages", "encoder", "dist", "cli.js");
@@ -80,7 +82,7 @@ function run(cmd, args, opts = {}) {
 // --- arguments ---------------------------------------------------------------
 const HELP = `ARES launcher
 
-  node tools/launch.mjs [app|probe|bench|sam] [options]
+  node ARES.mjs [app|probe|bench|sam] [options]
 
 Modes
   app     (default) demo app: Viewer | Compare | Inspect | Convert
@@ -99,37 +101,35 @@ Options
 
 Log: tools/launch.log`;
 
-function flagValue(argv, name) {
-  const i = argv.indexOf(name);
-  if (i < 0) return undefined;
-  const v = argv[i + 1];
-  // A value flag followed by another flag (or by nothing) is a usage error, not a value.
-  if (v === undefined || v.startsWith("-")) fail(`${name}: expected a value`);
-  return v;
-}
-
+/** One left-to-right walk. Values are consumed BY POSITION, never matched by value: with
+ *  `--src bench.ares bench`, the mode is still bench and the clip is still bench.ares. */
 function parseArgs(argv) {
   if (argv.includes("-h") || argv.includes("--help")) { console.log(HELP); process.exit(0); }
-  for (const a of argv) {
-    if (a.startsWith("-") && !OPTIONS.includes(a)) fail(`unknown option ${a} — run with --help`);
+  const out = { src: undefined, port: DEFAULT_PORT, detach: false, open: true, build: true, install: true };
+  const positional = [];
+  for (let i = 0; i < argv.length; i++) {
+    const a = argv[i];
+    if (!a.startsWith("-")) { positional.push(a); continue; }
+    if (!OPTIONS.includes(a)) fail(`unknown option ${a} — run with --help`);
+    if (a === "--port" || a === "--src") {
+      const v = argv[++i];
+      // A value flag followed by another flag (or by nothing) is a usage error, not a value.
+      if (v === undefined || v.startsWith("-")) fail(`${a}: expected a value`);
+      if (a === "--src") { out.src = v; continue; }
+      const n = Number(v);
+      if (!Number.isInteger(n) || n < 1024 || n > 65535) fail(`--port: expected an integer 1024-65535, got ${JSON.stringify(v)}`);
+      out.port = n;
+      continue;
+    }
+    if (a === "--detach") out.detach = true;
+    else if (a === "--no-open") out.open = false;
+    else if (a === "--no-build") out.build = false;
+    else if (a === "--no-install") out.install = false;
   }
-  const port = flagValue(argv, "--port");
-  const src = flagValue(argv, "--src");
-  const taken = new Set([port, src].filter((v) => v !== undefined));
-  const mode = argv.find((a) => !a.startsWith("-") && !taken.has(a)) ?? "app";
+  if (positional.length > 1) fail(`unexpected argument ${JSON.stringify(positional[1])} — one mode at a time; run with --help`);
+  const mode = positional[0] ?? "app";
   if (!MODES.has(mode)) fail(`unknown mode ${JSON.stringify(mode)} — expected one of ${[...MODES].join(", ")}`);
-  const portNum = port === undefined ? DEFAULT_PORT : Number(port);
-  if (!Number.isInteger(portNum) || portNum < 1024 || portNum > 65535) {
-    fail(`--port: expected an integer 1024-65535, got ${JSON.stringify(port)}`);
-  }
-  return {
-    mode, src,
-    port: portNum,
-    detach: argv.includes("--detach"),
-    open: !argv.includes("--no-open"),
-    build: !argv.includes("--no-build"),
-    install: !argv.includes("--no-install"),
-  };
+  return { mode, ...out };
 }
 
 // --- steps -------------------------------------------------------------------
@@ -220,8 +220,11 @@ function openBrowser(url) {
     process.platform === "win32" ? ["cmd", ["/c", "start", "", url]]
     : process.platform === "darwin" ? ["open", [url]]
     : ["xdg-open", [url]];
-  try { spawn(cmd, args, { detached: true, stdio: "ignore", windowsHide: true }).unref(); }
-  catch (e) { log(`could not open a browser (${e.message}) — go to ${url}`); }
+  // A missing opener (headless Linux without xdg-utils) surfaces as an async 'error' event,
+  // never as a throw, so the listener — not a try/catch — is what keeps the URL visible.
+  const child = spawn(cmd, args, { detached: true, stdio: "ignore", windowsHide: true });
+  child.on("error", (e) => log(`could not open a browser (${e.message}) — go to ${url}`));
+  child.unref();
 }
 
 function startSamService() {

@@ -11,9 +11,9 @@
  *   dist/release/ares-volumetric-<version>.zip    the same tree, zipped (store + deflate,
  *                                                 written here because Node ships no zip writer)
  *
- * In the box: the single-file browser bundles, npm tarballs for the four packages (offline
- * `npm i ./ares-core-<v>.tgz`), the spec, and the licence/notice files. The demo app is not
- * included: it needs the COOP/COEP dev server, which means the repo.
+ * In the box: the single-file browser bundles, npm tarballs for the four packages
+ * (`npm i ./npm/ares-core-<v>.tgz`), the spec, and the licence/notice files. The demo app is
+ * not included: it needs the dev server and the encoder, which means the repo.
  */
 import { spawn } from "node:child_process";
 import { cp, mkdir, readFile, readdir, rm, stat, writeFile } from "node:fs/promises";
@@ -151,38 +151,95 @@ for (const d of DOCS) {
 }
 
 const tarballs = (await readdir(join(stage, "npm"))).sort();
+const repoUrl = pkg.repository?.url?.replace(/^git\+/, "").replace(/\.git$/, "") ?? "the repository";
+
+/** Nobody downloading this has read the changelog, and for a first release there is no "before" to
+ *  diff against — so every generated document opens by saying what the thing IS. */
+const ABOUT = `**ARES Volumetric plays volumetric video in a browser, from a single file.**
+
+A volumetric capture — an animated person or object, one mesh plus one texture per frame, or a
+Gaussian splat cloud — normally arrives as thousands of files and gigabytes of PNGs. ARES packs a
+whole clip into one \`.ares\` file: quantized, meshopt-compressed geometry interleaved with a
+hardware-decodable AV1/VP9 video texture in one GOP-aligned stream, plus an optional Opus audio
+track. The player fetches that one file, keeps vertex positions quantized until the vertex shader
+dequantizes them on the GPU, and hands each decoded video frame to the GPU without a CPU pixel copy.
+
+A real 272-frame capture (11.3k vertices per frame, 9.1 s at 30 fps) is **49.7 MB in one file and
+one request** — against 1.58 GB across 544 files as raw OBJ+PNG, or 1.13 GB as a Draco-GLB sequence.
+
+This ${pkg.version} release is the format, the runtime and the tools that produce it: mesh clips with
+video texture, static and dynamic Gaussian splats (SPZ, 3DGS PLY, \`.splat\`, glTF
+\`KHR_gaussian_splatting\` and SOG in; SPZ, PLY, GLB and \`.splat\` out), an Opus audio track,
+playback effects, WebGPU with a WebGL2 fallback, optional worker decode, a Three.js object and a
+React component, and an \`ares\` CLI that encodes, inspects and exports. The repository additionally
+carries the demo app (viewer, side-by-side compare, container inspector, converter and mesh editor),
+a capability probe and a benchmark harness.`;
+
+await writeFile(join(ROOT, "dist", "release", `${name}-notes.md`), `# ARES Volumetric ${pkg.version}
+
+${ABOUT}
+
+Source, demo app and encoder CLI: ${repoUrl}
+
+## Download
+
+\`${name}.zip\` — the browser bundles, npm tarballs for the four packages, and the specification.
+Unzip and open \`README.md\` inside for the file-by-file guide. Everything else (demo app, encoder
+CLI, dev server) comes from a clone: on Windows double-click \`ARES.vbs\`, anywhere else run
+\`npm install && npm start\`.
+
+## What is in this release
+
+See \`docs/CHANGELOG.md\` in the archive for the itemised list.
+`);
+
 await writeFile(join(stage, "README.md"), `# ARES Volumetric ${pkg.version}
 
-${pkg.description}
+${ABOUT}
 
-Source, demo app and encoder CLI: ${pkg.repository?.url?.replace(/^git\+|\.git$/g, "") ?? "the repository"}
+Source, demo app and encoder CLI: ${repoUrl}
 
 ## bundles/
 Single-file browser builds of \`@ares/core\` (meshoptimizer inlined, nothing else fetched).
 Each has a \`.min.js\` and a source map.
 
+    <canvas id="stage"></canvas>
     <script type="module">
       import { AresPlayer } from "./ares-core.esm.js";
-      const player = new AresPlayer(canvas, { workerUrl: "./ares-decode-worker.js" });
-      await player.load("clip.ares");
+
+      const player = await AresPlayer.create({
+        canvas: document.getElementById("stage"),
+        src: "clip.ares",
+        loop: true,
+        useWorker: true,                            // optional: decode geometry off the main thread
+        workerUrl: "./ares-decode-worker.js",       // required whenever useWorker is set
+      });
       player.play();
     </script>
 
-\`ares-core.iife.js\` is the classic-script variant (\`window.ARES\`); it has no
-\`import.meta\`, so pass \`workerUrl\` explicitly as above. \`ares-three.esm.js\` keeps
-\`three\` external as a peer.
+\`AresPlayer.create\` is the only entry point — the constructor is internal. \`useWorker\`
+needs \`workerUrl\` to point at \`ares-decode-worker.js\`; neither bundle can resolve it on its
+own, and without a usable worker the player decodes on the main thread. \`ares-core.iife.js\` is
+the classic-script variant (\`window.ARES\`), and \`ares-three.esm.js\` keeps \`three\` external
+as a peer.
 
-Serve the page cross-origin isolated (COOP: same-origin, COEP: require-corp) if you want the
-worker decode path; without it the player decodes on the main thread.
+Serve the files over HTTP (not \`file://\`) — a module worker and WebCodecs both need an origin.
+Cross-origin isolation is not required: the worker path transfers ArrayBuffers rather than sharing
+memory.
 
 ## npm/
-Tarballs for offline install, no registry needed:
+Tarballs of the four packages:
 
 ${tarballs.map((t) => `    npm i ./npm/${t}`).join("\n")}
 
+\`@ares/core\` installs from its tarball alone. The other three declare \`@ares/*\` dependencies
+that npm resolves by name, so install them against a registry that has those packages, or add
+\`overrides\` pointing at the tarballs beside them.
+
 ## docs/
-The specification (Markdown and printable HTML), README, changelog, licence and third-party
-notices. ARES is MIT; \`THIRD-PARTY-NOTICES.md\` covers what the bundles and tools carry.
+The specification (Markdown and printable HTML), the project README, changelog, contributing
+guide, licence and third-party notices. ARES is MIT; \`THIRD-PARTY-NOTICES.md\` covers what the
+bundles and tools carry.
 `);
 
 const zip = join(ROOT, "dist", "release", `${name}.zip`);
@@ -190,3 +247,4 @@ const count = await zipDir(stage, zip, name);
 const size = (await stat(zip)).size;
 console.log(`[release] ${stage}`);
 console.log(`[release] ${zip} (${count} files, ${(size / 1024 / 1024).toFixed(1)} MB)`);
+console.log(`[release] ${join(ROOT, "dist", "release", `${name}-notes.md`)}  (release notes: what ARES is + the download)`);

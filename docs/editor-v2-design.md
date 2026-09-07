@@ -156,7 +156,7 @@ Cost: 60k VS invocations/frame vs ~11k (indexed, cached) — vertex pulling is b
 
 ### 5.3 CPU region math
 
-`curPosQ` (u16) + GOP AABB + `dequantScale` already live on the CPU per presented frame (`player.ts` decode path). Editor v2 adds `player.getFrameGeometry()` exposing `{ positionsQ, indices, aabb }`; dequant of 11k verts is a ~0.1 ms typed-array loop. All volume evaluation (§6.2) uses these world positions, both for preview (`tstate`) and for through-selection gestures. The bake re-implements the identical predicate in the encoder against OBJ floats (§9) — same math, two hosts, one shared `packages/encoder/src/edits.ts` + `packages/core` re-export so player preview and encoder bake cannot drift.
+`curPosQ` (u16) + GOP AABB + `dequantScale` already live on the CPU per presented frame (`player.ts` decode path). Editor v2 adds `player.getFrameGeometry()` exposing `{ positionsQ, indices, aabb }`; dequant of 11k verts is a ~0.1 ms typed-array loop. All volume evaluation (§6.2) uses these world positions, both for preview (`tstate`) and for through-selection gestures. The bake re-implements the identical predicate in the encoder against OBJ floats (§9) — same math, two hosts, one shared `packages/core/src/edits.ts`, re-exported from `@ares/core` and imported by the encoder, so player preview and encoder bake cannot drift.
 
 ---
 
@@ -313,7 +313,7 @@ ares encode <frames-dir> -o out.ares --edits daniel.edits.json [--fps 30 ...]
 
 Per frame f (in `cli.ts encode`, replacing the current `--crop` block):
 1. `activeRanges = ranges.filter(r => r.startFrame <= f && f <= r.endFrame)`
-2. For each, interpolate its region at f (§6.2) → `insideAny(p)` predicate. Volume math lives in `packages/encoder/src/edits.ts`, shared with the player preview (§5.3).
+2. For each, interpolate its region at f (§6.2) → `insideAny(p)` predicate. Volume math lives in `packages/core/src/edits.ts`, shared with the player preview (§5.3).
 3. `filterFrame(frame, keepTri)` — generalization of `cropFrame` where `keepTri(t)` = *"centroid **not** inside any delete region"* (and `= "centroid inside the keep region"` for crop). Pass 2 (vertex compaction/remap of positions+UVs) is reused verbatim from `crop.ts`.
 4. `scrubTexels` ranges: rasterize dropped tris' UVs → mask → blank atlas PNG before the ffmpeg texture pass (§9.3).
 5. Log per-range drop counts like today's crop log (`tris/frame (x% removed)`).
@@ -378,7 +378,7 @@ Undo/redo = command stack over this document; autosave debounced to the sidecar.
 **@ares/core** — editor pipeline (non-indexed VS variant + ID pass + tstate buffer + barycentric edges); `player.getFrameGeometry()`; `player.setEditPreview(editList | null)`; `player.renderIdPass(camera?, size?) → {ids, depth}` readback helper; offscreen frame renders for propagation; expose `project/unproject` from `camera.ts`.
 **apps/demo** — Edit tab v2: tool palette (Box / Brush / SAM point / SAM text), x-ray + wireframe toggles honoring §4's law, edit track under `#scrub` (ranges, diamonds, chevrons), keyframe navigation (prev/next diamond), bake panel extended to send `--edits` (reusing the v1 SSE flow in `main.js initEditor`).
 **tools/serve.mjs** — `GET/POST /edits/:name` (write next to the demo clips, path-sanitized like `/encode`); `/sam/*` reverse proxy with `SAM_URL` env (default `http://127.0.0.1:7263`), streaming pass-through for propagation.
-**packages/encoder** — `edits.ts` (schema parse/validate, per-frame region interpolation, `filterFrame`); `cli.ts --edits`; `--crop` reimplemented as degenerate list; optional texel scrub pre-pass in `texture-video.ts`.
+**packages/core** — `edits.ts` (schema parse/validate, per-frame region interpolation), consumed by both hosts. **packages/encoder** — `filterFrame`; `cli.ts --edits`; `--crop` reimplemented as degenerate list; optional texel scrub pre-pass in `texture-video.ts`.
 **SAM sidecar** — `tools/sam-service/` Dockerfile + FastAPI façade over SAM 2.1 video predictor (upgrade path: SAM 3 checkpoint swap), README with `docker compose up` (GPU) mirroring Meta's demo topology.
 
 **Suggested build order:** (1) editor pipeline + ID picking + box/brush through+visible selection, single-frame delete preview → (2) ranges/keyframes/interpolation + track UI + bake via `--edits` (crop parity test: v1 sliders → identical output through the new path) → (3) SAM click single-frame → (4) propagation + derived keyframes → (5) scrubTexels + polish.

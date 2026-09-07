@@ -2,9 +2,10 @@
  * ARES dev server — zero-dependency static server with cross-origin isolation.
  *
  * Sends COOP/COEP on every response so `crossOriginIsolated` is true and
- * SharedArrayBuffer is available (required for the worker mesh/splat decode
- * path, spec §10.2). `npx serve` and `python -m http.server` do NOT send
- * these headers, which is why the probe reported SharedArrayBuffer: no.
+ * SharedArrayBuffer is available — the probe measures both (spec §10.2 assumes
+ * they stay reachable), and `npx serve` / `python -m http.server` do NOT send
+ * these headers, which is why the probe reported SharedArrayBuffer: no. The
+ * runtime does not depend on it: worker decode transfers ArrayBuffers.
  *
  * Usage:  node tools/serve.mjs [port]     (default 8137, walks up if busy)
  * Serves: the ares/ repo root (parent of tools/), / redirects to the probe.
@@ -680,7 +681,7 @@ async function handle(req, res) {
   // ---- GLOBAL ACTIVITY LOG: everything that happens goes to a toggleable, append-only JSONL log on
   // the SERVER, not localStorage, so it survives tab switches, reloads, and a different browser — an
   // audit trail of what actually happened. Three producers write here: the app (UI actions, console,
-  // errors), the pipeline (bake/encode stages), and tooling (tools/log-note.mjs).
+  // errors) and the pipeline (bake/encode stages).
   // GET ?tail=N returns the last N entries so a fresh tab restores the full history.
   if (path === "/log") {
     const file = join(ROOT, "apps", "demo", ".ares-activity.jsonl");

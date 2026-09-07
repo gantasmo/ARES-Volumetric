@@ -1,6 +1,6 @@
 /**
- * Texture paint, build-order item 1 of the sculpt+paint plan (docs/reports/2026-07-16-sculpt-
- * paint-plan.md §B): a TEXEL-granular soft brush over the range's world-anchored region.
+ * Texture paint: a TEXEL-granular soft brush over the range's world-anchored region, and the
+ * first of the two bake-side brush actions (the other is sculpt.ts).
  *
  * Recolor (recolor.ts) is the hard-edged, triangle-granular ancestor: it selects whole
  * triangles by centroid and retints their entire UV footprint. Paint differs in exactly one

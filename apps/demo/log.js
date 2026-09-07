@@ -3,7 +3,7 @@
 // The log is an audit trail, not a summary. It records what ACTUALLY happened — timestamped,
 // server-persisted (apps/demo/.ares-activity.jsonl via /log), and readable after the fact.
 // Three producers write to the same sink: the app (here), the pipeline (bake stages, forwarded
-// from the /diagnostics SSE), and tooling (tools/log-note.mjs).
+// from the /diagnostics SSE).
 //
 // Design notes:
 // - SERVER-side persistence, not localStorage: it must survive tab switches, reloads, a different

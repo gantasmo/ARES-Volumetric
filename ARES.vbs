@@ -6,7 +6,7 @@
 '
 ' Optional argument picks what to open — app (default), probe, bench, or sam:
 '     ARES.vbs probe        cscript "ARES.vbs" bench
-' Troubleshooting: run tools\launch-console.cmd for a visible console, or read tools\launch.log.
+' Troubleshooting: run ARES-console.cmd for a visible console, or read tools\launch.log.
 Option Explicit
 Dim fso, sh, dir, ps1, cmd, i
 Set fso = CreateObject("Scripting.FileSystemObject")

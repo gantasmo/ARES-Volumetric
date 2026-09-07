@@ -1,7 +1,7 @@
 # Gaussian splat integration notes
 
-**Status: field notes, not a decision.** Filed under the `DECISIONS.md` §2 convention — this is evidence
-gathered on another project, contestable, and scoped to exactly what was tried.
+**Status: field notes, not a decision.** This is evidence gathered on another project — contestable, and
+scoped to exactly what was tried.
 
 Written 2026-08-22 while building an SPZ→mesh importer for the *Lord Lyrical: The Resonant Realm* VR piece
 (Unity 6.5, standalone Quest target). ARES has the splat profile **specified but unimplemented**
@@ -158,8 +158,9 @@ to 330 k in 3.0 s; surfaced to 205 k tris in **3.9 s**; decimated to 80 k tris w
 0.999**.
 
 That last number is the ARES technique paying itself back immediately — I used `arap-poc.mjs`'s signed
-**volume ratio** as the integrity gate rather than a surface-distance metric, on the strength of the
-`DECISIONS.md` §2 finding that nearest-surface error is *blind*. It caught nothing this run, which is the
+**volume ratio** as the integrity gate rather than a surface-distance metric, because nearest-surface
+error is blind to spikes: a mean distance stays small while a handful of vertices fly off, which is the
+failure mode decimation actually produces. It caught nothing this run, which is the
 point: it is a smoke alarm, and a cheap one at ~15 lines.
 
 ---
@@ -190,4 +191,4 @@ point: it is a smoke alarm, and a cheap one at ~15 lines.
   `MeshDecimator.cs` (QEM + border lock), `MeshIntegrity.cs` (volume ratio, ported from `arap-poc.mjs`).
 - ARES pages leaned on here: `spec/06-geometry.md` §6.8/§6.10, `spec/08-compression.md` §8.5,
   `packages/core/src/quant.ts`, `packages/encoder/src/importers/ply.ts`,
-  `packages/encoder/src/decimate.ts`, `tools/coherent/arap-poc.mjs`, `DECISIONS.md` §2.
+  `packages/encoder/src/decimate.ts`, `tools/coherent/arap-poc.mjs`.

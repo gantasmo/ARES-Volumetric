@@ -23,6 +23,8 @@ Two companion documents summarize the project at different depths:
 ## Layout
 
 ```
+  ARES.mjs               The launcher, any OS: app | probe | bench | sam
+  ARES.vbs               Windows double-click shim (windowless); ARES-console.cmd shows a console
   spec/                  Specification source, one file per chapter; spec/build.py
                          assembles ARES-Runtime-Specification.md + .html
   apps/phase0-probe/     Capability probe: WebGPU adapters, WebCodecs HW decode, isolation
@@ -35,7 +37,6 @@ Two companion documents summarize the project at different depths:
   packages/three/        @ares/three   AresObject (THREE.Object3D wrapper)
   packages/react/        @ares/react   <Ares/> for @react-three/fiber
   tools/serve.mjs        Zero-dependency dev server: COOP/COEP headers + local GUI endpoints
-  tools/launch.mjs       The launcher, any OS: app | probe | bench | sam (ARES.vbs wraps it)
   tools/sam-service/     Local FastAPI SAM segmentation service (editor assist)
   tools/4ds/             .4ds decode host for a locally licensed 4DViews codec DLL (not included)
   tools/coherent/        Coherent-GOP pre-pass: stable-template registration + atlas rebake
@@ -47,7 +48,8 @@ Two companion documents summarize the project at different depths:
 ```
 
 Toolchain: npm workspaces (npm ships with Node; pnpm and yarn are not used here),
-TypeScript 7.x (`tsc -b` project references), Node 18 or newer (tested on 24 LTS).
+TypeScript 7.x (`tsc -b` project references), Node 22.15 or newer (tested on 24 LTS) — the SPZ
+importer uses zstd from `node:zlib`. The browser packages themselves need no particular Node.
 
 ## Status
 
@@ -97,8 +99,8 @@ One launcher, four modes. On Windows, double-click **`ARES.vbs`** at the repo ro
 Node (installing the LTS build via winget if the machine has none), installs dependencies and
 builds when they are stale, synthesizes a demo clip if the checkout has no `.ares` file, starts
 the COOP/COEP dev server or reuses a running one, and opens the browser — all windowless.
-Every step is logged to `tools/launch.log`, and `tools\launch-console.cmd` runs the same flow
-with a visible console.
+Every step is logged to `tools/launch.log`, and `ARES-console.cmd` runs the same flow with a
+visible console.
 
 | Command | Opens |
 |---|---|
@@ -113,7 +115,7 @@ with a visible console.
 npm install
 npm run build                    # tsc -b across packages
 npm start                        # launcher -> http://127.0.0.1:8137/apps/demo/
-node tools/launch.mjs --help     # modes and flags (--port, --src, --detach, --no-open, ...)
+node ARES.mjs --help             # modes and flags (--port, --src, --detach, --no-open, ...)
 npm run serve                    # just the dev server: no build, no browser
 ```
 
@@ -126,11 +128,13 @@ without any capture data, and is all the demo needs to run:
 node packages/encoder/dist/cli.js synth -o apps/demo/demo.ares --shape object --frames 60
 ```
 
-The custom server exists because the worker decode path (spec 10.2) needs
-`SharedArrayBuffer`, which browsers only enable under cross-origin isolation
-(`Cross-Origin-Opener-Policy: same-origin` plus `Cross-Origin-Embedder-Policy:
-require-corp`). Plain static servers such as `npx serve` or `python -m http.server` do not
-send those headers, so the probe reports `crossOriginIsolated: no` under them. `serve.mjs`
+The custom server exists because the probe measures cross-origin isolation and
+`SharedArrayBuffer` availability (spec 10.2 assumes both stay reachable), which browsers only
+grant under `Cross-Origin-Opener-Policy: same-origin` plus `Cross-Origin-Embedder-Policy:
+require-corp`. Plain static servers such as `npx serve` or `python -m http.server` do not
+send those headers, so the probe reports `crossOriginIsolated: no` under them. The runtime
+itself does not need isolation: worker decode transfers ArrayBuffers rather than sharing
+memory, so it works on any origin. `serve.mjs`
 sends them on every response and also hosts the local GUI endpoints (`/encode`, `/enhance`,
 `/pick`, `/analyse`, `/edits/*`, `/sam/*`, `/showcase`).
 
@@ -332,7 +336,7 @@ The near-term queue (owner-steered):
    irreversibly AI-upscaled; reference photos are obtainable ground truth).
 
 The staged roadmap (spec 14) continues with P3 streaming (range-request seek, prefetch,
-ABR ladder), the dynamic splat profile (P-frames with birth/death lists on top of the shipped
-intra splat profile), P5 importer suite for mesh formats (glTF, Alembic, USD, Depthkit,
+ABR ladder), the remaining splat work (GPU sort, an LoD ladder, splat worker decode, hybrid
+mesh+splat files), P5 importer suite for mesh formats (glTF, Alembic, USD, Depthkit,
 4DViews), and P6 hardening toward a spec freeze. [AUDIT.md](AUDIT.md) tracks the 2026-09-07
 audit queue.
