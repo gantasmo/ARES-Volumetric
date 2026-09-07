@@ -124,10 +124,13 @@ def to_html(md_text):
 
 def main():
     files, md = collect()
+    # Render BEFORE opening the outputs: open(..., "w") truncates, so rendering inside the
+    # `with` turned a missing `markdown` into a 0-byte ARES-Runtime-Specification.html.
+    html = to_html(md)
     with open(OUT_MD, "w", encoding="utf-8") as fh:
         fh.write(md)
     with open(OUT_HTML, "w", encoding="utf-8") as fh:
-        fh.write(to_html(md))
+        fh.write(html)
     words = len(md.split())
     print(f"Combined {len(files)} sections.")
     print(f"  {OUT_MD}   ({words:,} words, ~{max(1, words // 500)} pages)")

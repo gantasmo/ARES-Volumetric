@@ -20,7 +20,8 @@
     "postinstall": "node tools/fix-ide-symlinks.mjs",
     "bundle": "node tools/bundle.mjs",
     "test:quick": "node --test \"packages/*/test/*.test.mjs\"",
-    "release:check": "npm run build && npm test && npm run bundle && npm pack --workspaces --dry-run"
+    "release:check": "npm run build && npm test && npm run bundle && npm pack --workspaces --dry-run",
+    "release": "npm run build && npm run bundle && node tools/release.mjs"
   },
   "devDependencies": {
     "esbuild": "^0.25.9",
