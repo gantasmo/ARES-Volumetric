@@ -175,22 +175,40 @@ React component, and an \`ares\` CLI that encodes, inspects and exports. The rep
 carries the demo app (viewer, side-by-side compare, container inspector, converter and mesh editor),
 a capability probe and a benchmark harness.`;
 
-await writeFile(join(ROOT, "dist", "release", `${name}-notes.md`), `# ARES Volumetric ${pkg.version}
+/** The changelog section for this version, with its repo-relative links made absolute — the notes
+ *  are read on the releases page, where `](AUDIT.md)` resolves to nothing. */
+async function changelogSection(version) {
+  const md = await readFile(join(ROOT, "CHANGELOG.md"), "utf8");
+  const start = md.indexOf(`## ${version}`);
+  if (start < 0) return null;
+  const rest = md.indexOf("\n## ", start + 1);
+  const body = (rest < 0 ? md.slice(start) : md.slice(start, rest)).trim();
+  return body
+    .replace(/^## .*\n/, "")                                    // the heading is supplied below
+    .replace(/\]\((?!https?:|#)([^)]+)\)/g, `](${repoUrl}/blob/master/$1)`)
+    .trim();
+}
 
-${ABOUT}
+const section = await changelogSection(pkg.version);
+if (!section) console.warn(`[release] CHANGELOG.md has no "## ${pkg.version}" section — notes will omit it`);
+
+await writeFile(join(ROOT, "dist", "release", `${name}-notes.md`), `${ABOUT}
 
 Source, demo app and encoder CLI: ${repoUrl}
 
 ## Download
 
-\`${name}.zip\` — the browser bundles, npm tarballs for the four packages, and the specification.
-Unzip and open \`README.md\` inside for the file-by-file guide. Everything else (demo app, encoder
-CLI, dev server) comes from a clone: on Windows double-click \`ARES.vbs\`, anywhere else run
-\`npm install && npm start\`.
+**\`${name}.zip\`** — the single-file browser bundles, npm tarballs for the four packages, and the
+specification. Unzip and open \`README.md\` inside for the file-by-file guide, including the
+five-line snippet that plays a clip.
+
+Everything else — the demo app (viewer, compare, inspect, convert, mesh editor), the \`ares\`
+encoder CLI and the dev server — comes from a clone: on Windows double-click \`ARES.vbs\`,
+anywhere else run \`npm install && npm start\`.
 
 ## What is in this release
 
-See \`docs/CHANGELOG.md\` in the archive for the itemised list.
+${section ?? "See CHANGELOG.md in the repository."}
 `);
 
 await writeFile(join(stage, "README.md"), `# ARES Volumetric ${pkg.version}

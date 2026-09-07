@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 — 2026-09-07 (unreleased)
+## 0.1.0 — 2026-09-07
 
 **ARES Volumetric plays volumetric video in a browser, from a single file.** A capture that would
 normally arrive as thousands of meshes and gigabytes of PNGs becomes one `.ares` file: quantized,
