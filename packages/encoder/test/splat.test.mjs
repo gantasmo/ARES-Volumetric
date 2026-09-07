@@ -9,7 +9,7 @@ import { deflateRawSync } from "node:zlib";
 import {
   synthSplatClip, encodeSplatBlock, decodedSplatToFrame, splatAabb, mortonOrder, permuteSplatFrame, filterSplatFrame, transformSplatFrame,
   parseSpz, writeSpz, parseSplatFile, writeSplatFile, parseGltfSplat, writeGlbSplat, parsePly, parsePlySplat, writeSplatPly, isSplatPly,
-  readZipEntries, webpSize, muxClip, synthClip, decodedMeshToFrame, writeObj, writeMeshPly,
+  readZipEntries, webpSize, muxClip, synthClip, decodedMeshToFrame, writeObj, writeMeshPly, meshoptEncoderReady,
 } from "../dist/index.js";
 import { decodeSplatBlock, decodeSplatPBlock, decodeGeometryBlock, Demuxer, GeometryProfile, BlockType, meshoptReady, dequantScale, shRestCoeffs, SH_C0 } from "@ares/core";
 
@@ -39,6 +39,7 @@ function frameClose(a, b, opts = {}) {
 
 test("splat block encode → decode round trip stays within quantization", async () => {
   await meshoptReady();
+  await meshoptEncoderReady();
   const f = synthSplatClip(1, 30, 1).splatFrames[0];
   const box = splatAabb(f);
   const block = encodeSplatBlock(f, box, 14);
@@ -168,6 +169,7 @@ test("splat clip muxes as the splat profile and demuxes frame by frame", async (
   assert.equal(file.tracks[0].codecFourcc, "SPLT");
   assert.equal(file.gopIndex.length, 3);
   await meshoptReady();
+  await meshoptEncoderReady();
   let frames = 0;
   for (const gop of file.gopIndex) {
     const chunk = Demuxer.chunkAt(file, gop);
@@ -188,6 +190,7 @@ test("mesh clip still muxes and round-trips a frame to OBJ/PLY", async () => {
   assert.equal(file.header.geometryProfile, GeometryProfile.MeshIPB);
   assert.equal(file.superblock.quantBitsUv, 16);
   await meshoptReady();
+  await meshoptEncoderReady();
   const chunk = Demuxer.chunkAt(file, file.gopIndex[0]);
   const g = decodeGeometryBlock(Demuxer.geometryBlocks(file, chunk)[0].data);
   const fr = decodedMeshToFrame(g, chunk.gopAabb, file.superblock.quantBitsPos, file.superblock.normalEncoding);

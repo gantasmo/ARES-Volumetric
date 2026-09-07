@@ -140,7 +140,10 @@ export function quantizeSplatFrame(f: SplatFrame, box: Aabb, bits: number, shDeg
   return { count: n, shDegree: degree, flags: f.antialiased ? SplatFlags.Antialiased : 0, positionsQ, attrs, sh };
 }
 
-/** Encode one splat I-frame block from its quantized state (layout in @ares/core splat.ts). */
+/** Encode one splat I-frame block from its quantized state (layout in @ares/core splat.ts).
+ *  Synchronous, so the caller must have awaited `meshoptEncoderReady()` first — `muxClipWithStats`
+ *  does; a direct caller that does not gets meshopt's undefined-instance TypeError, and only when
+ *  the WASM happens not to have compiled yet (it did on Node 24 and did not on Node 22). */
 export function encodeSplatStateBlock(q: DecodedSplat): Uint8Array {
   const n = q.count;
   const encPos = n ? MeshoptEncoder.encodeVertexBuffer(new Uint8Array(q.positionsQ.buffer, q.positionsQ.byteOffset, n * 8), n, 8) : new Uint8Array(0);
@@ -157,6 +160,7 @@ export function encodeSplatStateBlock(q: DecodedSplat): Uint8Array {
 /**
  * Encode one splat I-frame block. `shDegreeCap` truncates higher SH bands (coefficient-major
  * order means lower bands come first, so truncation is a prefix copy).
+ * Await `meshoptEncoderReady()` before calling — see `encodeSplatStateBlock`.
  */
 export function encodeSplatBlock(f: SplatFrame, box: Aabb, bits: number, shDegreeCap = 3): Uint8Array {
   return encodeSplatStateBlock(quantizeSplatFrame(f, box, bits, shDegreeCap));

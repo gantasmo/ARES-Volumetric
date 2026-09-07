@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { synthSplatClip, quantizeSplatFrame, encodeSplatStateBlock, encodeSplatPBlock, matchSplatsByIndex, matchSplatsNearest, orderForPFrame, splatAabb, muxClip, filterSplatFrame, emptySplatFrame } from "../dist/index.js";
+import { synthSplatClip, quantizeSplatFrame, encodeSplatStateBlock, encodeSplatPBlock, matchSplatsByIndex, matchSplatsNearest, orderForPFrame, splatAabb, muxClip, filterSplatFrame, emptySplatFrame, meshoptEncoderReady } from "../dist/index.js";
 import { decodeSplatBlock, decodeSplatPBlock, Demuxer, BlockType, meshoptReady, ByteWriter, ByteReader } from "@ares/core";
 
 function sameState(a, b) {
@@ -26,6 +26,7 @@ test("varint round trip", () => {
 
 test("index correspondence P-frame reproduces the decoder state exactly and is far smaller than intra", async () => {
   await meshoptReady();
+  await meshoptEncoderReady();
   const clip = synthSplatClip(3, 60, 1);          // 60 fps → small per-frame motion
   const box = clip.splatFrames.reduce((b, f) => { const s = splatAabb(f); return b ? { min: b.min.map((v, i) => Math.min(v, s.min[i])), max: b.max.map((v, i) => Math.max(v, s.max[i])) } : s; }, null);
   const q0 = quantizeSplatFrame(clip.splatFrames[0], box, 14), q1 = quantizeSplatFrame(clip.splatFrames[1], box, 14);
@@ -42,6 +43,7 @@ test("index correspondence P-frame reproduces the decoder state exactly and is f
 
 test("nearest-neighbour correspondence with births and deaths reconstructs the same splat set", async () => {
   await meshoptReady();
+  await meshoptEncoderReady();
   const base = synthSplatClip(1, 30, 0).splatFrames[0];
   const box = splatAabb(base);
   // Frame B: drop every 7th splat (deaths), jitter the rest slightly, append 50 new splats (births), shuffle.
@@ -75,6 +77,7 @@ test("nearest-neighbour correspondence with births and deaths reconstructs the s
 
 test("mux: dynamic splat GOPs carry I + P blocks and decode frame by frame; off = all intra", async () => {
   await meshoptReady();
+  await meshoptEncoderReady();
   const clip = synthSplatClip(6, 60, 1);
   const bytes = await muxClip({ fps: 60, splatFrames: clip.splatFrames, gopLength: 3, shDegree: 1, splatTemporal: { mode: "auto" } });
   const file = Demuxer.parse(bytes);
