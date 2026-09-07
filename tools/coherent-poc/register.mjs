@@ -25,8 +25,8 @@ import { TriangleGrid, buildWeldAdjacency, smoothFieldWelded, bboxDiag } from ".
 const SRC_DIR = process.env.ARES_SRC_DIR
   || fileURLToPath(new URL("../../../Daniel_Microsoft_Volcap/Daniel_Volcap", import.meta.url));
 const OUT_DIR = process.argv[2] || join(tmpdir(), "ares-coherent-poc");
-const GOP_START = 1;   // mesh-f00001.obj = frame 0
-const GOP_LEN = 30;    // frames 0..29 -> mesh-f00001..mesh-f00030
+const GOP_START = Number(process.env.ARES_GOP_START || 1);   // mesh-f00001.obj = frame 0
+const GOP_LEN = Number(process.env.ARES_GOP_LEN || 30);      // frames 0..LEN-1 from GOP_START
 const ROUNDS = 3;
 const SMOOTH_ITERS = 3;
 

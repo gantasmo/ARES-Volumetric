@@ -1,6 +1,6 @@
 <!doctype html>
 <meta charset="utf-8">
-<title>ARES — P1 vertical slice</title>
+<title>ARES</title>
 <link rel="icon" type="image/svg+xml" href="../phase0-probe/favicon.svg">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
@@ -12,6 +12,9 @@
      Blender/Lens-Studio/Apollo references.
      Default = DARK (built from dark greys). Light mode = the same neutrals
      inverted to paper. Text is HIGH contrast in both — never grey-on-grey.
+     Derived tints (--wash/--wash-st, --accent-dim, --warn/--good/--bad-dim), the
+     --scrim/--shadow overlay pair, and the three muted --axis-* hues are the only
+     other sanctioned color literals — everything else reads these tokens.
      ============================================================================ */
   :root {
     color-scheme: dark;
@@ -32,6 +35,16 @@
     --warn: #d9a441; --good: #62b87f; --bad: #d98a8a;
     --series-a: #d98a3a;     /* ARES (data series only) */
     --series-b: #8a8f98;     /* Draco — neutral, distinguishable by lightness not hue */
+    /* Derived tints + overlay/axis tokens — the light theme redefines every one. */
+    --wash:       rgba(255,255,255,.05);   /* subtle row hover / wash */
+    --wash-st:    rgba(255,255,255,.09);   /* stronger wash */
+    --accent-dim: rgba(217,138,58,.15);    /* selected/active tint */
+    --warn-dim:   rgba(217,164,65,.15);
+    --good-dim:   rgba(98,184,127,.12);
+    --bad-dim:    rgba(217,138,138,.12);
+    --scrim:      rgba(27,29,32,.85);      /* div.tool overlay ground */
+    --shadow:     0 6px 20px rgba(0,0,0,.45);  /* popover elevation */
+    --axis-x: #e0605f; --axis-y: #7ec36a; --axis-z: #5f92e0;  /* gizmo axes (data encoding) */
     /* Density: padding 2-6px, never 16-24px. */
     --pad-1: 2px; --pad-2: 4px; --pad-3: 6px;
     /* ONE uniform control size for tools/buttons (owner: "1 uniform button size"). */
@@ -64,6 +77,15 @@
     --accent-ink:#fbfaf7;
     --warn: #a8721c; --good: #2f7d4f; --bad: #a84a4a;
     --series-a: #c2762a; --series-b: #6c7078;
+    --wash:       rgba(0,0,0,.05);
+    --wash-st:    rgba(0,0,0,.08);
+    --accent-dim: rgba(194,118,42,.15);
+    --warn-dim:   rgba(168,114,28,.16);
+    --good-dim:   rgba(47,125,79,.14);
+    --bad-dim:    rgba(168,74,74,.14);
+    --scrim:      rgba(233,231,226,.9);
+    --shadow:     0 6px 20px rgba(0,0,0,.18);
+    --axis-x: #c25453; --axis-y: #588a4a; --axis-z: #4a76c2;
   }
   /* NO prefers-color-scheme auto-switch: the design law is DEFAULT DARK, with light as an
      explicit opt-in (◐ in the header, persisted in localStorage["ares.theme"]). Letting the OS
@@ -80,6 +102,9 @@
   .u:hover { background: var(--surface-h); }
   .u:disabled { opacity: .38; cursor: default; }
   .u.ico { padding: 0; width: var(--ctl); font-size: 13px; font-variant-emoji: text; }
+  .u.lg { height: var(--ctl-lg); }
+  .u.ico.lg { width: var(--ctl-lg); font-size: 15px; }
+  .u.danger { color: var(--bad); }  /* destructive action — text only, never a red fill */
   .u[aria-pressed="true"], .u.on { background: var(--accent); border-color: var(--accent);
     color: var(--accent-ink); }
   .u.primary { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
@@ -88,7 +113,7 @@
   .seg { display: inline-flex; border: 1px solid var(--border-st); border-radius: var(--r); overflow: hidden; }
   .seg > button { height: var(--ctl); padding: 0 8px; font: 600 11px system-ui; color: var(--text-dim);
     background: transparent; border: 0; border-left: 1px solid var(--border); cursor: pointer;
-    display: inline-flex; align-items: center; gap: 4px; }
+    display: inline-flex; align-items: center; gap: 4px; font-variant-emoji: text; }
   .seg > button:first-child { border-left: 0; }
   .seg > button:hover { color: var(--text); background: var(--surface-h); }
   .seg > button[aria-pressed="true"] { background: var(--accent); color: var(--accent-ink); }
@@ -101,22 +126,27 @@
     border: 1px solid var(--border-st); border-radius: var(--r); color: var(--text);
     font: 11px ui-monospace, monospace; }
   .inp:focus { outline: 1px solid var(--accent); outline-offset: -1px; }
+  /* Shared caption: uppercase micro-heading over a list or section. */
+  .cap { font-size: 10px; text-transform: uppercase; letter-spacing: .3px; color: var(--text-dim);
+    margin-bottom: 4px; }
   /* Tool cluster: uniform controls packed on one line, wrapping only when they must. */
   .ctlGrid { display: flex; flex-wrap: wrap; gap: 4px; align-items: center; }
+  /* Thin vertical divider between button groups inside a cluster row. */
+  .vdiv { width: 1px; height: 16px; background: var(--border-st); margin: 0 2px; flex: none; }
   .ctlGrid input[type="range"] { flex: 1; min-width: 48px; height: var(--ctl); }
   /* One accent for every slider in the rails — no stray browser-default blue/lavender. */
   .rail input[type="range"] { accent-color: var(--accent); height: var(--ctl); }
   #view { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
   #view:active { cursor: grabbing; }
   .panel { position: fixed; background: var(--bg-panel); backdrop-filter: blur(8px);
-    border: 1px solid var(--border); border-radius: 9px; }
+    border: 1px solid var(--border); border-radius: var(--r); }
   /* tab bar */
   /* The ONE header bar: tabs + viewport shading. */
   #tabs { top: 10px; left: 50%; transform: translateX(-50%); padding: var(--pad-1) var(--pad-2);
     display: flex; gap: 3px; align-items: center; z-index: 20; }
   #tabs button[role="tab"] { height: var(--ctl-lg); font: 600 12px system-ui; color: var(--text-mid);
     background: transparent; border: 1px solid transparent; border-radius: var(--r);
-    padding: 0 10px; cursor: pointer; }
+    padding: 0 10px; cursor: pointer; font-variant-emoji: text; }
   #tabs button[role="tab"]:hover { color: var(--text); background: var(--surface-h); }
   #tabs button[role="tab"][aria-selected="true"] { color: var(--accent-ink); background: var(--accent); border-color: var(--accent); }
   .hdrSep { width: 1px; align-self: stretch; margin: 3px 5px; background: var(--border-st); flex: none; }
@@ -139,14 +169,14 @@
     background: var(--bg-rail); backdrop-filter: blur(8px); border-radius: 0; }
   .rail.dragging { user-select: none; }
   .rail .railHandle { position: absolute; top: 0; bottom: 0; width: 7px; cursor: ew-resize; z-index: 2; }
-  .rail .railHandle:hover { background: rgba(127,216,240,.2); }
+  .rail .railHandle:hover { background: var(--accent-dim); }
   .rail.collapsed .railHandle { display: none; }
   .rail .railHead { display: flex; align-items: center; gap: 6px; flex: none; min-height: 26px;
-    padding: var(--pad-3) var(--pad-3); border-bottom: 1px solid rgba(255,255,255,.08); }
+    padding: var(--pad-3) var(--pad-3); border-bottom: 1px solid var(--border); }
   .rail.collapsed .railHead { flex-direction: column; height: 100%; border-bottom: 0; cursor: pointer; padding-top: 8px; }
   .rail .railChevron { flex: none; background: none; border: 0; color: var(--text-dim); cursor: pointer;
-    font-size: 12px; padding: 3px 4px; line-height: 1; border-radius: 4px; }
-  .rail .railChevron:hover { color: var(--text); background: rgba(255,255,255,.06); }
+    font-size: 12px; padding: 3px 4px; line-height: 1; border-radius: var(--r); }
+  .rail .railChevron:hover { color: var(--text); background: var(--wash); }
   .rail .railTitle { font-size: 11px; font-weight: 700; color: var(--text-dim); text-transform: uppercase;
     letter-spacing: .5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .rail.collapsed .railTitle { display: none; }
@@ -175,18 +205,18 @@
   /* editPanel sections: slim header rows with a ▸/▾ twist — the compact-collapsible unit the
      design law asks for, so five tool groups (Crop/Tools/Ranges/SAM/Bake) cost one line each closed. */
   .railSec { margin-bottom: 2px; }
-  .railSec + .railSec { border-top: 1px solid rgba(255,255,255,.06); padding-top: 2px; }
+  .railSec + .railSec { border-top: 1px solid var(--border); padding-top: 2px; }
   .railSec .secHead { display: flex; align-items: center; gap: 5px; padding: 5px 2px; cursor: pointer;
-    user-select: none; font-size: 11.5px; font-weight: 600; color: #c3c2b7; }
+    user-select: none; font-size: 11.5px; font-weight: 600; color: var(--text-mid); }
   .railSec .secHead:hover { color: var(--text); }
   .railSec .secHead .tw { display: inline-block; width: 9px; font-size: 9px; color: var(--text-faint);
     transition: transform .1s; flex: none; }
   .railSec.collapsed .secHead .tw { transform: rotate(-90deg); }
   .railSec .secHead small { margin-left: auto; font-weight: 400; color: var(--text-faint); font-size: 10px; }
-  /* undo/redo: two tiny icon buttons riding in the Ranges section header, after the <small> label —
-     they need their own disabled dimming (.railChevron has none; it's normally always-clickable). */
-  .railChevron:disabled { opacity: .35; cursor: default; }
   .railSec .secBody { padding: 2px 2px 8px 13px; }
+  /* Uniform label column: every .row label in the Edit rail starts its control at the same x,
+     so the rail reads as label-column / control-column instead of ragged per-row layouts. */
+  #editPanel .row > .k { flex: 0 0 46px; }
   .railSec.collapsed .secBody { display: none; }
   .good { color: var(--good); }
   .warn { color: var(--warn); }
@@ -194,17 +224,17 @@
      grouped into collapsible folders) on top; condensed readouts pinned at the bottom; full compare
      table folded into a <details>. Slim, no chrome, accent = active clip, amber = favorite. ---- */
   #hudBody { display: flex; flex-direction: column; padding: 0; overflow: hidden; }
-  .mediaHead { display: flex; align-items: center; gap: 3px; padding: 5px 5px 4px; flex: none; border-bottom: 1px solid rgba(255,255,255,.05); }
+  .mediaHead { display: flex; align-items: center; gap: 3px; padding: 5px 5px 4px; flex: none; border-bottom: 1px solid var(--border); }
   .mediaHead .sp { flex: 1; }
-  .mediaHead .libsort { font: 600 10.5px system-ui; color: var(--text-mid); background: rgba(255,255,255,.05);
-    border: 1px solid var(--border); border-radius: 5px; padding: 2px 4px; cursor: pointer; }
+  .mediaHead .libsort { font: 600 10.5px system-ui; color: var(--text-mid); background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--r); padding: 2px 4px; cursor: pointer; }
   .libbtn { background: none; border: 1px solid transparent; color: var(--text-faint); cursor: pointer;
-    font-size: 12px; line-height: 1; padding: 3px 5px; border-radius: 5px; min-width: 22px; }
-  .libbtn:hover { color: var(--text); background: rgba(255,255,255,.07); }
-  .mediaHead .libbtn.on { color: var(--text); background: rgba(127,216,240,.14); border-color: var(--accent); }
+    font-size: 12px; line-height: 1; padding: 3px 5px; border-radius: var(--r); min-width: 22px; }
+  .libbtn:hover { color: var(--text); background: var(--wash); }
+  .mediaHead .libbtn.on { color: var(--text); background: var(--accent-dim); border-color: var(--accent); }
   /* Rich hover detail popover for a library item (full provenance + timestamps). */
-  #clipDetail { position: fixed; z-index: 40; max-width: 300px; background: #17181c; border: 1px solid rgba(255,255,255,.13);
-    border-radius: 6px; padding: 7px 9px; font: 11px/1.5 system-ui; color: var(--text); box-shadow: 0 6px 20px rgba(0,0,0,.55); pointer-events: none; }
+  #clipDetail { position: fixed; z-index: 40; max-width: 300px; background: var(--bg-panel); border: 1px solid var(--border-st);
+    border-radius: var(--r); padding: 7px 9px; font: 11px/1.5 system-ui; color: var(--text); box-shadow: var(--shadow); pointer-events: none; }
   #clipDetail .cdttl { font-weight: 700; font-size: 12px; }
   #clipDetail .cdsub { color: var(--text-mid); font-size: 10px; margin-bottom: 5px; word-break: break-all; }
   #clipDetail .cdrow { display: flex; justify-content: space-between; gap: 14px; }
@@ -219,42 +249,42 @@
   .star { flex: none; background: none; border: 0; cursor: pointer; font-size: 12px; line-height: 1; padding: 2px; color: var(--text-faint); }
   .star:hover, .star.on { color: var(--warn); }
   /* list row */
-  .mrow { display: flex; align-items: center; gap: 1px; border-radius: 4px; }
+  .mrow { display: flex; align-items: center; gap: 1px; border-radius: var(--r); }
   .mrow > button.clip { flex: 1 1 auto; min-width: 0; display: flex; align-items: center; text-align: left;
     font: 600 12px system-ui; color: var(--text-mid); background: none; border: 0; border-left: 2px solid transparent;
     padding: 4px 6px; cursor: pointer; }
   .mrow > button.clip .lab { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .mrow > button.clip .sz { color: var(--text-faint); font-weight: 400; font-size: 10px; margin-left: auto; padding-left: 8px; }
-  .mrow > button.clip:hover { color: var(--text); background: rgba(255,255,255,.05); }
-  .mrow > button.clip[aria-pressed="true"] { color: var(--text); border-left-color: var(--accent); background: rgba(127,216,240,.10); }
+  .mrow > button.clip:hover { color: var(--text); background: var(--wash); }
+  .mrow > button.clip[aria-pressed="true"] { color: var(--text); border-left-color: var(--accent); background: var(--accent-dim); }
   /* grid card */
-  .gcard { display: flex; flex-direction: column; gap: 2px; border-radius: 6px; padding: 2px; }
-  .gcard.active { background: rgba(127,216,240,.10); outline: 1px solid var(--accent); }
-  .gthumb { position: relative; aspect-ratio: 4 / 3; background: #14161b; border-radius: 5px; overflow: hidden; cursor: pointer; border: 1px solid var(--border); }
+  .gcard { display: flex; flex-direction: column; gap: 2px; border-radius: var(--r); padding: 2px; }
+  .gcard.active { background: var(--accent-dim); outline: 1px solid var(--accent); }
+  .gthumb { position: relative; aspect-ratio: 4 / 3; background: var(--bg); border-radius: var(--r); overflow: hidden; cursor: pointer; border: 1px solid var(--border); }
   .gthumb img { width: 100%; height: 100%; object-fit: cover; display: block; }
   .gthumb .ph { width: 100%; height: 100%; display: flex; align-items: center; justify-content: center;
-    font: 700 22px system-ui; color: var(--text-faint); background: linear-gradient(160deg, #1c1f26, #14161b); }
-  .gthumb .star { position: absolute; top: 2px; right: 2px; background: rgba(0,0,0,.4); border-radius: 4px; }
+    font: 700 22px system-ui; color: var(--text-faint); background: linear-gradient(160deg, var(--bg-panel), var(--bg)); }
+  .gthumb .star { position: absolute; top: 2px; right: 2px; background: var(--scrim); border-radius: var(--r); }
   .glab { font: 600 11px system-ui; color: var(--text-mid); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; cursor: pointer; padding: 0 2px; }
   .gcard.active .glab { color: var(--text); }
   .gsz { font-size: 9.5px; color: var(--text-faint); padding: 0 2px; }
   /* edit-mode per-item controls */
   .mctl { display: flex; align-items: center; gap: 1px; flex-wrap: wrap; }
   .mediaItems.grid .mctl { padding: 0 2px 2px; }
-  .mctl .fsel { font: 10px system-ui; color: var(--text-mid); background: rgba(0,0,0,.3); border: 1px solid var(--border);
-    border-radius: 4px; padding: 1px 2px; max-width: 76px; cursor: pointer; }
+  .mctl .fsel { font: 10px system-ui; color: var(--text-mid); background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--r); padding: 1px 2px; max-width: 76px; cursor: pointer; }
   .mctl .libbtn { padding: 2px 3px; font-size: 11px; min-width: 0; }
   .renameIn { flex: 1 1 auto; min-width: 0; width: 100%; box-sizing: border-box; font: 600 12px system-ui; color: var(--text);
-    background: rgba(0,0,0,.35); border: 1px solid var(--accent); border-radius: 4px; padding: 3px 5px; }
+    background: var(--surface); border: 1px solid var(--accent); border-radius: var(--r); padding: 3px 5px; }
   /* folder group header (collapsible) */
   .folderHd { display: flex; align-items: center; gap: 4px; padding: 5px 4px 3px; margin-top: 3px; cursor: pointer;
-    color: var(--text-dim); border-top: 1px solid rgba(255,255,255,.05); }
+    color: var(--text-dim); border-top: 1px solid var(--border); }
   .folderHd:hover { color: var(--text); }
   .folderHd .tw { font-size: 9px; color: var(--text-faint); transition: transform .12s; }
   .folderHd.collapsed .tw { transform: rotate(-90deg); }
   .folderHd .fn { font: 700 10.5px system-ui; text-transform: uppercase; letter-spacing: .4px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .folderHd .fc { color: var(--text-faint); font-size: 10px; }
-  .folderHd .fx { margin-left: auto; color: #e58a8a; padding: 1px 4px; }
+  .folderHd .fx { margin-left: auto; color: var(--bad); padding: 1px 4px; }
   /* dangling entry: the .ares was deleted from disk but is still in the library */
   .mrow.missing, .gcard.missing { opacity: .5; }
   .mrow.missing .sz, .gcard.missing .gsz { color: var(--warn); }
@@ -263,7 +293,7 @@
   #axisGizmo text { user-select: none; }
   #axisGizmo g:hover circle { stroke: var(--text); stroke-width: 1.5; }
   /* condensed readouts: exactly one line each, dim key + bright value, never wrap */
-  .mediaReadouts { flex: none; border-top: 1px solid var(--border); padding: 5px 7px 6px; background: rgba(0,0,0,.16); }
+  .mediaReadouts { flex: none; border-top: 1px solid var(--border); padding: 5px 7px 6px; background: var(--bg); }
   .mediaReadouts #title { font-size: 11px; margin: 0 0 4px; color: var(--text-dim); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
   .mediaReadouts .rl { display: flex; justify-content: space-between; gap: 8px; font: 11px ui-monospace, monospace;
     line-height: 1.55; white-space: nowrap; overflow: hidden; }
@@ -272,29 +302,28 @@
   .mediaReadouts .rl .v b { color: var(--accent); }
   .mediaReadouts .rlBtn { background: none; border: 0; color: var(--text-faint); cursor: pointer; padding: 0 2px; font-size: 11px; }
   .mediaReadouts .rlBtn:hover { color: var(--accent); }
-  #hudDetails { margin-top: 5px; border-top: 1px solid rgba(255,255,255,.07); padding-top: 3px; }
+  #hudDetails { margin-top: 5px; border-top: 1px solid var(--border); padding-top: 3px; }
   #hudDetails > summary { font-size: 10px; color: var(--text-faint); cursor: pointer; list-style: none; padding: 2px 0; }
   #hudDetails[open] > summary { color: var(--text-dim); }
   /* comparison table: metric | ARES | Draco-GLB seq — compact monospace-numeral rows in the HUD rail */
   table.cmp { width: 100%; border-collapse: collapse; font-size: 11.5px; }
   table.cmp th { text-align: left; font-size: 10px; text-transform: uppercase; letter-spacing: .3px;
-    color: var(--text-dim); font-weight: 600; padding: 0 0 4px; border-bottom: 1px solid rgba(255,255,255,0.1); }
+    color: var(--text-dim); font-weight: 600; padding: 0 0 4px; border-bottom: 1px solid var(--border); }
   table.cmp th.ares { color: var(--accent); }
-  table.cmp th.draco { color: var(--accent-2); }
-  table.cmp td { padding: 3px 0; border-bottom: 1px solid rgba(255,255,255,0.05); vertical-align: baseline; }
+  table.cmp th.draco { color: var(--series-b); }
+  table.cmp td { padding: 3px 0; border-bottom: 1px solid var(--border); vertical-align: baseline; }
   table.cmp td.metric { color: var(--text-dim); width: 36%; }
   table.cmp td.ares { color: var(--text); font-weight: 600; font-variant-numeric: tabular-nums; }
   table.cmp td.draco { color: var(--text-mid); font-variant-numeric: tabular-nums; width: 32%; }
   table.cmp td small { color: var(--text-faint); font-weight: 400; }
-  #cmp { font-size: 11.5px; color: #c3c2b7; }
+  #cmp { font-size: 11.5px; color: var(--text-mid); }
   #cmp b { color: var(--text); }
   /* size-comparison bars (Viewer HUD) */
-  .sizebars { margin-top: 7px; padding-top: 6px; border-top: 1px solid rgba(255,255,255,0.08); }
-  .sizebars .cap { font-size: 10px; text-transform: uppercase; letter-spacing: .3px; color: var(--text-dim); margin-bottom: 5px; }
+  .sizebars { margin-top: 7px; padding-top: 6px; border-top: 1px solid var(--border); }
   .bar { display: grid; grid-template-columns: 80px 1fr auto; gap: 5px; align-items: center; margin: 3px 0; font-size: 11px; }
   .bar .name { color: var(--text-mid); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .bar .track { height: 8px; background: rgba(255,255,255,0.06); border-radius: 4px; overflow: hidden; }
-  .bar .fill { height: 100%; border-radius: 4px; }
+  .bar .track { height: 8px; background: var(--surface); border-radius: var(--r); overflow: hidden; }
+  .bar .fill { height: 100%; border-radius: var(--r); }
   .bar .val { color: var(--text); font-variant-numeric: tabular-nums; font-weight: 600; min-width: 50px; text-align: right; }
   /* source switcher */
   /* (the old horizontal #sources bar was folded into the left Media rail — see .mediaList above) */
@@ -304,10 +333,14 @@
     display: flex; flex-direction: column; background: var(--bg-rail);
     border-top: 1px solid var(--border); }
   #tlResize { position: absolute; top: -3px; left: 0; right: 0; height: 7px; cursor: ns-resize; z-index: 3; }
-  #tlResize:hover { background: rgba(217,138,58,.25); }
-  #tlHead { display: flex; align-items: center; gap: 4px; padding: var(--pad-2) var(--pad-3) var(--pad-1);
-    flex: none; }
-  #tlHead .sp { flex: 1; }
+  #tlResize:hover { background: var(--accent-dim); }
+  /* Three-zone transport row: readouts left, transport dead-centre, trim right. The 1fr/auto/1fr
+     grid keeps the transport centred on the WINDOW regardless of how wide either side grows. */
+  #tlHead { display: grid; grid-template-columns: 1fr auto 1fr; align-items: center; gap: 4px;
+    padding: var(--pad-2) var(--pad-3) var(--pad-1); flex: none; }
+  .tlZone { display: flex; align-items: center; gap: 4px; min-width: 0; }
+  .tlZone.center { justify-content: center; }
+  .tlZone.right { justify-content: flex-end; }
   #time { font: 12px ui-monospace, "Cascadia Code", monospace; font-variant-numeric: tabular-nums;
     color: var(--text-dim); white-space: nowrap; padding-left: var(--pad-2); }
   #trimRead { font: 11px ui-monospace, monospace; color: var(--text-dim); min-width: 30px;
@@ -382,93 +415,106 @@
   .inp.xf3 { flex: 1; min-width: 0; width: 0; text-align: right; }
   #upSeg > button, #ctrSeg > button { min-width: 22px; padding: 0 5px; }
   #xfRead { font: 10px ui-monospace, monospace; color: var(--text-faint); }
-  .cropRow { display: flex; align-items: center; gap: 3px; flex-wrap: wrap; }
+  .cropRow { display: flex; align-items: center; gap: 4px; flex-wrap: wrap; }
   #cropRead { display: flex; align-items: center; gap: 3px; flex: 1; min-width: 0; flex-wrap: wrap; }
-  #cropRead .cr { display: flex; align-items: baseline; gap: 2px; padding: 0 3px; border-radius: 3px;
-    background: rgba(255,255,255,.045); font: 10px ui-monospace, monospace; line-height: 16px; }
+  #cropRead .cr { display: flex; align-items: baseline; gap: 2px; padding: 0 3px; border-radius: var(--r);
+    background: var(--wash); font: 10px ui-monospace, monospace; line-height: 16px; }
   #cropRead .cr u { text-decoration: none; font-weight: 700; color: var(--accent); }
   #cropRead .cr span { color: var(--text-dim); }
   #cropRead .cr.depth u, #cropRead .cr.depth span { color: var(--text-faint); }
-  #cropRead .cr.set { background: rgba(217,138,58,.16); }
+  #cropRead .cr.set { background: var(--accent-dim); }
   #cropRead .cr.set span { color: var(--text); }
 
   /* tool panels (Compare / Convert / Settings) — full overlay above the canvas.
      div.tool, NOT .tool: the editor's tool BUTTONS also carry class "tool", and the bare class
      selector's display:none silently hid the whole tool row (Nav/Box/Brush/SAM). */
-  div.tool { position: fixed; inset: 60px 0 0 0; z-index: 15; overflow: auto; padding: 16px 16px 24px;
-    background: rgba(8,9,13,0.72); backdrop-filter: blur(4px); display: none; }
-  div.tool.active { display: block; }
-  .tool .wrap { max-width: 860px; margin: 0 auto; }
+  div.tool { position: fixed; inset: 60px 0 0 0; z-index: 15; overflow: auto; padding: 12px 16px;
+    background: var(--scrim); backdrop-filter: blur(4px); display: none; flex-direction: column; }
+  div.tool.active { display: flex; }
+  .tool .wrap { max-width: 860px; margin: 0 auto; flex: 1 1 auto; display: flex; flex-direction: column;
+    min-height: 0; width: 100%; }
+  /* Each overlay page is a bounded column — its dynamic region is the internal scroller, so the
+     page itself never scrolls wholesale. */
+  #convertOut { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+  #depsOut { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+  #rpOut { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
   .tool h2 { margin: 4px 0 4px; font-size: 18px; }
   .tool .lead { color: var(--text-dim); font-size: 13px; margin: 0 0 14px; }
   /* display:block is load-bearing: a label is inline by default, and an inline element with
      block children fragments its dashed border into stray segments. */
-  .drop { display: block; border: 1.5px dashed rgba(255,255,255,0.18); border-radius: 10px; padding: 20px 16px;
-    text-align: center; background: rgba(255,255,255,0.02); transition: border-color .15s, background .15s; cursor: pointer; }
-  .drop.over { border-color: var(--accent); background: rgba(127,216,240,0.08); }
+  .drop { display: block; border: 1.5px dashed var(--border-st); border-radius: var(--r); padding: 12px 16px;
+    text-align: center; background: var(--wash); transition: border-color .15s, background .15s; cursor: pointer; }
+  .drop.over { border-color: var(--accent); background: var(--accent-dim); }
   .drop .big { font-size: 15px; color: var(--text); margin-bottom: 5px; }
   .drop .small { font-size: 12px; color: var(--text-faint); }
   .drop input { display: none; }
-  .card { margin-top: 10px; padding: 10px 12px; background: rgba(18,20,26,0.9);
-    border: 1px solid rgba(255,255,255,0.09); border-radius: 9px; }
+  .card { margin-top: 10px; padding: 8px 10px; background: var(--bg-panel);
+    border: 1px solid var(--border); border-radius: var(--r); }
   .card h3 { margin: 0 0 8px; font-size: 14px; }
   .kv { display: grid; grid-template-columns: 168px 1fr; gap: 5px 14px; font-size: 12.5px; }
   .kv .k { color: var(--text-dim); } .kv .v { color: var(--text); font-variant-numeric: tabular-nums; }
-  .split { display: flex; height: 26px; border-radius: 6px; overflow: hidden; margin: 10px 0 4px; }
+  .split { display: flex; height: 26px; border-radius: var(--r); overflow: hidden; margin: 10px 0 4px; }
   .split > div { display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 600; color: var(--accent-ink); }
   .note { font-size: 12px; color: var(--text-dim); margin-top: 8px; }
-  .btn { font: 600 13px system-ui; color: var(--accent-ink); background: var(--accent); border: 0; border-radius: 7px;
-    padding: 7px 12px; cursor: pointer; margin-top: 10px; }
-  .btn:disabled { opacity: .4; cursor: default; }
-  .btn.ghost { color: var(--text); background: rgba(255,255,255,0.07); }
-  .prog { height: 8px; background: rgba(255,255,255,0.08); border-radius: 4px; overflow: hidden; margin-top: 10px; display: none; }
+  /* legacy alias — JS migrated to .u/.inp; these keep any missed reference rendering correctly. */
+  .btn { height: var(--ctl); min-width: var(--ctl); padding: 0 7px; font: 600 11.5px system-ui;
+    color: var(--text); background: var(--surface); border: 1px solid var(--border);
+    border-radius: var(--r); cursor: pointer; display: inline-flex; align-items: center;
+    justify-content: center; gap: 4px; white-space: nowrap; }
+  .btn:hover { background: var(--surface-h); }
+  .btn:disabled { opacity: .38; cursor: default; }
+  .btn.ghost { color: var(--text); background: var(--surface); }
+  .cvsel { height: var(--ctl); min-width: 0; padding: 0 6px; background: var(--surface);
+    border: 1px solid var(--border-st); border-radius: var(--r); color: var(--text);
+    font: 11px ui-monospace, monospace; }
+  .prog { height: 8px; background: var(--surface); border-radius: var(--r); overflow: hidden; margin-top: 10px; display: none; }
   .prog > div { height: 100%; width: 0; background: var(--accent); transition: width .2s; }
-  .badge { display: inline-block; font-size: 10.5px; font-weight: 600; padding: 2px 7px; border-radius: 5px;
-    background: rgba(127,216,240,0.15); color: var(--accent); margin-left: 6px; }
-  .badge.warn { background: rgba(224,169,74,0.15); color: var(--warn); }
-  .cvsel { padding: 6px 8px; background: rgba(0,0,0,.3); border: 1px solid rgba(255,255,255,.14);
-    border-radius: 6px; color: var(--text); font: 12px system-ui; margin-right: 4px; }
+  .badge { display: inline-block; font-size: 10.5px; font-weight: 600; padding: 2px 7px; border-radius: var(--r);
+    background: var(--accent-dim); color: var(--accent); margin-left: 6px; }
+  .badge.warn { background: var(--warn-dim); color: var(--warn); }
   /* history rows (Convert tab — includes "inspect"-kind probe entries) */
-  .hrow { display: flex; gap: 10px; align-items: center; padding: 6px 8px; margin: 0 -8px; border-radius: 7px; font-size: 12px; }
-  .hrow:hover { background: rgba(255,255,255,.045); }
-  .hrow .chip { font-size: 9.5px; font-weight: 700; padding: 2px 7px; border-radius: 5px; flex: none;
-    text-transform: uppercase; letter-spacing: .5px; min-width: 62px; text-align: center; }
+  .hrow { display: flex; gap: 10px; align-items: center; padding: 6px 8px; margin: 0 -8px; border-radius: var(--r); font-size: 12px; }
+  .hrow:hover { background: var(--wash); }
+  .hrow .chip { font-size: 9.5px; font-weight: 700; padding: 2px 7px; border-radius: var(--r); flex: none;
+    text-transform: uppercase; letter-spacing: .5px; min-width: 62px; text-align: center;
+    border: 1px solid var(--border-st); color: var(--text-dim); }  /* neutral — the label text carries the kind */
   .hrow .nm { color: var(--text); font-weight: 600; flex: none; max-width: 190px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
   .hrow .pth { color: var(--text-faint); font: 11px ui-monospace, monospace; flex: 1; min-width: 40px;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; direction: rtl; text-align: left; }
   .hrow .mt { color: var(--text-dim); font-size: 11px; flex: none; }
   .hrow .dt { color: var(--text-faint); font-size: 11px; flex: none; font-variant-numeric: tabular-nums; }
   .hrow .act { display: flex; gap: 4px; flex: none; }
-  .hrow .act button { font: 600 11px system-ui; color: #b6b4a9; background: rgba(255,255,255,.06);
-    border: 1px solid rgba(255,255,255,.1); border-radius: 6px; padding: 3px 9px; cursor: pointer; }
-  .hrow .act button:hover { color: var(--text); border-color: rgba(255,255,255,.25); }
+  .hrow .act button { height: var(--ctl); font: 600 11px system-ui; color: var(--text); background: var(--surface);
+    border: 1px solid var(--border); border-radius: var(--r); padding: 0 7px; cursor: pointer;
+    display: inline-flex; align-items: center; }
+  .hrow .act button:hover { background: var(--surface-h); }
+  .histList { max-height: 240px; overflow-y: auto; }
   /* settings tab: dependency rows */
-  .dep { display: grid; grid-template-columns: 14px 250px 1fr auto; gap: 6px 12px; align-items: baseline;
-    padding: 8px; margin: 0 -8px; border-radius: 7px; }
-  .dep:hover { background: rgba(255,255,255,.03); }
-  .dep + .dep { border-top: 1px solid rgba(255,255,255,.05); }
-  .dep .dot { width: 8px; height: 8px; border-radius: 50%; align-self: center; }
+  .dep { display: grid; grid-template-columns: 250px 1fr auto; gap: 6px 12px; align-items: baseline;
+    padding: 8px; margin: 0 -8px; border-radius: var(--r); }
+  .dep:hover { background: var(--wash); }
+  .dep + .dep { border-top: 1px solid var(--border); }
   .dep .lbl { color: var(--text); font-weight: 600; font-size: 13px; }
   .dep .en { color: var(--text-dim); font-size: 12px; }
-  .dep .pth { grid-column: 2 / 4; color: var(--text-faint); font: 10.5px ui-monospace, monospace;
+  .dep .pth { grid-column: 1 / 3; color: var(--text-faint); font: 10.5px ui-monospace, monospace;
     overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-  .dep .note2 { grid-column: 2 / 4; color: var(--text-dim); font-size: 11.5px; }
-  .dep .side { grid-row: 1 / 3; grid-column: 4; display: flex; flex-direction: column; gap: 5px; align-items: flex-end; align-self: center; }
+  .dep .note2 { grid-column: 1 / 3; color: var(--text-dim); font-size: 11.5px; }
+  .dep .side { grid-row: 1 / 3; grid-column: 3; display: flex; flex-direction: column; gap: 5px; align-items: flex-end; align-self: center; }
   .dep .size { color: var(--text-faint); font-size: 11px; font-variant-numeric: tabular-nums; }
   .seclbl { font-size: 10.5px; text-transform: uppercase; letter-spacing: .4px; color: var(--text-dim); margin-bottom: 6px; }
   button.toggle[aria-pressed="false"] { opacity: .45; }
   button.toggle[aria-pressed="true"] { border-color: var(--accent) !important; }
   /* Compare stage — wipe mode: canvases stacked & pixel-aligned; B clipped by the divider. */
-  #cmpStage { --wipe: 50%; height: calc(100vh - 210px); min-height: 320px; }
+  #cmpStage { --wipe: 50%; flex: 1 1 auto; min-height: 0; }  /* fills the flex .wrap — no viewport math */
   #cmpStage.wipe { position: relative; }
   #cmpStage.wipe canvas { position: absolute; inset: 0; width: 100%; height: 100%;
-    background: var(--bg); border-radius: 10px; touch-action: none; }
+    background: var(--bg); border-radius: var(--r); touch-action: none; }
   #cmpStage.wipe #cmpCanvasA { cursor: grab; }
   #cmpStage.wipe #cmpCanvasB { pointer-events: none; clip-path: inset(0 0 0 var(--wipe)); }
   #cmpStage.wipe #wipeHandle { display: block; }
   #wipeHandle { position: absolute; top: 0; bottom: 0; left: var(--wipe); width: 0; cursor: ew-resize; z-index: 5; }
   #wipeHandle::before { content: ""; position: absolute; top: 0; bottom: 0; left: -1px; width: 2px;
-    background: var(--accent); box-shadow: 0 0 8px rgba(127,216,240,.6); }
+    background: var(--accent); }
   #wipeHandle .grip { position: absolute; top: 50%; left: 0; transform: translate(-50%, -50%);
     width: 34px; height: 34px; border-radius: 50%; background: var(--accent); color: var(--accent-ink);
     display: flex; align-items: center; justify-content: center; font: 700 15px system-ui; user-select: none; }
@@ -476,7 +522,7 @@
   /* split mode: classic side-by-side */
   #cmpStage.split { display: grid; grid-template-columns: 1fr 1fr; gap: 10px; position: static; }
   #cmpStage.split canvas { position: static; width: 100%; height: 100%; background: var(--bg);
-    border-radius: 10px; touch-action: none; clip-path: none; }
+    border-radius: var(--r); touch-action: none; clip-path: none; }
   #cmpStage.split #cmpCanvasA { cursor: grab; }
   #cmpStage.split #cmpCanvasB { pointer-events: none; }
   #cmpStage.split #wipeHandle { display: none; }
@@ -489,16 +535,21 @@
   <button role="tab" data-tab="viewer" aria-selected="true" title="3D playback viewport — orbit, scrub, and edit the volumetric clip">Viewer</button>
   <button role="tab" data-tab="compare" aria-selected="false" title="A/B two clips side-by-side at the same frame — check a re-bake against the original">Compare</button>
   <button role="tab" data-tab="convert" aria-selected="false" title="import a capture folder (OBJ/PLY + atlas) and encode it into a .ares clip">Convert</button>
-  <button role="tab" data-tab="settings" aria-selected="false" title="models, tools, and downloads">⚙</button>
-  <button role="tab" data-tab="compute" aria-selected="false" title="RunPod compute — launch, watch, run experiments">☁</button>
+  <button role="tab" data-tab="settings" aria-selected="false" title="models, tools, and downloads">Settings</button>
+  <button role="tab" data-tab="compute" aria-selected="false" title="RunPod compute — launch, watch, run experiments">Compute</button>
   <!-- Viewport shading lives in the ONE header bar (owner ask #15). Segmented = mutually
        exclusive, like the reference shot's MESH|WIRED|X-RAY. Icons carry it; the tooltip
        carries the explanation (never inline prose). -->
   <span class="hdrSep viewer-only"></span>
   <div class="seg viewer-only" id="shadeSeg" role="group" aria-label="viewport shading">
     <button data-shade="shaded" aria-pressed="true" title="Shaded — the baked texture on the mesh, lit. The delivery look: judge colour, seams and texture sharpness here. Z cycles shading, W toggles wireframe.">◍</button>
+    <button data-shade="unlit" aria-pressed="false" title="Unlit — the texture verbatim, no lighting applied. The honest view for video-textured captures (Depthkit) whose footage already carries the room's real lighting: lit shading double-lights them and reads blown out. Z cycles shading.">◌</button>
     <button data-shade="clay" aria-pressed="false" title="Untextured clay — same lighting, texture off, so you judge FORM alone: dents, melts and wrong-surface snaps the texture hides. Z cycles shading.">◑</button>
     <button data-shade="wire" aria-pressed="false" title="Wireframe — triangle edges only. Read topology + density, and spot stretched/torn edges across a coherent run. W toggles it, Z cycles shading.">▦</button>
+    <button data-shade="normals" aria-pressed="false" title="Normals — surface orientation as colour (x,y,z → r,g,b). Shows shading seams, flipped patches and the effect of smoothing at a glance. Z cycles shading.">◭</button>
+    <button data-shade="uv" aria-pressed="false" title="UV checker — a 32×32 checker sampled through the atlas coordinates. Stretched or squashed squares mean stretched texels; seams show where charts meet. Z cycles shading.">▩</button>
+    <button data-shade="depth" aria-pressed="false" title="Depth — distance from the camera as a gradient over the clip's extent. Reads relief and stray geometry behind the subject. Z cycles shading.">◔</button>
+    <button data-shade="points" aria-pressed="false" title="Points — the vertices alone as a point cloud, textured, unlit. The honest view of a capture's sampling density; the point size is in Edit ▸ Tools. Z cycles shading.">⁘</button>
   </div>
   <span class="hdrSep"></span>
   <!-- Projection. Perspective is for looking, ortho is for measuring: it kills the wide-angle
@@ -518,7 +569,7 @@
   </div>
   <span class="gridRead viewer-only" id="gridRead" title="the grid cell size currently on screen, in real-world units">—</span>
   <span class="hdrSep"></span>
-  <button id="themeBtn" class="u ico" style="height:var(--ctl-lg);width:var(--ctl-lg);font-size:13px" title="Light / dark theme. Dark is the default; your choice is remembered on this machine.">◐</button>
+  <button id="themeBtn" class="u ico lg" title="Light / dark theme. Dark is the default; your choice is remembered on this machine.">◐</button>
 </div>
 <script>
   // Theme: DARK by default (design law), light is opt-in and remembered. Applied inline before
@@ -575,19 +626,27 @@
 <div class="viewer-only" id="controls">
   <div id="tlResize" title="drag to resize the timeline"></div>
   <div id="tlHead">
-    <button id="play" class="u ico" style="height:var(--ctl-lg);width:var(--ctl-lg);font-size:15px" title="play / pause — Space">⏸</button>
-    <button id="loopMode" class="u ico" style="height:var(--ctl-lg);width:var(--ctl-lg);font-size:15px" title="at the clip end: Loop / Ping-pong / Once — click to cycle">⟳</button>
-    <button id="orbit" class="u ico toggle" style="height:var(--ctl-lg);width:var(--ctl-lg);font-size:15px" title="auto-orbit on/off — O (disabled while the view is locked)">◍</button>
-    <span id="time">0/0 · 0.00s</span>
-    <span id="lockTag" style="display:none;font-size:10px;font-weight:600;color:var(--warn)" title="view locked — rotation &amp; auto-orbit disabled; scrub, zoom, pan, and selection tools still work. Press L (or the Lock-view button in Edit → Tools) to release.">🔒 view locked</span>
-    <span class="sp"></span>
-    <!-- Clip trim. The two brackets ARE the in/out points; everything outside them is dimmed on the
-         strip, playback loops between them, and a Bake encodes only that window (encoder
-         --trim-in/--trim-out) — so the dimmed frames are really gone, not just hidden. -->
-    <button id="trimIn" class="u ico" title="Set the clip IN point at the playhead ( [ ) — everything before it is trimmed off: dimmed on the strip, skipped by playback, and dropped by a bake. Drag the bracket on the strip to adjust it.">⇥</button>
-    <button id="trimOut" class="u ico" title="Set the clip OUT point at the playhead ( ] ) — everything after it is trimmed off: dimmed on the strip, skipped by playback, and dropped by a bake. Drag the bracket on the strip to adjust it.">⇤</button>
-    <button id="trimReset" class="u ico" title="Clear the trim — the whole clip plays and bakes again. Nothing was destroyed; a trim only chooses which frames survive the next bake.">⭯</button>
-    <span id="trimRead" title="the trimmed clip: surviving frames and duration">full</span>
+    <div class="tlZone">
+      <span id="time">0/0 · 0.00s</span>
+      <span id="lockTag" style="display:none;font-size:10px;font-weight:600;color:var(--warn)" title="view locked — rotation &amp; auto-orbit disabled; scrub, zoom, pan, and selection tools still work. Press L (or the Lock-view button in Edit → Tools) to release.">view locked</span>
+    </div>
+    <div class="tlZone center">
+      <button id="play" class="u ico lg" title="play / pause — Space">⏸︎</button>
+      <button id="loopMode" class="u ico lg" title="at the clip end: Loop / Ping-pong / Once — click to cycle">⟳</button>
+      <button id="orbit" class="u ico lg toggle" title="auto-orbit on/off — O (disabled while the view is locked)">◍</button>
+      <!-- Audio transport: only shown for clips that carry an Opus track (spec §11.5). -->
+      <button id="mute" class="u ico lg toggle" aria-pressed="false" style="display:none" title="mute / unmute the clip's audio — U">♪</button>
+      <input id="vol" type="range" min="0" max="100" value="100" style="display:none;width:64px" title="volume">
+    </div>
+    <div class="tlZone right">
+      <!-- Clip trim. The two brackets ARE the in/out points; everything outside them is dimmed on the
+           strip, playback loops between them, and a Bake encodes only that window (encoder
+           --trim-in/--trim-out) — so the dimmed frames are really gone, not just hidden. -->
+      <button id="trimIn" class="u ico" title="Set the clip IN point at the playhead ( [ ) — everything before it is trimmed off: dimmed on the strip, skipped by playback, and dropped by a bake. Drag the bracket on the strip to adjust it.">⇥</button>
+      <button id="trimOut" class="u ico" title="Set the clip OUT point at the playhead ( ] ) — everything after it is trimmed off: dimmed on the strip, skipped by playback, and dropped by a bake. Drag the bracket on the strip to adjust it.">⇤</button>
+      <button id="trimReset" class="u ico" title="Clear the trim — the whole clip plays and bakes again. Nothing was destroyed; a trim only chooses which frames survive the next bake.">⭯</button>
+      <span id="trimRead" title="the trimmed clip: surviving frames and duration">full</span>
+    </div>
   </div>
   <div id="rangeTrack"></div>
 </div>
@@ -646,7 +705,7 @@
         </div>
         <div class="row">
           <span class="k" title="Uniform scale. 0.001 takes a millimetre capture to metres.">scale</span>
-          <input id="xfScale" class="inp" type="number" step="0.001" value="1" style="width:66px">
+          <input id="xfScale" class="inp xf3" type="number" step="0.001" value="1">
           <button id="xfMm2M" class="u" title="Set scale to 0.001 — millimetres to metres. The daniel/Microsoft captures are mm (a person is ~1700 units tall); 4DViews bakes are already metres.">mm→m</button>
         </div>
         <div class="row">
@@ -665,12 +724,12 @@
           <button class="u ico xtool" data-xtool="move" aria-pressed="false" title="Move (W) — drag in the viewport to translate the model. Hold X / Y / Z to constrain to one axis; Shift for fine steps.">✥</button>
           <button class="u ico xtool" data-xtool="rotate" aria-pressed="false" title="Rotate (E) — drag in the viewport to rotate the model. Hold X / Y / Z to constrain to one axis; Shift for fine steps.">⟲</button>
           <button class="u ico xtool" data-xtool="scale" aria-pressed="false" title="Scale (R) — drag in the viewport to scale the model uniformly. Shift for fine steps.">⤢</button>
-          <span style="width:1px;height:16px;background:var(--border-st);margin:0 2px"></span>
+          <span class="vdiv"></span>
           <button id="xfFocus" class="u ico" title="Focus (F) — frame the subject: point the camera at the model's bounds and pull back to fit.">◎</button>
           <button id="xfReset" class="u ico" title="Reset the transform — back to the capture's own raw coordinates.">⭯</button>
         </div>
         <div class="row" style="margin-top:2px">
-          <span class="k" id="xfRead" title="the clip's size and floor height as the viewer currently sees it, with the transform applied">—</span>
+          <span class="k" id="xfRead" style="flex:1" title="the clip's size and floor height as the viewer currently sees it, with the transform applied">—</span>
         </div>
       </div>
     </section>
@@ -679,30 +738,48 @@
       <div class="secBody">
         <!-- The ground grid used to sit here. It is not a tool — it is a viewport reference, like
              shading and projection — so it moved to the header bar and is on by default. -->
+        <!-- ONE cluster row: selection tools | view modifiers, divided like the Transform tools row —
+             two stacked two-button rows read as clutter at this density. -->
         <div class="ctlGrid">
-          <button id="xray" class="u ico" aria-pressed="false" title="X-ray (X) — Blender-style: selections cut THROUGH the mesh, hitting back-facing surfaces too. Off = only what you can actually see is selected. Turn on to delete something inside or behind the body.">◫</button>
-          <button id="viewLock" class="u ico" aria-pressed="false" title="Lock view (L) — freezes rotation and auto-orbit so you can scrub the whole timeline and select/delete from one exact angle without the camera drifting. Middle-drag pan and wheel zoom still work.">🔒</button>
-        </div>
-        <div class="ctlGrid" style="margin-top:4px">
           <button class="u ico tool" data-tool="nav" aria-pressed="true" title="Navigate (V) — camera only, no selection. Esc returns here from any tool.">✥</button>
           <button class="u ico tool" data-tool="sbox" aria-pressed="false" title="Box select (M) — drag a screen-space rectangle to mark geometry for deletion, keyframed at the current frame. Pair with X-ray to cut through the body.">▢</button>
           <button class="u ico tool" data-tool="brush" aria-pressed="false" title="Brush (B) — paint directly on the surface to mark geometry for deletion. Radius slider sits beside it (mm).">✎</button>
           <button class="u ico tool" data-tool="sam" aria-pressed="false" title="SAM select (S) — click an object and the segmentation model selects the whole thing. Shift-click excludes a region. Commit it below as Delete / Recolor / Copy; the Del key always commits as a delete.">✂</button>
-          <input id="brushR" type="range" min="5" max="150" value="35" title="Brush radius in millimetres — how wide a patch each stroke marks.">
+          <button class="u ico tool" data-tool="lasso" aria-pressed="false" title="Lasso select (A) — draw a free shape around geometry to mark it, keyframed at the current frame. Respects X-ray like the box: off = only what is visible inside the loop.">◠</button>
+          <button class="u ico tool" data-tool="measure" aria-pressed="false" title="Measure (T) — click two points on the surface to read the straight-line distance between them in real units. Esc clears.">⟷</button>
+          <span class="vdiv"></span>
+          <button id="xray" class="u ico" aria-pressed="false" title="X-ray (X) — Blender-style: selections cut THROUGH the mesh, hitting back-facing surfaces too. Off = only what you can actually see is selected. Turn on to delete something inside or behind the body.">◫</button>
+          <button id="viewLock" class="u ico" aria-pressed="false" title="Lock view (L) — freezes rotation and auto-orbit so you can scrub the whole timeline and select/delete from one exact angle without the camera drifting. Middle-drag pan and wheel zoom still work.">🔒︎</button>
+          <input id="brushR" type="range" min="5" max="150" value="35" title="Brush radius in millimetres — how wide a patch each stroke marks; also the step Grow/Shrink use.">
+        </div>
+        <!-- Selection operators act on the ▶ active range's regions; camera bookmarks are camera-only. -->
+        <div class="ctlGrid" style="margin-top:4px">
+          <button id="selGrow" class="u ico" title="Grow (=) — expand the active range's regions by one brush radius: boxes per face, brush radii, marquee rects, and SAM/lasso masks by the matching pixels. Shift = 5×.">⊕</button>
+          <button id="selShrink" class="u ico" title="Shrink (−) — contract the active range's regions by one brush radius. Shift = 5×.">⊖</button>
+          <button id="selInvert" class="u ico" title="Invert (I) — flip the active delete range between delete-inside and keep-inside (everything outside is deleted instead).">⇋</button>
+          <button id="selMirror" class="u ico" title="Mirror — duplicate the active range's box and brush regions across the clip's centre X plane (left ⇄ right). Screen-space masks cannot be mirrored and are left as they are.">⇔</button>
+          <span class="vdiv"></span>
+          <button id="camSave" class="u ico" title="Bookmark this camera (C cycles bookmarks). Click a number to return to it; Shift-click a number to remove it. Stored on this machine per clip.">◈</button>
+          <span id="camChips" style="display:flex;gap:3px;flex-wrap:wrap"></span>
+          <span class="vdiv"></span>
+          <input id="pointSize" type="range" min="1" max="12" value="2" title="Point size for the Points view, in pixels." style="width:56px">
         </div>
       </div>
     </section>
     <section class="railSec" data-sec="ranges">
       <div class="secHead" title="Edits that span time. Click a row to make it ▶ active; Delete/Backspace removes the active row (not while typing) — but with a pending SAM selection those keys commit it as a delete instead. Ctrl+S saves immediately.">
         <span class="tw">▾</span>Ranges<small>over time</small>
-        <button id="undoBtn" class="railChevron" style="margin-left:auto" disabled title="Undo the last edit — Ctrl+Z">↶</button>
-        <button id="redoBtn" class="railChevron" disabled title="Redo — Ctrl+Shift+Z or Ctrl+Y">↷</button>
       </div>
       <div class="secBody">
+        <!-- range lifecycle | undo/redo — one uniform icon row; undo/redo used to ride the section
+             header as odd-sized chevron buttons, the one non-uniform button pair in the rail. -->
         <div class="ctlGrid">
-          <button id="rangeStart" class="u" title="Start a range at the current frame — the edit applies from here onward. Then shape the selection (it auto-keyframes here), scrub elsewhere and reshape to add keyframes, and press End to close it. The range tweens between keyframes.">⬤</button>
-          <button id="rangeKey" class="u" disabled title="Add a keyframe at the current frame so the edit's shape can change across the range. The shape interpolates between neighbouring keyframes.">◆</button>
-          <button id="rangeEnd" class="u" disabled title="End the range at the current frame — closes the open range so it applies only up to here.">■</button>
+          <button id="rangeStart" class="u ico" title="Start a range at the current frame — the edit applies from here onward. Then shape the selection (it auto-keyframes here), scrub elsewhere and reshape to add keyframes, and press End to close it. The range tweens between keyframes.">⬤</button>
+          <button id="rangeKey" class="u ico" disabled title="Add a keyframe at the current frame so the edit's shape can change across the range. The shape interpolates between neighbouring keyframes.">◆</button>
+          <button id="rangeEnd" class="u ico" disabled title="End the range at the current frame — closes the open range so it applies only up to here.">■</button>
+          <span class="vdiv"></span>
+          <button id="undoBtn" class="u ico" disabled title="Undo the last edit — Ctrl+Z">↶</button>
+          <button id="redoBtn" class="u ico" disabled title="Redo — Ctrl+Shift+Z or Ctrl+Y">↷</button>
         </div>
         <!-- The range STRIP lives in the bottom timeline dock now (#rangeTrack, see #controls) —
              time belongs on the timeline, not in a 270px-wide side rail. This section keeps the
@@ -715,23 +792,24 @@
         <span class="tw">▾</span>SAM<small>local service</small>
       </div>
       <div class="secBody">
-        <div style="display:flex;gap:6px;align-items:center">
-          <span id="samDot" style="width:7px;height:7px;border-radius:50%;background:#5a5852;flex:none;transition:background .3s"></span>
+        <div class="row">
           <button id="samStart" class="u" title="Start the local SAM segmentation service. Click-to-select and text prompts both need it running; it loads the model on a background thread and reports below.">Start</button>
           <span id="samStatus" style="font:10px ui-monospace,monospace;color:var(--text-dim)">checking…</span>
         </div>
-        <div id="samTextRow" style="display:flex;gap:5px;align-items:center;margin-top:6px">
-          <input id="samTextInput" type="text" placeholder="describe an object…" disabled maxlength="200"
-            style="flex:1;min-width:0;padding:4px 6px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:5px;color:var(--text);font-size:11px" title="text/concept prompt — Enter to segment (SAM tool) — Esc clears">
+        <div id="samTextRow" class="row" style="margin-top:4px">
+          <input id="samTextInput" class="inp" type="text" placeholder="describe an object…" disabled maxlength="200"
+            style="flex:1;min-width:0" title="text/concept prompt — Enter to segment (SAM tool) — Esc clears">
           <button id="samTextGo" class="u" disabled title="Segment by text description (Enter). Captures the current view and asks the concept model for every matching instance.">Go</button>
         </div>
         <div id="samTextHint" style="display:none;margin-top:3px;font:10px ui-monospace,monospace;color:var(--text-faint)"></div>
         <div id="samTextChips" style="display:none;gap:4px;flex-wrap:wrap;margin-top:5px"></div>
-        <div id="samSelRow" style="display:none;margin-top:6px;align-items:center;gap:5px;flex-wrap:wrap">
+        <div id="samSelRow" class="row" style="display:none;margin-top:4px;flex-wrap:wrap">
           <span id="samSelInfo" style="flex:1;min-width:90px;font:10px ui-monospace,monospace;color:var(--text-dim)"></span>
-          <select id="samActSel" style="padding:3px 4px;margin:0;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:4px;color:var(--text);font-size:10.5px" title="the action the commit button below performs on this selection">
+          <select id="samActSel" class="inp" title="the action the commit button below performs on this selection">
             <option value="delete">Delete</option>
             <option value="recolor">Recolor…</option>
+            <option value="paint">Paint…</option>
+            <option value="sculpt">Sculpt…</option>
             <option value="copy">Copy…</option>
           </select>
           <button id="samApply" class="u primary" title="Commit this selection as the action chosen beside it, keyframed at the current frame. The Del key always commits as a delete.">Commit</button>
@@ -739,15 +817,91 @@
         </div>
       </div>
     </section>
+    <section class="railSec" data-sec="fx">
+      <div class="secHead" title="Playback effects — evaluated in the renderer, never baked into the geometry. Keyframe them on the timeline (◆) and they interpolate between keys; the track is saved in the clip's sidecar."><span class="tw">▾</span>FX<small>playback · keyframed</small></div>
+      <div class="secBody">
+        <div class="row">
+          <span class="k" title="Clip plane — hides everything on one side of a world-aligned plane: a cross-section or a reveal. The slider moves the plane through the clip's extent along the chosen axis.">clip</span>
+          <button id="fxClipOn" class="u ico" aria-pressed="false" title="clip plane on / off">◫</button>
+          <div class="seg" id="fxClipAxis" role="group" aria-label="clip axis">
+            <button data-ax="0" title="plane normal along X">X</button><button data-ax="1" aria-pressed="true" title="plane normal along Y">Y</button><button data-ax="2" title="plane normal along Z">Z</button>
+          </div>
+          <button id="fxClipFlip" class="u ico" title="flip which side is kept">⇄</button>
+          <input id="fxClipOff" type="range" min="0" max="100" value="50" style="flex:1;min-width:40px" title="plane position across the clip's extent">
+        </div>
+        <div class="row">
+          <span class="k" title="Dissolve — burns the surface away through 3D noise; the rim of the burn takes the edge colour. Scale sets the grain.">dissolve</span>
+          <input id="fxDissolve" type="range" min="0" max="100" value="0" style="flex:1;min-width:40px" title="how much has dissolved, 0–100%">
+          <input id="fxDissolveScale" class="inp" type="number" min="0.1" step="0.5" value="4" style="width:44px" title="grain: noise cells per world unit">
+          <input id="fxEdge" type="color" value="#c99a5a" title="burn-edge colour" style="width:var(--ctl);height:var(--ctl);padding:0;border:0;background:none;cursor:pointer">
+        </div>
+        <div class="row">
+          <span class="k" title="Tint — multiply the surface by a colour, mixed in by the slider.">tint</span>
+          <input id="fxTint" type="color" value="#ffffff" title="tint colour" style="width:var(--ctl);height:var(--ctl);padding:0;border:0;background:none;cursor:pointer">
+          <input id="fxTintMix" type="range" min="0" max="100" value="0" style="flex:1;min-width:40px" title="tint mix, 0–100%">
+        </div>
+        <div class="row">
+          <span class="k" title="Rim — a fresnel edge light from the camera's point of view (meshes).">rim</span>
+          <input id="fxRimColor" type="color" value="#c99a5a" title="rim colour" style="width:var(--ctl);height:var(--ctl);padding:0;border:0;background:none;cursor:pointer">
+          <input id="fxRim" type="range" min="0" max="100" value="0" style="flex:1;min-width:40px" title="rim strength, 0–100%">
+        </div>
+        <div class="row">
+          <span class="k" title="Scanlines — hologram bands along world Y; the number is bands per metre-scale unit.">scan</span>
+          <input id="fxScan" type="range" min="0" max="100" value="0" style="flex:1;min-width:40px" title="scanline strength, 0–100%">
+          <input id="fxScanFreq" class="inp" type="number" min="1" step="5" value="40" style="width:48px" title="bands per world unit">
+        </div>
+        <div class="row">
+          <span class="k" title="Wobble — sinusoidal displacement of the surface (holo-glitch). Amplitude is a percentage of the clip's height; frequency in waves per world unit.">wobble</span>
+          <input id="fxWobble" type="range" min="0" max="100" value="0" style="flex:1;min-width:40px" title="wobble amplitude, % of clip height ÷ 20">
+          <input id="fxWobbleFreq" class="inp" type="number" min="0.1" step="0.5" value="2" style="width:44px" title="waves per world unit">
+        </div>
+        <div class="row" id="fxSplatRow">
+          <span class="k" title="Splat clips only: per-splat jitter (% of clip height ÷ 100), size and opacity multipliers.">splat</span>
+          <input id="fxJitter" type="range" min="0" max="100" value="0" style="flex:1;min-width:30px" title="per-splat jitter">
+          <input id="fxSplatScale" type="range" min="10" max="300" value="100" style="flex:1;min-width:30px" title="splat size, 10–300%">
+          <input id="fxSplatOpacity" type="range" min="0" max="100" value="100" style="flex:1;min-width:30px" title="splat opacity, 0–100%">
+        </div>
+        <div class="ctlGrid" style="margin-top:4px">
+          <button id="fxKey" class="u ico" title="Keyframe (◆) — store the current effect values at this frame; the track interpolates between keys and holds outside them.">◆</button>
+          <button id="fxKeyDel" class="u ico" title="Remove the keyframe at this frame.">◇</button>
+          <button id="fxTrackClear" class="u ico" title="Clear the whole effects track.">✕</button>
+          <button id="fxReset" class="u ico" title="Reset the live values (the track is kept).">⭯</button>
+          <span class="vdiv"></span>
+          <select id="fxReact" class="inp" title="Audio-reactive: add the clip's loudness × gain to one parameter while it plays (needs an audio track).">
+            <option value="">react: off</option>
+            <option value="dissolve">dissolve</option>
+            <option value="tintMix">tint mix</option>
+            <option value="rim">rim</option>
+            <option value="scanlines">scanlines</option>
+            <option value="wobbleAmp">wobble</option>
+            <option value="splatScale">splat size</option>
+            <option value="splatOpacity">splat opacity</option>
+          </select>
+          <input id="fxReactGain" type="range" min="0" max="200" value="80" style="width:56px" title="reactive gain, 0–200%">
+        </div>
+        <div id="fxKeys" style="display:flex;gap:3px;flex-wrap:wrap;margin-top:4px;font:10px ui-monospace,monospace;color:var(--text-dim)"></div>
+      </div>
+    </section>
+    <section class="railSec" data-sec="export">
+      <div class="secHead" title="Take things out of the viewer: the presented frame's mesh, a still, or a turntable clip. All local, nothing uploaded."><span class="tw">▾</span>Export<small>frame · still · turntable</small></div>
+      <div class="secBody">
+        <div class="ctlGrid">
+          <button id="exportObj" class="u" title="Write the presented frame as a Wavefront OBJ (positions, UVs, normals, faces) — the frame exactly as decoded, before any edit preview. The atlas is a video track and is not written; use ares export for a PNG-free PLY.">Frame → OBJ</button>
+          <button id="exportPng" class="u" title="Save the viewport as a PNG at up to 4096 px on the long side (current shading, grid and overlays as shown).">Still → PNG</button>
+          <button id="exportTurn" class="u" title="Record one full auto-orbit revolution (8 s) of the playing clip as a WebM video from this viewport. Uses the browser's MediaRecorder; the orbit speed is restored afterwards.">Turntable → WebM</button>
+        </div>
+        <div id="exportStatus" style="font:10px ui-monospace,monospace;color:var(--text-dim);margin-top:4px;min-height:12px"></div>
+      </div>
+    </section>
     <section class="railSec" data-sec="bake">
       <div class="secHead"><span class="tw">▾</span>Bake to .ares</div>
       <div class="secBody">
-        <div style="display:flex;gap:5px;align-items:center;margin-bottom:5px">
-          <input id="bakePath" placeholder="source frames folder — click 📁" style="flex:1;min-width:0;padding:4px 6px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:5px;color:var(--text);font:10.5px ui-monospace,monospace">
-          <button id="bakePick" class="u ico" title="Choose the source frames folder with a native dialog — the path fills itself in.">📁</button>
+        <div class="row" style="margin-bottom:4px">
+          <input id="bakePath" class="inp" placeholder="source frames folder" style="flex:1;min-width:0">
+          <button id="bakePick" class="u ico" title="Choose the source frames folder">…</button>
         </div>
-        <div style="display:flex;gap:5px;align-items:center">
-          <input id="bakeName" value="daniel-crop" style="flex:1;padding:4px 6px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:5px;color:var(--text);font:11px system-ui"><span style="color:var(--text-faint);font-size:10px">.ares</span>
+        <div class="row">
+          <input id="bakeName" class="inp" value="" placeholder="output name" style="flex:1;min-width:0"><span style="color:var(--text-faint);font-size:10px">.ares</span>
           <button id="bakeGo" class="u primary" title="Encode the picked capture folder into a .ares clip, applying the edit ranges above. Progress streams below.">Bake</button>
         </div>
         <div id="bakeLog" style="font:10px ui-monospace,monospace;color:var(--text-dim);margin-top:6px;max-height:80px;overflow:auto;white-space:pre-wrap"></div>
@@ -761,12 +915,12 @@
 <div class="tool" id="tab-compare">
   <div class="wrap" style="max-width:1500px">
     <div id="cmpBar" style="display:flex;gap:10px;justify-content:center;align-items:center;margin:2px 0 12px;flex-wrap:wrap">
-      <select id="cmpA" class="cvsel"></select>
+      <select id="cmpA" class="inp"></select>
       <span style="color:var(--text-faint);font-size:12px">vs</span>
-      <select id="cmpB" class="cvsel"></select>
-      <button id="cmpPlay" class="btn" style="margin:0;padding:7px 14px" title="play / pause both clips together — Space">Pause</button>
-      <button id="cmpOrbit" class="btn ghost toggle" style="margin:0;padding:7px 14px" title="auto-orbit both clips in sync so you compare from the same angle">Orbit</button>
-      <button id="cmpMode" class="btn ghost" style="margin:0;padding:7px 14px" title="switch between split-screen and overlaid A/B — click to cycle">Split view</button>
+      <select id="cmpB" class="inp"></select>
+      <button id="cmpPlay" class="u primary" title="play / pause both clips together — Space">Pause</button>
+      <button id="cmpOrbit" class="u toggle" title="auto-orbit both clips in sync so you compare from the same angle">Orbit</button>
+      <button id="cmpMode" class="u" title="switch between split-screen and overlaid A/B — click to cycle">Split view</button>
       <!-- Same shading modes as the Viewer, driving BOTH players in lockstep — an A/B is only fair
            if both sides are shaded identically (owner ask: Compare needs these too). -->
       <div class="seg" id="cmpShadeSeg" role="group" aria-label="viewport shading (both clips)">
@@ -796,26 +950,22 @@
 <div class="tool" id="tab-convert">
   <div class="wrap">
     <h2>Convert to .ares</h2>
-    <p class="lead">Pick a <b>folder</b> of per-frame <b>OBJ/PLY meshes + PNG atlases</b> — no typing, no command line.
-      Encoding runs on this machine; nothing is uploaded. Drop a single <b>.ares</b> or <b>.4ds</b> file instead
-      and it's structurally probed <b>locally in your browser</b> — only the container skeleton (header, frame
-      directory, block lengths) is read, never the mesh or texture content.</p>
+    <p class="lead">Convert a capture folder — per-frame OBJ/PLY meshes with PNG or JPG atlases — into a
+      single .ares clip. Encoding runs locally. A single .ares or .4ds file is probed structurally
+      instead: only the container layout is read, never mesh or texture content.</p>
     <div class="note" style="margin:0 0 10px">Formats: <b>Microsoft volcap</b> OBJ+PNG <span class="good">✓ converts</span>
       · <b>PLY sequences</b> <span class="good">✓ converts</span>
-      · <b>DepthKit</b> Textured Geometry Sequence (OBJ/PLY + PNG/JPG, one of each per frame) — drop the exported
-      frames folder, same path as above
+      · <b>DepthKit</b> Textured Geometry Sequence (OBJ/PLY + PNG/JPG, one of each per frame) <span class="good">✓ converts</span>
       · <b>4DViews</b> <code>.4ds</code> <span class="good">✓ converts</span> (DXT1 desktop captures, ~2 fps decode; needs the
-      codec DLL — <a href="#" id="fourdsSettingsLink">⚙ Settings</a> if missing)</div>
+      codec DLL — <a href="#" id="fourdsSettingsLink">Settings</a> if missing)</div>
     <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
-      <button class="btn" id="convertPick" style="margin:0" title="pick the capture folder to import — a sequence of per-frame OBJ/PLY meshes + atlas PNGs">📁 Choose folder…</button>
-      <span class="note" style="margin:0">opens a native folder dialog — the path fills itself in</span>
-      <label class="btn ghost" for="convertProbeFile" style="margin:0;display:inline-block">📄 Choose .ares/.4ds…</label>
-      <span class="note" style="margin:0">inspect a single container file</span>
+      <button class="u primary" id="convertPick" title="pick the capture folder to import — a sequence of per-frame OBJ/PLY meshes + atlas PNGs">Choose folder…</button>
+      <label class="u" for="convertProbeFile">Choose .ares/.4ds…</label>
       <input type="file" id="convertProbeFile" accept=".4ds,.ares" style="display:none">
     </div>
     <label class="drop" id="convertDrop">
-      <div class="big">…or drop a folder / mesh+atlas files — or a single .ares/.4ds — here</div>
-      <div class="small">drag-drop works for a quick preview, or a full structural probe</div>
+      <div class="big">Drop a capture folder or a .ares/.4ds file</div>
+      <div class="small">Folders are analysed for conversion; single files are probed.</div>
       <input type="file" id="convertFile" multiple webkitdirectory>
     </label>
     <div id="convertOut"></div>
@@ -828,9 +978,8 @@
 <div class="tool" id="tab-settings">
   <div class="wrap">
     <h2>Settings — models and tools</h2>
-    <p class="lead">Optional models, libraries, and data the app can use. Green means installed;
-      anything missing shows what it enables and where to get it. The app runs regardless — features
-      that need a missing piece warn when used and link back here.</p>
+    <p class="lead">Optional models, tools, and data. Each row shows what the component enables and
+      how to install it. Features that need a missing component warn at the point of use.</p>
     <div id="depsOut"><div class="card"><div class="note">checking…</div></div></div>
   </div>
 </div>
@@ -838,9 +987,8 @@
 <div class="tool" id="tab-compute">
   <div class="wrap">
     <h2>Compute — RunPod</h2>
-    <p class="lead">Launch cloud GPUs, watch them live, and run the motion-robust registration
-      experiments — from inside the app. The API key stays on the dev server; nothing spends until
-      a pod is launched.</p>
+    <p class="lead">Launch and monitor RunPod GPU pods and run registration experiments. The API key
+      stays on the dev server.</p>
     <div id="rpOut"><div class="card"><div class="note">checking…</div></div></div>
   </div>
 </div>
@@ -866,7 +1014,7 @@
 <!-- Selection capture layer (editor tools): sits over the canvas, under the panels -->
 <div id="selectOverlay" style="position:fixed;inset:0;z-index:4;display:none;cursor:crosshair;touch-action:none">
   <canvas id="samMask" style="position:absolute;display:none;pointer-events:none"></canvas>
-  <div id="marquee" style="position:absolute;border:1.5px dashed var(--warn);background:rgba(224,169,74,.12);display:none"></div>
+  <div id="marquee" style="position:absolute;border:1.5px dashed var(--warn);background:color-mix(in srgb, var(--warn) 12%, transparent);display:none"></div>
 </div>
 
 <div class="panel" id="err"></div>

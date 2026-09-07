@@ -1494,10 +1494,20 @@ sharing the same container and timeline. A splat frame is a set of Gaussians:</p
   splat <em>birth/death</em> must be coded.</li>
 <li><strong>Video-packed attributes.</strong> Following PackUV [43], splat attributes can be laid into 2D tiles and
   encoded as a video track (<a href="#85-video-assisted-geometry-packing-attributes-into-pixels">§8.5</a>),
-  routing splat geometry through the hardware decoder just like texture.</li>
-<li><strong>Rendering.</strong> WebGPU instanced billboards with additive/OIT blending and a per-frame compute-shader
-  depth sort (<a href="#12-javascript--webgpu-implementation">§12</a>).</li>
+  routing splat geometry through the hardware decoder just like texture. The §8.5.1 warning applies
+  in full: only colour is video-shaped. Positions fail exactly as for meshes, and rotations fail
+  worse — a quaternion is not spatially coherent, and a jittered splat has no index buffer holding
+  it in place. The claim that "splats tolerate lossy packing better" holds for colour, not geometry.</li>
+<li><strong>Rendering.</strong> Instanced quads per splat, back-to-front through an index indirection from a CPU
+  counting sort (re-sorted only when the view direction moves), EWA covariance projection in the
+  vertex stage, premultiplied "over" compositing. Both backends (WebGPU storage buffers; WebGL2
+  data textures) — <a href="#12-javascript--webgpu-implementation">§12</a>.</li>
 </ul>
+<p><strong>Implementation (2026-09-07).</strong> The intra splat profile ships: block layout in
+<a href="#1163-geometry-block--splat-profile">§11.6.3</a>; importers for Niantic SPZ (v1–v4), 3DGS PLY,
+<code>.splat</code>, glTF/GLB with <code>KHR_gaussian_splatting</code>, and PlayCanvas SOG; exporters for SPZ, 3DGS PLY,
+glTF/GLB and <code>.splat</code> (<code>ares export</code>). Degree 0 is the fast path (the common case for generated
+environments); degrees 1–3 are carried as 8-bit bands and evaluated in the vertex shader.</p>
 <h3 id="69-hybrid-geometry-per-stream-representations">6.9 Hybrid geometry (per-stream representations)</h3>
 <p>No single representation is optimal for all content, so the container permits <strong>multiple geometry
 representations within one asset</strong>, each stream carrying its representation id and its own decoder while
@@ -2485,9 +2495,175 @@ marked <em>reserved</em> exist for forward compatibility.</p>
 <p>P/B frames are <strong>sparse</strong>: only vertices whose residual exceeds the dead-zone are listed. Static
 regions cost near-zero bytes. Topology (indices) is <strong>not</strong> repeated — it persists from the I-frame.</p>
 </blockquote>
+<h4 id="1162a-audio-block-implemented-2026-09-07">11.6.2a Audio block (implemented 2026-09-07)</h4>
+<p>Track type 3, FourCC <code>OPUS</code>, <code>codec_config</code> = the 19-byte OpusHead (channels, pre-skip, input
+rate). One block per chunk holding the Opus packets whose presentation time falls in the chunk's
+span (the last chunk also takes the audio tail):</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>packet_count</code></td>
+<td>u16</td>
+<td></td>
+</tr>
+<tr>
+<td><code>reserved</code></td>
+<td>u16</td>
+<td></td>
+</tr>
+<tr>
+<td>per packet: <code>pts_offset_us</code></td>
+<td>u32</td>
+<td>from the chunk's <code>pts_start_us</code></td>
+</tr>
+<tr>
+<td><code>duration_us</code></td>
+<td>u16</td>
+<td>from the packet's TOC (20 ms at the encoder's default)</td>
+</tr>
+<tr>
+<td><code>size</code></td>
+<td>u16</td>
+<td></td>
+</tr>
+<tr>
+<td><code>data[]</code></td>
+<td>u8</td>
+<td>the packets, concatenated in the same order</td>
+</tr>
+</tbody>
+</table>
+<p>Media time 0 is the first audible sample: the encoder subtracts the pre-skip when timing
+packets, and the decoder receives OpusHead as its <code>description</code> so it trims the same priming.</p>
 <h4 id="1163-geometry-block-splat-profile">11.6.3 Geometry block — splat profile</h4>
-<p>I-frame: <code>splat_count(u32)</code> then packed <code>pos(3×f16)|scale(3×f16)|rot(4×i8 quat)|opacity(u8)|SH(k×
-f16)</code>. P/B-frames: sparse attribute residuals + a birth/death list (<code>added[]</code>, <code>removed[]</code>).</p>
+<p>Implemented (2026-09-07; <code>@ares/core</code> splat.ts / geometry.ts, <code>@ares/encoder</code> splat-frame.ts). The
+geometry track's FourCC is <code>SPLT</code>, the header's <code>geometry_profile</code> is 1, and the superblock's
+<code>sh_degree</code> byte (the mesh profile's reserved byte after <code>normal_encoding</code>) carries the SH degree.</p>
+<p>I-frame:</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>splat_count</code></td>
+<td>u32</td>
+<td></td>
+</tr>
+<tr>
+<td><code>sh_degree</code></td>
+<td>u8</td>
+<td>0–3; the number of higher-order bands present</td>
+</tr>
+<tr>
+<td><code>flags</code></td>
+<td>u8</td>
+<td>bit0 antialiased (mip-splatting kernel)</td>
+</tr>
+<tr>
+<td><code>reserved</code></td>
+<td>u16</td>
+<td></td>
+</tr>
+<tr>
+<td><code>positions</code></td>
+<td>meshopt(u16×3 + pad, stride 8)</td>
+<td>quantized over the chunk AABB with <code>quant_bits_pos</code> — the mesh layout</td>
+</tr>
+<tr>
+<td><code>attrs</code></td>
+<td>meshopt(3×u32, stride 12)</td>
+<td>word 0: scale bytes ×3 (<code>exp(s/16 − 10)</code>) + opacity u8; word 1: rotation, SPZ v3 "smallest three" (2-bit largest index, 3 × sign+9-bit magnitude); word 2: base colour rgb u8 (display-referred, <code>0.5 + C0·sh0</code> clamped) + reserved</td>
+</tr>
+<tr>
+<td><code>sh</code></td>
+<td>meshopt(u8, stride 12 / 24 / 48)</td>
+<td>degree ≥ 1 only: <code>(v − 128)/128</code>, coefficient-major rgb, padded to a multiple of 4</td>
+</tr>
+</tbody>
+</table>
+<p>Positions and rotations are never video-packed (§8.5.1); at <code>sh_degree</code> 0 the whole record is 18
+bytes per splat before meshopt. Splats are Morton-ordered within a frame so the vertex codec's
+delta prediction sees spatial neighbours.</p>
+<p>P-frame (dynamic splat profile, implemented 2026-09-07). Correspondence is by index when the
+Gaussian set is stable frame to frame, else nearest neighbour within a radius (encoder
+<code>--splat-temporal auto|index|nn|off</code>, <code>--splat-match</code>); a frame keeping fewer survivors than
+<code>--splat-min-survive</code> is coded intra. Survivors keep the previous frame's order (minus the dead);
+births append.</p>
+<table>
+<thead>
+<tr>
+<th>Field</th>
+<th>Type</th>
+<th>Notes</th>
+</tr>
+</thead>
+<tbody>
+<tr>
+<td><code>splat_count</code></td>
+<td>u32</td>
+<td>this frame</td>
+</tr>
+<tr>
+<td><code>sh_degree</code>, <code>flags</code>, <code>reserved</code></td>
+<td>u8, u8, u16</td>
+<td>as the I-frame; degree must match the keyframe</td>
+</tr>
+<tr>
+<td><code>death_count</code></td>
+<td>u32</td>
+<td>over the PREVIOUS frame</td>
+</tr>
+<tr>
+<td><code>deaths[]</code></td>
+<td>varint</td>
+<td>ascending previous indices, delta-coded (LEB128)</td>
+</tr>
+<tr>
+<td><code>survivor_count</code></td>
+<td>u32</td>
+<td>= previous count − deaths</td>
+</tr>
+<tr>
+<td><code>deltas</code></td>
+<td>meshopt(i16×3 + pad, stride 8)</td>
+<td>quantized position deltas, added mod 2¹⁶</td>
+</tr>
+<tr>
+<td><code>attrs</code></td>
+<td>meshopt(stride 12)</td>
+<td>survivors' attrs as byte deltas mod 256 vs their previous copy</td>
+</tr>
+<tr>
+<td><code>sh</code></td>
+<td>meshopt(stride 12/24/48)</td>
+<td>survivors' SH as byte deltas mod 256 (degree ≥ 1)</td>
+</tr>
+<tr>
+<td><code>birth_count</code></td>
+<td>u32</td>
+<td>= count − survivors</td>
+</tr>
+<tr>
+<td><code>birth positions</code>, <code>birth attrs</code>, <code>birth sh</code></td>
+<td>meshopt</td>
+<td>absolute, the I-frame encodings</td>
+</tr>
+</tbody>
+</table>
+<p>Byte deltas turn an unchanged attribute into a run of zeros, which the vertex codec folds to
+almost nothing; on the synthetic rotating clip a 60 fps GOP is &gt; 20 % smaller than intra.</p>
 <h3 id="117-versioning-and-extensions">11.7 Versioning and extensions</h3>
 <ul>
 <li><strong>Version.</strong> <code>version_major</code> breaks compatibility; <code>version_minor</code> is additive. A decoder MUST

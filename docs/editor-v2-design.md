@@ -400,3 +400,33 @@ Undo/redo = command stack over this document; autosave debounced to the sidecar.
 - SAM 3 / 3.1 (concept prompts, tracking): https://ai.meta.com/blog/segment-anything-model-3/ · https://github.com/facebookresearch/sam3
 - SAM 3D (reconstruction, local checkpoints): https://github.com/facebookresearch/sam-3d-objects · https://github.com/facebookresearch/sam-3d-body
 - WebGPU wireframe (line-list vs barycentric): https://notebook.xbdev.net/index.php?page=webgpuwireframe · https://tchayen.github.io/posts/wireframes-with-barycentric-coordinates
+
+
+## Addendum 2026-09-07 — tools added after the audit
+
+- **Lasso** (`A`): a free polygon rasterized into the same `mask2d/bitmap` volume SAM produces, so
+  the evaluator, the X-ray/depth-band law and the bake path are shared, not forked.
+- **Measure** (`T`): two surface picks through `pickRaster`, re-projected as the camera moves,
+  read in the clip's inferred units. Camera-only; never touches the sidecar.
+- **Grow / shrink / invert / mirror** on the ▶ active range: boxes per face, brush radii, marquee
+  rects, and bitmaps by the matching pixel count (`growKeyframe`, `morphBitmap` in core
+  `edits.ts`); invert flips `mode` between delete and keep; mirror duplicates box and brush
+  regions across the clip's centre X plane (`mirrorKeyframe`; screen-space masks cannot be
+  mirrored and are counted, not silently skipped).
+- **Range properties**: `enabled:false` mutes a range everywhere (preview and every bake op filter
+  on `isRangeEnabled`), `label` names it, `interp` selects linear / hold / smooth keyframe
+  interpolation in `prepareRangeSdfAt`.
+- **Sculpt** (`action:"sculpt"`, encoder `sculpt.ts`): world-anchored vertex displacement inside
+  the interpolated region — move, inflate, smooth, flatten, pinch — weld-aware and feathered
+  with the paint op's law. Bake-side only, like paint; the timeline shows the range.
+- **Analysis views** in the shading control: normals, UV checker, depth, points (the vertices as
+  a point cloud, textured, unlit, with a size slider). Both renderers.
+- **Export** rail section: the presented frame to OBJ (`AresPlayer.exportFrame()`), a still to
+  PNG, an 8-second turntable to WebM through `MediaRecorder` (orbit speed is restored after).
+- **Camera bookmarks** (`◈`, `C` cycles): per clip in `localStorage`; Shift-click removes.
+- `?` opens a shortcuts panel; the tooltips still carry the same words at each control.
+- **FX** (`packages/core/src/fx.ts`): playback-time effects on meshes and splats — clip plane,
+  dissolve (3D value noise + burn rim), tint, fresnel rim, scanlines, wobble, splat jitter / size /
+  opacity — as one uniform block in both renderers, keyframed in `edits.fx` and evaluated per
+  presented frame (`setFxTrack`), with an override layer for audio-reactive modulation
+  (`setFxOverride`, `getAudioLevel`). Never baked: the encoder ignores `edits.fx`.

@@ -84,7 +84,7 @@ export interface EditRange {
    * for copy, packages/encoder/src/recolor.ts for recolor); the demo timeline still renders the
    * range (bar/keyframes) like any other.
    */
-  action?: "delete" | "copy" | "recolor";
+  action?: "delete" | "copy" | "recolor" | "paint" | "sculpt";
   /**
    * action:"copy" payload: paste a region from `srcFrame` into each of `dstFrames`. Region = this
    * range's volumes evaluated ONCE at srcFrame (prepareRangeAt below — the SAME evaluator preview
@@ -119,6 +119,25 @@ export interface EditRange {
    */
   recolor?: { color: string; strength?: number; mode?: "tint" | "hue" };
   /**
+   * action:"paint" payload (sculpt+paint plan §B, build-order item 1): a TEXEL-granular soft
+   * brush, where recolor is triangle-granular and hard-edged. The range's keyframed volumes are
+   * the brush region (usually brushStrokes authored by the paint tool — world-anchored, so the
+   * op re-projects per frame through that frame's OWN mesh and survives per-frame atlas repacks;
+   * the editor-v3 frame-copy lesson makes same-coord texel writes a corruption, so there are
+   * none here). Per frame, per texel of each nearby triangle's UV footprint: the texel's WORLD
+   * position (barycentric) is evaluated against the range's interpolated SDF and the effect is
+   * weighted by a smoothstep falloff over `feather` mm (default half the mean stroke radius).
+   * `brush` default "tint":
+   *   "tint" — recolorPixel's luma-preserving tint toward `color`, scaled by strength×weight.
+   *   "heal" — box-blur sourced from the frame's own pre-paint atlas, mixed by strength×weight
+   *            (softens damage/seams; the manual cousin of the reference-restore track).
+   * On a stable-layout (coherent) span the painted texels land in the same atlas place every
+   * frame — the plan's "paint once, whole span inherits" falls out of the per-frame evaluation
+   * rather than being a special case. Bake-side only, same as copy/recolor (the timeline shows
+   * the range; the baked .ares shows the paint).
+   */
+  paint?: { brush?: "tint" | "heal"; color?: string; strength?: number; feather?: number };
+  /**
    * Hole patching after deletion — a MODIFIER on a plain delete
    * range, not a new action: only meaningful when `(action ?? "delete") === "delete"` and
    * `mode === "delete"` (a copy/recolor/keep range carrying this field is a passive no-op,
@@ -132,11 +151,36 @@ export interface EditRange {
    * the open hole; only the baked .ares shows the cap.
    */
   patchHoles?: { color?: string };
+  /**
+   * action:"sculpt" payload (sculpt+paint plan §A): a world-anchored displacement of the vertices
+   * inside the range's interpolated region, per frame against that frame's OWN mesh — so it
+   * survives per-frame topology resets exactly as paint does. Weight = 1 inside, smoothstep
+   * falloff over `feather` (mm; default: half the mean brush radius, or 5 % of the region size).
+   *   "move"    — translate by `offset` (world units) × weight.
+   *   "inflate" — push along the (weld-aware) vertex normal by `amount` (world units) × weight;
+   *               negative deflates.
+   *   "smooth"  — `iterations` Laplacian passes (weld-aware, umbrella weights), blended by weight.
+   *   "flatten" — pull toward the region's best-fit plane by `amount` (0..1 fraction) × weight.
+   *   "pinch"   — pull toward the region's centroid by `amount` (0..1 fraction) × weight.
+   * Bake-side only, like paint (the timeline shows the range; the baked .ares shows the shape).
+   */
+  sculpt?: { brush?: "move" | "inflate" | "smooth" | "flatten" | "pinch"; amount?: number; offset?: [number, number, number]; iterations?: number; feather?: number };
+  /**
+   * Keyframe interpolation: "linear" (default) lerps the SDF between bracketing keyframes,
+   * "hold" keeps the previous keyframe's region until the next one, "smooth" eases with a
+   * smoothstep so a region settles into each keyframe instead of hitting it.
+   */
+  interp?: "linear" | "hold" | "smooth";
+  /** false = muted: the range is kept in the document but ignored by preview and bake alike. */
+  enabled?: boolean;
   startFrame: number;
   endFrame: number;
   scrubTexels?: boolean;
   keyframes: EditKeyframe[];
 }
+
+/** Muted ranges are skipped everywhere; a missing flag means enabled. */
+export const isRangeEnabled = (r: EditRange): boolean => r.enabled !== false;
 export interface EditList {
   aresEdits: 1;
   source?: string;
@@ -287,13 +331,116 @@ function bracket(r: EditRange, f: number): { a: EditKeyframe; b: EditKeyframe; t
  * fixed srcFrame and reuse it verbatim against other frames' meshes — same evaluator, not forked.
  */
 export function prepareRangeAt(r: EditRange, f: number): (x: number, y: number, z: number) => boolean {
+  const sdf = prepareRangeSdfAt(r, f);
+  if (!sdf) return () => false;     // no keyframes yet → range matches nothing
+  return (x, y, z) => sdf(x, y, z) < 0;
+}
+
+/**
+ * The RAW interpolated signed distance for a range at frame f (negative = inside), or null when
+ * the range has no keyframes yet. prepareRangeAt is its sign; the paint op needs the magnitude
+ * for its feathered falloff (metric mm for box/brush volumes; mask2d magnitudes are NDC-scaled
+ * and only meaningful near zero — the falloff still behaves, it is just not metric there).
+ */
+export function prepareRangeSdfAt(r: EditRange, f: number): SdfFn | null {
   const br = bracket(r, f);
-  if (!br) return () => false;      // no keyframes yet → range matches nothing
-  const { a, b, t } = br;
+  if (!br) return null;
+  const { a, b } = br;
+  let t = br.t;
+  if (r.interp === "hold") t = 0;
+  else if (r.interp === "smooth") t = t * t * (3 - 2 * t);
   const evA = prepareKeyframe(a);
-  if (t === 0) return (x, y, z) => evA(x, y, z) < 0;
+  if (t === 0) return evA;
   const evB = prepareKeyframe(b);
-  return (x, y, z) => (1 - t) * evA(x, y, z) + t * evB(x, y, z) < 0;
+  return (x, y, z) => (1 - t) * evA(x, y, z) + t * evB(x, y, z);
+}
+
+/* ------------------------------- region editing helpers ------------------------------- */
+
+/** Morphological dilate (r > 0) / erode (r < 0) of a 0/1 bitmap by |r| pixels (square kernel, |r| passes). */
+export function morphBitmap(bits: Uint8Array, w: number, h: number, r: number): Uint8Array {
+  const grow = r > 0;
+  let cur = bits;
+  for (let pass = 0; pass < Math.abs(r); pass++) {
+    const next = new Uint8Array(w * h);
+    for (let y = 0; y < h; y++) for (let x = 0; x < w; x++) {
+      const i = y * w + x;
+      let v = cur[i]!;
+      if (grow ? !v : v) {
+        // grow: any set neighbour sets; shrink: any clear neighbour (or the border) clears
+        let hit = false;
+        for (let dy = -1; dy <= 1 && !hit; dy++) for (let dx = -1; dx <= 1; dx++) {
+          const nx = x + dx, ny = y + dy;
+          if (nx < 0 || ny < 0 || nx >= w || ny >= h) { if (!grow) { hit = true; break; } continue; }
+          const n = cur[ny * w + nx]!;
+          if (grow ? n === 1 : n === 0) { hit = true; break; }
+        }
+        if (hit) v = grow ? 1 : 0;
+      }
+      next[i] = v;
+    }
+    cur = next;
+  }
+  return cur === bits ? bits.slice() : cur;
+}
+
+/**
+ * Grow (positive) or shrink (negative) every volume of a keyframe in place: boxes by `world`
+ * units per face, brush radii by `world`, mask rects by `ndc`, bitmaps by `px` pixels. Returns
+ * the number of volumes touched. Boxes and brushes never invert (a face cannot cross its twin).
+ */
+export function growKeyframe(kf: EditKeyframe, world: number, ndc: number, px: number): number {
+  let n = 0;
+  for (const v of kf.volumes) {
+    if (v.type === "box") {
+      for (let a = 0; a < 3; a++) {
+        const mid = (v.min[a]! + v.max[a]!) / 2;
+        v.min[a] = Math.min(mid, v.min[a]! - world);
+        v.max[a] = Math.max(mid, v.max[a]! + world);
+      }
+      n++;
+    } else if (v.type === "brushStrokes") {
+      for (const st of v.strokes) st.radius = Math.max(1e-6, st.radius + world);
+      n++;
+    } else if (v.type === "mask2d") {
+      if (v.kind === "rect" && v.rect) {
+        const r = v.rect;
+        const cx = (r[0] + r[2]) / 2, cy = (r[1] + r[3]) / 2;
+        v.rect = [Math.min(cx, r[0] - ndc), Math.min(cy, r[1] - ndc), Math.max(cx, r[2] + ndc), Math.max(cy, r[3] + ndc)];
+        n++;
+      } else if (v.kind === "bitmap" && v.mask && px !== 0) {
+        const { width, height, rle } = v.mask;
+        const bits = morphBitmap(rleDecodeMask(rle, width * height), width, height, px);
+        v.mask = { width, height, rle: rleEncodeMask(bits) };   // new object: the decode cache is keyed on it
+        n++;
+      }
+    }
+  }
+  return n;
+}
+
+/**
+ * Mirror a keyframe's volumes about the plane `axis = at` (box corners and brush points reflect;
+ * mask2d volumes are camera-anchored and cannot be reflected — they are left untouched and
+ * counted separately). Returns { mirrored, skipped }.
+ */
+export function mirrorKeyframe(kf: EditKeyframe, axis: 0 | 1 | 2, at: number): { mirrored: number; skipped: number } {
+  let mirrored = 0, skipped = 0;
+  const add: EditVolume[] = [];
+  for (const v of kf.volumes) {
+    if (v.type === "box") {
+      const min: [number, number, number] = [...v.min], max: [number, number, number] = [...v.max];
+      const lo = 2 * at - v.max[axis]!, hi = 2 * at - v.min[axis]!;
+      min[axis] = lo; max[axis] = hi;
+      add.push({ type: "box", min, max });
+      mirrored++;
+    } else if (v.type === "brushStrokes") {
+      add.push({ type: "brushStrokes", strokes: v.strokes.map((s) => ({ op: s.op, radius: s.radius, points: s.points.map((p) => { const q: [number, number, number] = [p[0]!, p[1]!, p[2]!]; q[axis] = 2 * at - q[axis]!; return q; }) })) });
+      mirrored++;
+    } else skipped++;
+  }
+  kf.volumes.push(...add);
+  return { mirrored, skipped };
 }
 
 /** Single-point convenience form of prepareRangeAt (per-point use recompiles — prefer the compiled form in loops). */
@@ -318,7 +465,7 @@ export function keepPredicateAt(list: EditList, f: number): ((cx: number, cy: nu
   // blocklist: behavior-identical to the old `r.action !== "copy"` for every value that existed
   // before today (undefined and "delete" both satisfy `(action ?? "delete") === "delete"` and
   // were already included; "copy" fails both forms and was already excluded).
-  const isDeleteAction = (r: EditRange) => (r.action ?? "delete") === "delete";
+  const isDeleteAction = (r: EditRange) => isRangeEnabled(r) && (r.action ?? "delete") === "delete";
   const del = list.ranges.filter((r) => isDeleteAction(r) && r.mode === "delete" && f >= r.startFrame && f <= r.endFrame).map((r) => prepareRangeAt(r, f));
   const keep = list.ranges.filter((r) => isDeleteAction(r) && r.mode === "keep" && f >= r.startFrame && f <= r.endFrame).map((r) => prepareRangeAt(r, f));
   if (!del.length && !keep.length) return null;

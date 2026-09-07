@@ -57,32 +57,41 @@ export async function probe4ds(file) {
 
 // ---- ARES .ares -------------------------------------------------------------
 export async function probeAres(file) {
-  const buf = new Uint8Array(await file.arrayBuffer());
-  const dv = new DataView(buf.buffer);
-  const magic = String.fromCharCode(buf[0], buf[1], buf[2], buf[3]);
-  if (magic !== "ARES" && !(buf[0] === 0x41 && buf[1] === 0x52 && buf[2] === 0x45 && buf[3] === 0x53))
-    throw new Error("not an .ares file");
-  const frameCount = dv.getUint32(16, true);
-  const fps = dv.getFloat32(12, true);
-  const gopIndexOffset = Number(dv.getBigUint64(36, true));
-  let p = gopIndexOffset;
-  const nChunks = dv.getUint32(p, true); p += 4;
+  // Skeleton only, through File.slice() byte ranges — the module header's promise. A 1 GB .ares
+  // costs a few hundred small reads here, never a full buffer.
+  const size = file.size;
+  const h = await slice(file, 0, 64);
+  if (!(h.getUint8(0) === 0x41 && h.getUint8(1) === 0x52 && h.getUint8(2) === 0x45 && h.getUint8(3) === 0x53)) throw new Error("not an .ares file");
+  const frameCount = h.getUint32(16, true);
+  const fps = h.getFloat32(12, true);
+  const profile = h.getUint8(8);
+  const flags = h.getUint16(6, true);
+  const gopIndexOffset = Number(h.getBigUint64(36, true));
+  if (gopIndexOffset <= 0 || gopIndexOffset + 4 > size) throw new Error("bad GOP index offset");
+  const nChunks = (await slice(file, gopIndexOffset, 4)).getUint32(0, true);
+  const REC = 8 + 4 + 2 + 2 + 8 + 4;
+  if (nChunks > 1e6 || gopIndexOffset + 4 + nChunks * REC > size) throw new Error("bad GOP index");
+  const idx = await slice(file, gopIndexOffset + 4, nChunks * REC);
   const chunkOffsets = [];
-  for (let i = 0; i < nChunks; i++) { p += 8 + 4 + 2 + 2; chunkOffsets.push(Number(dv.getBigUint64(p, true))); p += 8 + 4; }
-  let geomI = 0, geomP = 0, tex = 0;
+  for (let i = 0; i < nChunks; i++) chunkOffsets.push(Number(idx.getBigUint64(i * REC + 16, true)));
+  let geomI = 0, geomP = 0, tex = 0, audio = 0;
+  const HEAD = 4 + 8 + 2 + 2 + 12 + 12 + 2;
   for (const off of chunkOffsets) {
-    let q = off + 4 + 8 + 2 + 2 + 12 + 12;
-    const blockCount = dv.getUint16(q, true); q += 2;
+    if (off + HEAD > size) throw new Error("chunk header out of bounds");
+    const ch = await slice(file, off, HEAD);
+    const blockCount = ch.getUint16(HEAD - 2, true);
+    const dir = await slice(file, off + HEAD, blockCount * 11);
     for (let b = 0; b < blockCount; b++) {
-      const type = buf[q]; q += 1 + 2 + 4;
-      const plen = dv.getUint32(q, true); q += 4;
-      if (type === 0) geomI += plen; else if (type === 1) geomP += plen; else if (type === 2) tex += plen;
+      const type = dir.getUint8(b * 11);
+      const plen = dir.getUint32(b * 11 + 7, true);
+      if (type === 0) geomI += plen; else if (type === 1) geomP += plen; else if (type === 2) tex += plen; else if (type === 4) audio += plen;
     }
   }
   const geom = geomI + geomP;
   return {
-    kind: "ares", name: file.name, size: buf.byteLength, frameCount, fps, dur: frameCount / fps,
-    chunks: nChunks, geom, tex, temporal: geomP > 0, overhead: buf.byteLength - geom - tex,
+    kind: "ares", name: file.name, size, frameCount, fps, dur: frameCount / fps,
+    chunks: nChunks, geom, tex, audio, temporal: geomP > 0, overhead: size - geom - tex,
+    profile: profile === 1 ? "splat" : "mesh", hasAudio: !!(flags & 2),
   };
 }
 
@@ -94,7 +103,7 @@ function splitBar(geom, tex, total) {
   return `<div class="split">
     <div style="width:${g}%;background:var(--accent)" title="geometry ${fmtMB(geom)}">${g > 8 ? "geom " + g.toFixed(0) + "%" : ""}</div>
     <div style="width:${t}%;background:var(--series-b)" title="texture ${fmtMB(tex)}">${t > 8 ? "tex " + t.toFixed(0) + "%" : ""}</div>
-    <div style="width:${o}%;background:#5a5852" title="overhead"></div>
+    <div style="width:${o}%;background:var(--border-st)" title="overhead"></div>
   </div>`;
 }
 
@@ -115,7 +124,7 @@ export function render4ds(r) {
     <div class="kv" style="margin-top:8px">
       ${row("geometry", `<b>${fmtMB(r.geom)}</b> · ${pct(r.geom, r.size)} — temporal mesh (small blocks)`)}
       ${row("texture", `<b>${fmtMB(r.tex)}</b> · ${pct(r.tex, r.size)} — per-frame ${r.texW}² image, no inter-frame compression`)}
-      ${row("reconciles", `${r.geom.toLocaleString()} + ${r.tex.toLocaleString()} + ${r.overhead.toLocaleString()} = ${(r.geom + r.tex + r.overhead).toLocaleString()} ${(r.geom + r.tex + r.overhead) === r.size ? "<span class='good'>exact ✓</span>" : "⚠"}`)}
+      ${row("reconciles", `${r.geom.toLocaleString()} + ${r.tex.toLocaleString()} + ${r.overhead.toLocaleString()} = ${(r.geom + r.tex + r.overhead).toLocaleString()} ${(r.geom + r.tex + r.overhead) === r.size ? "<span class='good'>exact ✓</span>" : `<span class='warn'>off by ${Math.abs(r.size - (r.geom + r.tex + r.overhead)).toLocaleString()} B</span>`}`)}
       ${row("per-9.07s equiv", `geometry ${(r.geom * eq / 1048576).toFixed(1)} MiB · texture ${(r.tex * eq / 1048576).toFixed(1)} MiB`)}
     </div>
     <div class="note">Mirror image of ARES: 4DViews spends ~${pct(r.geom, r.size)} on geometry (temporal) and ~${pct(r.tex, r.size)} on texture
@@ -130,7 +139,9 @@ export function renderAres(r) {
       ${row("file", r.name)}
       ${row("size", `${r.size.toLocaleString()} B (${fmtMB(r.size)})`)}
       ${row("frames", `${r.frameCount} @ ${r.fps.toFixed(2)} fps = ${r.dur.toFixed(1)} s · ${r.chunks} chunks`)}
-      ${row("geometry", `meshopt ${r.temporal ? "I+P" : "intra"}`)}
+      ${row("profile", r.profile === "splat" ? "Gaussian splat (SPLT)" : "mesh")}
+      ${row("geometry", r.profile === "splat" ? "meshopt splat streams" : `meshopt ${r.temporal ? "I+P" : "intra"}`)}
+      ${r.hasAudio ? row("audio", `Opus · ${fmtMB(r.audio)}`) : ""}
     </div>
     ${splitBar(r.geom, r.tex, r.size)}
     <div class="kv" style="margin-top:8px">
@@ -138,7 +149,7 @@ export function renderAres(r) {
       ${row("texture", `<b>${fmtMB(r.tex)}</b> · ${pct(r.tex, r.size)} — VP9 video`)}
     </div>
     <div class="note">ARES puts most bytes in geometry (intra re-stores topology per frame) and keeps texture tiny via a video codec —
-      the inverse of a 4DViews .4ds. Drop one of each to compare.</div>
+      the inverse of a 4DViews .4ds.</div>
   </div>`;
 }
 

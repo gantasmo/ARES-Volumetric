@@ -13,6 +13,8 @@ export interface Superblock {
   quantBitsPos: number;
   quantBitsUv: number;
   normalEncoding: number;
+  /** Splat profile only (spec §11.3 `sh_degree`, 0–3); 0 for mesh files. Shares the byte that mesh files wrote as reserved. */
+  shDegree: number;
   gopLength: number;
   /** Static texture atlas (spec §7.7 poster/near-static); 0-length when absent. */
   texture: { offset: bigint; length: number; format: TextureBlobFormat; width: number; height: number };
@@ -40,6 +42,25 @@ export function parseTextureBlock(block: Uint8Array, frameStart: number): Textur
   for (let i = 0; i < count; i++) {
     out.push({ data: r.bytes(sizes[i]!), isKey: keys[i]!, frameIndex: frameStart + i });
   }
+  return out;
+}
+
+/** One Opus packet from a chunk's audio block, with absolute presentation time. */
+export interface AudioPacketRef { data: Uint8Array; ptsUs: number; durationUs: number; }
+
+/**
+ * Parse a chunk's audio block (spec §11.6 audio block, as written by @ares/encoder audio-mux.ts):
+ *   packet_count u16, reserved u16, per packet [pts_offset_us u32][duration_us u16][size u16],
+ *   then the packet datas concatenated. Offsets are relative to the chunk's pts_start.
+ */
+export function parseAudioBlock(block: Uint8Array, chunkStartUs: number): AudioPacketRef[] {
+  const r = new ByteReader(block);
+  const count = r.u16();
+  r.u16();
+  const meta: { off: number; dur: number; size: number }[] = [];
+  for (let i = 0; i < count; i++) meta.push({ off: r.u32(), dur: r.u16(), size: r.u16() });
+  const out: AudioPacketRef[] = [];
+  for (const m of meta) out.push({ data: r.bytes(m.size), ptsUs: chunkStartUs + m.off, durationUs: m.dur });
   return out;
 }
 
@@ -87,7 +108,7 @@ export function parseSuperblock(buf: Uint8Array, offset: number): Superblock {
   const quantBitsPos = r.u8();
   const quantBitsUv = r.u8();
   const normalEncoding = r.u8();
-  r.u8(); // reserved
+  const shDegree = r.u8(); // spec §11.3 sh_degree (splat profile); mesh files write 0
   const gopLength = r.u16();
   const texOffset = r.u64();
   const texLength = r.u32();
@@ -103,7 +124,7 @@ export function parseSuperblock(buf: Uint8Array, offset: number): Superblock {
   }
   return {
     aabb: { min, max },
-    quantBitsPos, quantBitsUv, normalEncoding, gopLength,
+    quantBitsPos, quantBitsUv, normalEncoding, shDegree, gopLength,
     texture: { offset: texOffset, length: texLength, format: texFormat, width: texW, height: texH },
     meta,
   };

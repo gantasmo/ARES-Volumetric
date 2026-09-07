@@ -5,9 +5,9 @@
  * render. Camera-only — never touches edits/ranges; works in and out of edit mode.
  */
 const AX = [
-  { k: 0, col: "#e0605f", label: "X" },   // conventional RGB axes, toned to the app's muted palette
-  { k: 1, col: "#7ec36a", label: "Y" },
-  { k: 2, col: "#5f92e0", label: "Z" },
+  { k: 0, col: "var(--axis-x)", label: "X" },   // conventional RGB axes; hues live in index.html's --axis-* tokens (muted, theme-tuned)
+  { k: 1, col: "var(--axis-y)", label: "Y" },
+  { k: 2, col: "var(--axis-z)", label: "Z" },
 ];
 const ELEV_CLAMP = 1.4;   // matches the player's drag clamp (±~80°); a literal ±90° would jump on next drag
 const NS = "http://www.w3.org/2000/svg";
@@ -17,7 +17,8 @@ export function initGizmo() {
   const el = document.getElementById("axisGizmo");
   if (!el) return;
   const bg = document.createElementNS(NS, "circle");   // faint backdrop so the axes read over any model
-  bg.setAttribute("cx", C); bg.setAttribute("cy", C); bg.setAttribute("r", "32"); bg.setAttribute("fill", "rgba(18,20,26,0.34)");
+  bg.setAttribute("cx", C); bg.setAttribute("cy", C); bg.setAttribute("r", "32");
+  bg.style.fill = "var(--bg-panel)"; bg.style.fillOpacity = ".55";   // style, not setAttribute: var() in presentation attrs is unreliable
   el.append(bg);
   const linesG = document.createElementNS(NS, "g");
   const ballsG = document.createElementNS(NS, "g");
@@ -27,7 +28,7 @@ export function initGizmo() {
     const g = document.createElementNS(NS, "g"); g.style.cursor = "pointer";
     const c = document.createElementNS(NS, "circle"); c.setAttribute("r", String(BALL));
     const t = document.createElementNS(NS, "text"); t.setAttribute("text-anchor", "middle"); t.setAttribute("dominant-baseline", "central");
-    t.setAttribute("font-size", "8"); t.setAttribute("font-weight", "700"); t.setAttribute("fill", "#14161b"); t.style.pointerEvents = "none";
+    t.setAttribute("font-size", "8"); t.setAttribute("font-weight", "700"); t.style.fill = "var(--bg)"; t.style.pointerEvents = "none";   // --bg contrasts with the mid-lightness axis hues in both themes
     t.textContent = sign > 0 ? a.label : "";
     g.append(c, t);
     g.onclick = () => snap(a.k, sign);
@@ -37,7 +38,7 @@ export function initGizmo() {
   };
   const objs = AX.map((a) => {
     const line = document.createElementNS(NS, "line");
-    line.setAttribute("stroke", a.col); line.setAttribute("stroke-width", "2"); line.setAttribute("stroke-linecap", "round");
+    line.style.stroke = a.col; line.setAttribute("stroke-width", "2"); line.setAttribute("stroke-linecap", "round");
     linesG.append(line);
     return { line, pos: mkBall(a, 1), neg: mkBall(a, -1), col: a.col };
   });
@@ -55,10 +56,10 @@ export function initGizmo() {
     ball.c.setAttribute("cx", px); ball.c.setAttribute("cy", py);
     ball.t.setAttribute("x", px); ball.t.setAttribute("y", py);
     if (ball.sign > 0) {   // + end: filled + labeled; dim when facing away
-      ball.c.setAttribute("fill", ball.col); ball.c.setAttribute("stroke", "none");
+      ball.c.style.fill = ball.col; ball.c.style.stroke = "none";
       ball.c.setAttribute("opacity", near ? "1" : "0.5"); ball.t.setAttribute("opacity", near ? "1" : "0.5");
     } else {               // − end: hollow ring
-      ball.c.setAttribute("fill", near ? ball.col : "#181a20"); ball.c.setAttribute("stroke", ball.col); ball.c.setAttribute("stroke-width", "1.5");
+      ball.c.style.fill = near ? ball.col : "var(--bg-panel)"; ball.c.style.stroke = ball.col; ball.c.setAttribute("stroke-width", "1.5");
       ball.c.setAttribute("opacity", near ? "0.9" : "0.85");
     }
   }

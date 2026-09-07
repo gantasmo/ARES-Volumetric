@@ -1068,9 +1068,20 @@ Design notes:
   splat *birth/death* must be coded.
 - **Video-packed attributes.** Following PackUV [43], splat attributes can be laid into 2D tiles and
   encoded as a video track ([§8.5](#85-video-assisted-geometry-packing-attributes-into-pixels)),
-  routing splat geometry through the hardware decoder just like texture.
-- **Rendering.** WebGPU instanced billboards with additive/OIT blending and a per-frame compute-shader
-  depth sort ([§12](#12-javascript--webgpu-implementation)).
+  routing splat geometry through the hardware decoder just like texture. The §8.5.1 warning applies
+  in full: only colour is video-shaped. Positions fail exactly as for meshes, and rotations fail
+  worse — a quaternion is not spatially coherent, and a jittered splat has no index buffer holding
+  it in place. The claim that "splats tolerate lossy packing better" holds for colour, not geometry.
+- **Rendering.** Instanced quads per splat, back-to-front through an index indirection from a CPU
+  counting sort (re-sorted only when the view direction moves), EWA covariance projection in the
+  vertex stage, premultiplied "over" compositing. Both backends (WebGPU storage buffers; WebGL2
+  data textures) — [§12](#12-javascript--webgpu-implementation).
+
+**Implementation (2026-09-07).** The intra splat profile ships: block layout in
+[§11.6.3](#1163-geometry-block--splat-profile); importers for Niantic SPZ (v1–v4), 3DGS PLY,
+`.splat`, glTF/GLB with `KHR_gaussian_splatting`, and PlayCanvas SOG; exporters for SPZ, 3DGS PLY,
+glTF/GLB and `.splat` (`ares export`). Degree 0 is the fast path (the common case for generated
+environments); degrees 1–3 are carried as 8-bit bands and evaluated in the vertex shader.
 
 ### 6.9 Hybrid geometry (per-stream representations)
 
@@ -1724,10 +1735,67 @@ Chunk
 > P/B frames are **sparse**: only vertices whose residual exceeds the dead-zone are listed. Static
 > regions cost near-zero bytes. Topology (indices) is **not** repeated — it persists from the I-frame.
 
+#### 11.6.2a Audio block (implemented 2026-09-07)
+
+Track type 3, FourCC `OPUS`, `codec_config` = the 19-byte OpusHead (channels, pre-skip, input
+rate). One block per chunk holding the Opus packets whose presentation time falls in the chunk's
+span (the last chunk also takes the audio tail):
+
+| Field | Type | Notes |
+|---|---|---|
+| `packet_count` | u16 | |
+| `reserved` | u16 | |
+| per packet: `pts_offset_us` | u32 | from the chunk's `pts_start_us` |
+| `duration_us` | u16 | from the packet's TOC (20 ms at the encoder's default) |
+| `size` | u16 | |
+| `data[]` | u8 | the packets, concatenated in the same order |
+
+Media time 0 is the first audible sample: the encoder subtracts the pre-skip when timing
+packets, and the decoder receives OpusHead as its `description` so it trims the same priming.
+
 #### 11.6.3 Geometry block — splat profile
 
-I-frame: `splat_count(u32)` then packed `pos(3×f16)|scale(3×f16)|rot(4×i8 quat)|opacity(u8)|SH(k×
-f16)`. P/B-frames: sparse attribute residuals + a birth/death list (`added[]`, `removed[]`).
+Implemented (2026-09-07; `@ares/core` splat.ts / geometry.ts, `@ares/encoder` splat-frame.ts). The
+geometry track's FourCC is `SPLT`, the header's `geometry_profile` is 1, and the superblock's
+`sh_degree` byte (the mesh profile's reserved byte after `normal_encoding`) carries the SH degree.
+
+I-frame:
+
+| Field | Type | Notes |
+|---|---|---|
+| `splat_count` | u32 | |
+| `sh_degree` | u8 | 0–3; the number of higher-order bands present |
+| `flags` | u8 | bit0 antialiased (mip-splatting kernel) |
+| `reserved` | u16 | |
+| `positions` | meshopt(u16×3 + pad, stride 8) | quantized over the chunk AABB with `quant_bits_pos` — the mesh layout |
+| `attrs` | meshopt(3×u32, stride 12) | word 0: scale bytes ×3 (`exp(s/16 − 10)`) + opacity u8; word 1: rotation, SPZ v3 "smallest three" (2-bit largest index, 3 × sign+9-bit magnitude); word 2: base colour rgb u8 (display-referred, `0.5 + C0·sh0` clamped) + reserved |
+| `sh` | meshopt(u8, stride 12 / 24 / 48) | degree ≥ 1 only: `(v − 128)/128`, coefficient-major rgb, padded to a multiple of 4 |
+
+Positions and rotations are never video-packed (§8.5.1); at `sh_degree` 0 the whole record is 18
+bytes per splat before meshopt. Splats are Morton-ordered within a frame so the vertex codec's
+delta prediction sees spatial neighbours.
+
+P-frame (dynamic splat profile, implemented 2026-09-07). Correspondence is by index when the
+Gaussian set is stable frame to frame, else nearest neighbour within a radius (encoder
+`--splat-temporal auto|index|nn|off`, `--splat-match`); a frame keeping fewer survivors than
+`--splat-min-survive` is coded intra. Survivors keep the previous frame's order (minus the dead);
+births append.
+
+| Field | Type | Notes |
+|---|---|---|
+| `splat_count` | u32 | this frame |
+| `sh_degree`, `flags`, `reserved` | u8, u8, u16 | as the I-frame; degree must match the keyframe |
+| `death_count` | u32 | over the PREVIOUS frame |
+| `deaths[]` | varint | ascending previous indices, delta-coded (LEB128) |
+| `survivor_count` | u32 | = previous count − deaths |
+| `deltas` | meshopt(i16×3 + pad, stride 8) | quantized position deltas, added mod 2¹⁶ |
+| `attrs` | meshopt(stride 12) | survivors' attrs as byte deltas mod 256 vs their previous copy |
+| `sh` | meshopt(stride 12/24/48) | survivors' SH as byte deltas mod 256 (degree ≥ 1) |
+| `birth_count` | u32 | = count − survivors |
+| `birth positions`, `birth attrs`, `birth sh` | meshopt | absolute, the I-frame encodings |
+
+Byte deltas turn an unchanged attribute into a run of zeros, which the vertex codec folds to
+almost nothing; on the synthetic rotating clip a 60 fps GOP is > 20 % smaller than intra.
 
 ### 11.7 Versioning and extensions
 

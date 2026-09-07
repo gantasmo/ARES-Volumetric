@@ -38,9 +38,19 @@ export const AttrMask = {
 export const FourCC = {
   Meshopt: "MSHO",
   Draco: "DRAC",
+  /** Splat-profile geometry track (spec §6.8, §11.6.3): meshopt-coded quantized splat streams. */
+  Splat: "SPLT",
   AV1: "AV01",
   VP9: "VP09",
   PNGAtlas: "PNG0",
+  /** Audio track: Opus packets, one block per chunk (spec §11.6). */
+  Opus: "OPUS",
+} as const;
+
+/** Splat I-frame block `flags` bits (spec §11.6.3 as implemented — see splat.ts). */
+export const SplatFlags = {
+  /** Splats were trained with the anti-aliased (mip-splatting style) kernel; renderers may dilate less. */
+  Antialiased: 1 << 0,
 } as const;
 
 /** Byte offsets of the fixed 64-byte file header (Appendix A.1). */

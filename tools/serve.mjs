@@ -10,11 +10,12 @@
  * Serves: the ares/ repo root (parent of tools/), / redirects to the probe.
  */
 import { createServer, request as httpRequest } from "node:http";
-import { stat, readFile, writeFile, appendFile, readdir, mkdir, link, copyFile, unlink, rename, mkdtemp, rm, statfs } from "node:fs/promises";
-import { totalmem, freemem } from "node:os";
+import { stat, readFile, writeFile, appendFile, readdir, mkdir, link, copyFile, unlink, rename, mkdtemp, rm, statfs, open } from "node:fs/promises";
+import { totalmem, freemem, homedir } from "node:os";
 import { statSync, existsSync } from "node:fs";
 import { spawn } from "node:child_process";
-import { join, normalize, extname, dirname, basename } from "node:path";
+import { join, normalize, extname, dirname, basename, sep } from "node:path";
+import zlib from "node:zlib";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 
@@ -120,8 +121,10 @@ async function runpodPodSsh(key, id) {
 // Spawn `ssh` (unsandboxed — serve.mjs is a normal process) to run a command on the pod, emitting
 // output line-by-line. Returns the child so callers can kill it on client disconnect.
 function sshRun(ip, port, command, onLine, onDone) {
-  const args = ["-i", RUNPOD_SSH_KEY, "-p", String(port), "-o", "StrictHostKeyChecking=no",
-    "-o", "UserKnownHostsFile=/dev/null", "-o", "ConnectTimeout=12", "-o", "ServerAliveInterval=15",
+  // accept-new pins each pod's host key on first contact and refuses a changed one afterwards
+  // (pods are ephemeral, so a fresh IP is a fresh key — a CHANGED key on a known IP is the alarm).
+  const args = ["-i", RUNPOD_SSH_KEY, "-p", String(port), "-o", "StrictHostKeyChecking=accept-new",
+    "-o", `UserKnownHostsFile=${join(RUNPOD_SSH_DIR, "known_hosts")}`, "-o", "ConnectTimeout=12", "-o", "ServerAliveInterval=15",
     "root@" + ip, command];
   const p = spawn("ssh", args);
   let buf = "";
@@ -219,33 +222,84 @@ function rememberDir(key, dir) {
 
 // ---- folder analysis (server-side parity with the browser drag-drop preview) ---------------
 const OBJ_RE = /\.obj$/i, PLY_RE = /\.ply$/i, ATLAS_RE = /^atlas-.*\.png$/i, PNG_RE = /\.png$/i;
+// Splat-profile frame files (spec §6.8): SPZ, .splat, SOG bundles, glTF/GLB with KHR_gaussian_splatting.
+const SPLAT_RE = /\.(spz|splat|sog|glb|gltf)$/i;
 const pngDimsBuf = (b) => (b && b.length > 24 && b.readUInt32BE(0) === 0x89504e47) ? [b.readUInt32BE(16), b.readUInt32BE(20)] : null;
+const isFrameFile = (f) => OBJ_RE.test(f) || PLY_RE.test(f) || SPLAT_RE.test(f);
 // Point-at-parent convenience: if `dir` has no meshes but a single subfolder does, use that.
 async function resolveFramesDir(dir) {
   try {
     const names = await readdir(dir);
-    if (names.some((f) => OBJ_RE.test(f) || PLY_RE.test(f))) return dir;
+    if (names.some(isFrameFile) || names.includes("meta.json")) return dir;
     const hits = [];
     for (const n of names) {
       const p = join(dir, n);
-      try { if (statSync(p).isDirectory()) { const inner = await readdir(p); if (inner.some((f) => OBJ_RE.test(f) || PLY_RE.test(f))) hits.push(p); } } catch { /* ignore */ }
+      try { if (statSync(p).isDirectory()) { const inner = await readdir(p); if (inner.some(isFrameFile)) hits.push(p); } } catch { /* ignore */ }
     }
     return hits.length === 1 ? hits[0] : dir;
   } catch { return dir; }
+}
+/** 3DGS splat PLY? Only the header is read (f_dc_0 + scale_0 + rot_0 + opacity on the vertex element). */
+async function isSplatPlyFile(path) {
+  try {
+    const fh = await open(path, "r");
+    try {
+      const buf = Buffer.alloc(16384);
+      const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+      const head = buf.subarray(0, bytesRead).toString("latin1");
+      const hdr = head.slice(0, head.indexOf("end_header") >= 0 ? head.indexOf("end_header") : head.length);
+      return ["f_dc_0", "scale_0", "rot_0", "opacity"].every((k) => hdr.includes("property float " + k) || hdr.includes(" " + k + "\n") || hdr.includes(" " + k + "\r"));
+    } finally { await fh.close(); }
+  } catch { return false; }
+}
+/** Splat count of one frame file, cheaply (headers only). 0 when unknown. */
+async function splatCountOf(path, kind) {
+  try {
+    if (kind === "SPZ") {
+      const fh = await open(path, "r");
+      let head;
+      try { const b = Buffer.alloc(65536); const { bytesRead } = await fh.read(b, 0, b.length, 0); head = b.subarray(0, bytesRead); } finally { await fh.close(); }
+      if (head[0] === 0x1f && head[1] === 0x8b) head = zlib.gunzipSync(head, { finishFlush: zlib.constants.Z_SYNC_FLUSH });
+      return head.readUInt32LE(0) === 0x5053474e ? head.readUInt32LE(8) : 0;
+    }
+    if (kind === "3DGS PLY") {
+      const fh = await open(path, "r");
+      try { const b = Buffer.alloc(16384); const { bytesRead } = await fh.read(b, 0, b.length, 0); const m = /element vertex (\d+)/.exec(b.subarray(0, bytesRead).toString("latin1")); return m ? Number(m[1]) : 0; } finally { await fh.close(); }
+    }
+    if (kind === ".splat") return Math.floor((await stat(path)).size / 32);
+    if (kind === "SOG") {
+      const metaPath = (await stat(path)).isDirectory() ? join(path, "meta.json") : null;
+      if (metaPath) return Number(JSON.parse(await readFile(metaPath, "utf8")).count) || 0;
+    }
+  } catch { /* unknown */ }
+  return 0;
 }
 async function analyseDir(dir0) {
   const dir = await resolveFramesDir(dir0);
   const names = (await readdir(dir)).sort();
   const objs = names.filter((f) => OBJ_RE.test(f)), plys = names.filter((f) => PLY_RE.test(f));
+  const splatFiles = names.filter((f) => SPLAT_RE.test(f));
   const atlases = names.filter((f) => ATLAS_RE.test(f)), pngs = names.filter((f) => PNG_RE.test(f));
-  const meshes = objs.length ? objs : plys;
-  const kind = objs.length ? "OBJ" : plys.length ? "PLY" : "—";
+  let meshes = objs.length ? objs : plys;
+  let kind = objs.length ? "OBJ" : plys.length ? "PLY" : "—";
+  // Splat sequences (spec §6.8): a 3DGS PLY folder, or one SPZ/.splat/SOG/glTF file per frame, or
+  // a single SOG directory (meta.json + webp images).
+  let splat = false, splatCount = 0;
+  if (!objs.length) {
+    if (plys.length && await isSplatPlyFile(join(dir, plys[0]))) { splat = true; kind = "3DGS PLY"; }
+    else if (splatFiles.length) {
+      const ext = extname(splatFiles[0]).toLowerCase();
+      kind = ext === ".spz" ? "SPZ" : ext === ".splat" ? ".splat" : ext === ".sog" ? "SOG" : "glTF splat";
+      meshes = splatFiles; splat = true;
+    } else if (names.includes("meta.json")) { kind = "SOG"; meshes = ["."]; splat = true; }
+    if (splat) splatCount = await splatCountOf(meshes[0] === "." ? dir : join(dir, meshes[0]), kind);
+  }
   let rawBytes = 0;
   for (const f of names) { try { rawBytes += (await stat(join(dir, f))).size; } catch { /* ignore */ } }
   let verts = 0, atlasDims = null;
   if (objs.length) { try { verts = ((await readFile(join(dir, objs[0]), "utf8")).match(/^v /gm) || []).length; } catch { /* ignore */ } }
   if (atlases.length) { try { atlasDims = pngDimsBuf(await readFile(join(dir, atlases[0]))); } catch { /* ignore */ } }
-  return { dir, meshes: meshes.length, kind, atlases: atlases.length, pngs: pngs.length, atlasDims, verts, rawBytes };
+  return { dir, meshes: meshes.length, kind, atlases: atlases.length, pngs: pngs.length, atlasDims, verts, rawBytes, splat, splatCount };
 }
 
 // ---- standalone Real-ESRGAN (ncnn-vulkan): the no-server, low-VRAM upscale tier -----------
@@ -265,10 +319,10 @@ function runProc(exe, args, opts, onChild) {
 }
 
 // ---- Forge (generative "hero" tier only) — auto-launched headless, no terminal ------------
-const FORGE_ROOT = process.env.FORGE_ROOT || "D:\\Dev\\webui_forge_cu121_torch231";
+const FORGE_ROOT = process.env.FORGE_ROOT || join(homedir(), "webui_forge");            // set FORGE_ROOT to your install
 const FORGE_PY = join(FORGE_ROOT, "system", "python", "python.exe");
 const FORGE_WEBUI = join(FORGE_ROOT, "webui");
-const FORGE_CKPT_DIR = process.env.FORGE_CKPT_DIR || "D:\\Dev\\webui_forge_cu121_torch21\\webui\\models\\Stable-diffusion";
+const FORGE_CKPT_DIR = process.env.FORGE_CKPT_DIR || join(FORGE_ROOT, "webui", "models", "Stable-diffusion");
 const FORGE_URL = process.env.FORGE_URL || "http://127.0.0.1:7861";
 const FORGE_PATH_PREPEND = [join(FORGE_ROOT, "system", "git", "bin"), join(FORGE_ROOT, "system", "python"), join(FORGE_ROOT, "system", "python", "Scripts")].join(";");
 let forgeChild = null;
@@ -282,7 +336,7 @@ function forgeHealthy(timeoutMs = 1500) {
   });
 }
 // Ensure Forge's API is up: health-check, else spawn it detached+hidden and poll. `send` streams
-// SSE status. Mirrors the repo's hidden-PowerShell launchers (Launch SAM Service.vbs etc.).
+// SSE status. Mirrors the repo's hidden-PowerShell launcher path (tools/launch.ps1).
 async function forgeEnsure(send) {
   if (await forgeHealthy()) return true;
   if (!existsSync(FORGE_PY)) { send && send("log", `Forge not found at ${FORGE_ROOT} — set FORGE_ROOT to your webui_forge install`); return false; }
@@ -392,9 +446,28 @@ function run4dsInfo(inputPath) {
   });
 }
 
+// Routes that do work, spend money, open dialogs or write files. Browsers stamp Sec-Fetch-Site on
+// every request, so a page on any other origin (or a same-site page on another port) is refused
+// here even though the server only listens on loopback: EventSource/GET side effects were the
+// audit's CSRF finding. Non-browser callers (curl, scripts) send no such header and pass.
+const GUARDED = /^\/(encode|convert-4ds|enhance|sam\/start|forge\/start|setup\/|runpod\/(launch|stop|action|logs)|pick|log|edits\/|showcase|deps\/)/;
+const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
+function sameOrigin(req) {
+  const sfs = req.headers["sec-fetch-site"];
+  if (sfs && sfs !== "same-origin" && sfs !== "none") return false;
+  const origin = req.headers.origin || (req.headers.referer ? (() => { try { return new URL(req.headers.referer).origin; } catch { return "bad"; } })() : null);
+  if (origin) { try { return LOOPBACK.has(new URL(origin).hostname); } catch { return false; } }
+  return true;
+}
+
 async function handle(req, res) {
   const url = new URL(req.url, "http://localhost");
   let path = decodeURIComponent(url.pathname);
+
+  // Host pinning (DNS rebinding): the only names this loopback server answers to are its own.
+  const hostName = String(req.headers.host || "").replace(/:\d+$/, "").toLowerCase();
+  if (hostName && !LOOPBACK.has(hostName)) { res.writeHead(421, { "Content-Type": "text/plain" }); res.end("wrong host"); return; }
+  if (GUARDED.test(path) && !sameOrigin(req)) { res.writeHead(403, { ...HEADERS, "Content-Type": "text/plain" }); res.end("cross-origin request refused"); return; }
 
   if (path === "/__ares") {
     res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
@@ -426,6 +499,9 @@ async function handle(req, res) {
 
   // Launch a pod (the ONLY spend — the UI confirms before calling this). Community RTX 3090 by default.
   if (path === "/runpod/launch" && req.method === "POST") {
+    if (!/^application\/json/i.test(String(req.headers["content-type"] || ""))) {
+      res.writeHead(415, { ...HEADERS, "Content-Type": "application/json" }); res.end(JSON.stringify({ ok: false, error: "expected application/json" })); return;
+    }
     res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
     const key = await readRunpodKey();
     if (!key) { res.end(JSON.stringify({ ok: false, error: "no RunPod key" })); return; }
@@ -807,35 +883,6 @@ async function handle(req, res) {
     return;
   }
 
-  // Live coherent-bake progress: tails apps/demo/.coherent-bake.log and forwards the pipeline's
-  // HONEST [PROGRESS]/[STAGE]/[DONE] lines (measured rate + ETA, no fabricated %). SSE; polls the
-  // file every ~1.2s (cross-platform — no reliance on `tail -F`). Emits {state:"idle"} if no bake.
-  if (path === "/coherent/progress") {
-    res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
-    const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
-    const logPath = join(ROOT, "apps", "demo", ".coherent-bake.log");
-    let lastSig = "", closed = false, timer = null;
-    req.on("close", () => { closed = true; if (timer) clearInterval(timer); });
-    const poll = async () => {
-      if (closed) return;
-      let txt = "";
-      try { txt = await readFile(logPath, "utf8"); } catch { send("progress", { state: "idle" }); return; }
-      const lines = txt.split(/\r?\n/);
-      let prog = null, stage = null, done = null;
-      for (const ln of lines) {
-        if (ln.startsWith("[PROGRESS] ")) { try { prog = JSON.parse(ln.slice(11)); } catch { /* */ } }
-        else if (ln.startsWith("[STAGE] ")) { try { stage = JSON.parse(ln.slice(8)); } catch { /* */ } }
-        else if (ln.startsWith("[DONE] ")) { try { done = JSON.parse(ln.slice(7)); } catch { /* */ } }
-      }
-      const sig = JSON.stringify({ prog, stage, done });
-      if (sig !== lastSig) { lastSig = sig; send("progress", { state: done ? "done" : "running", stage, prog, done }); }
-      if (done) { if (timer) clearInterval(timer); if (!res.writableEnded) res.end(); }
-    };
-    timer = setInterval(poll, 1200);
-    poll();
-    return;
-  }
-
   // System diagnostics feed for the dashboard rail: GPU (util/temp/VRAM), RAM, disk, the coherent
   // bake stage+ETA, and RunPod on/off — one snapshot every 2s over SSE. RunPod is refreshed on a
   // 15s cadence (cached) so the panel never rate-limits the API; all local reads are cheap.
@@ -894,7 +941,7 @@ async function handle(req, res) {
     const samPy = join(ROOT, "tools", "sam-service", "env", "Scripts", "python.exe");
     const sam3W = join(REPO, "sam3", "model.safetensors");
     const sam31W = join(REPO, "sam3.1", "sam3.1_multiplex.pt");
-    const vitH = process.env.SAM_CKPT || "D:\\Dev\\pinokio\\api\\wan.git\\app\\ckpts\\mask\\sam_vit_h_4b8939_fp16.safetensors";
+    const vitH = process.env.SAM_CKPT || join(ROOT, "tools", "sam-service", "models", "sam_vit_h_4b8939_fp16.safetensors");
     const keeper = join(ROOT, "apps", "demo", "daniel-s0.ares");
     const synth = join(ROOT, "apps", "demo", "demo.ares");
     const capture = join(REPO, "Daniel_Microsoft_Volcap", "Daniel_Volcap");
@@ -1047,7 +1094,12 @@ async function handle(req, res) {
     const reqName = (q.get("name") || "converted").replace(/[^a-z0-9._-]/gi, "_");
     const name = await versionedOutName(join(ROOT, "apps", "demo"), reqName); // auto -vN, never overwrite
     const outRel = `apps/demo/${name}.ares`;
-    const coherent = q.get("coherent") === "1";
+    let coherent = q.get("coherent") === "1";
+    // Splat sequences skip the mesh-only coherent pre-pass and the texture flags (the encoder
+    // ignores them for splat input anyway); their own flags ride through below.
+    let isSplatDir = false;
+    try { isSplatDir = !!(await analyseDir(dir)).splat; } catch { /* treat as mesh */ }
+    if (coherent && isSplatDir) coherent = false;
     res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
     const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
     const relay = (d) => String(d).split(/\r?\n/).forEach((l) => l.trim() && send("log", l));
@@ -1104,6 +1156,17 @@ async function handle(req, res) {
         // stops the bake instead of silently encoding the untransformed clip.
         pass("upAxis", "--up-axis"); pass("center", "--center"); pass("scale", "--scale");
         pass("rotate", "--rotate"); pass("translate", "--translate");
+        // Splat profile (spec §6.8): SH cap, outlier-alpha filter, position quantization bits.
+        pass("shDegree", "--sh-degree"); pass("splatMinAlpha", "--splat-min-alpha"); pass("quantBits", "--quant-bits");
+        // Audio track (spec §11.5): any file ffmpeg reads, transcoded to Opus and laid into the chunks.
+        const audioPath = q.get("audio");
+        if (audioPath) {
+          let okA = false; try { okA = statSync(audioPath).isFile(); } catch { okA = false; }
+          if (!okA) { send("error", { message: `audio file not found: ${audioPath}` }); res.end(); return; }
+          args.push("--audio", audioPath);
+          pass("audioOffset", "--audio-offset"); pass("audioBitrate", "--audio-bitrate");
+        }
+        if (isSplatDir) send("log", "[encode] splat sequence detected — encoding as the Gaussian splat profile (coherent pre-pass and texture flags do not apply)");
         // editsName → the sidecar saved via POST /edits/<name> (path stays server-side, sanitized).
         const editsName = q.get("editsName");
         if (editsName) args.push("--edits", join(ROOT, "apps", "demo", editsName.replace(/[^a-z0-9._-]/gi, "_") + ".edits.json"));
@@ -1117,6 +1180,8 @@ async function handle(req, res) {
             codec: q.get("textureCodec") || "vp9", texSize: q.get("texSize") || "", crf: q.get("crf") || "",
             smooth: q.get("smooth") || "0", coherent: coherent ? "1" : "", fps: q.get("fps") || "",
             decimate: q.get("decimate") || "", maxFrames: q.get("maxFrames") || "", noTexture: q.get("noTexture") || "",
+            profile: isSplatDir ? "splat" : "mesh", shDegree: q.get("shDegree") || "", splatMinAlpha: q.get("splatMinAlpha") || "", quantBits: q.get("quantBits") || "",
+            audio: q.get("audio") || "", audioOffset: q.get("audioOffset") || "",
           } });
         }
         send(code === 0 ? "done" : "error", { code, out: "/" + outRel });
@@ -1209,14 +1274,6 @@ async function handle(req, res) {
 
     const name = await versionedOutName(join(ROOT, "apps", "demo"), rawName); // auto -vN, never overwrite
     const outRel = `apps/demo/${name}.ares`;
-    const outAbs = join(ROOT, outRel);
-    // Refuse to clobber an existing bake unless the caller explicitly opted in — apps/demo holds
-    // the keeper .ares files, and a name collision here must never be a silent overwrite.
-    if (existsSync(outAbs) && q.get("overwrite") !== "1") {
-      res.writeHead(409, { ...HEADERS, "Content-Type": "text/plain" });
-      res.end(`${name}.ares already exists — pick another name or pass overwrite=1`);
-      return;
-    }
 
     res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
     const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
@@ -1435,7 +1492,7 @@ async function handle(req, res) {
 
   // Resolve inside ROOT only (reject traversal).
   const fsPath = normalize(join(ROOT, path));
-  if (!fsPath.startsWith(ROOT)) {
+  if (fsPath !== ROOT && !fsPath.startsWith(ROOT.endsWith(sep) ? ROOT : ROOT + sep)) {
     res.writeHead(403, HEADERS);
     res.end("forbidden");
     return;

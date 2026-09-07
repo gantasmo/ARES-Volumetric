@@ -1,10 +1,10 @@
 /** ARES demuxer — parses the container header, superblock, GOP index, track dir, and chunks. Spec §11. */
-import { H, HEADER_SIZE, MAGIC_BYTES, crc32, BlockType } from "./format.js";
+import { H, HEADER_SIZE, MAGIC_BYTES, crc32, BlockType, TrackType, HeaderFlags } from "./format.js";
 import type { AresHeader } from "./types.js";
 import { ByteReader, AresParseError } from "./bytes.js";
 import {
-  Superblock, GopEntry, Track, ChunkHeader, TextureBlobFormat, TextureFrameRef,
-  parseSuperblock, parseGopIndex, parseTrackDir, parseChunkHeader, parseTextureBlock, gopForPts,
+  Superblock, GopEntry, Track, ChunkHeader, TextureBlobFormat, TextureFrameRef, AudioPacketRef,
+  parseSuperblock, parseGopIndex, parseTrackDir, parseChunkHeader, parseTextureBlock, parseAudioBlock, gopForPts,
 } from "./container.js";
 
 export { AresParseError };
@@ -107,6 +107,27 @@ export class Demuxer {
       // frameStart derived from the GOP entry sharing this chunk offset
       const gop = file.gopIndex.find((g) => Number(g.byteOffset) === chunk.fileOffset);
       return parseTextureBlock(file.buf.subarray(start, start + b.length), gop?.frameStart ?? 0);
+    }
+    return [];
+  }
+
+  /** The audio track (spec §11.5 `OPUS`), or null when the file carries none. codecConfig = OpusHead. */
+  static audioTrack(file: AresFile): { trackId: number; fourcc: string; codecConfig: Uint8Array; sampleRate: number; channels: number } | null {
+    if (!(file.header.headerFlags & HeaderFlags.HasAudio)) return null;
+    const t = file.tracks.find((x) => x.trackType === TrackType.Audio);
+    if (!t) return null;
+    const cfg = t.codecConfig;
+    const channels = cfg.length >= 19 ? cfg[9]! : 2;
+    return { trackId: t.trackId, fourcc: t.codecFourcc, codecConfig: cfg, sampleRate: 48000, channels: channels || 2 };
+  }
+
+  /** Timed Opus packets carried by a chunk's audio block (spec §11.6). */
+  static audioPackets(file: AresFile, chunk: ChunkHeader): AudioPacketRef[] {
+    for (const b of chunk.blocks) {
+      if (b.type !== BlockType.Audio) continue;
+      const start = chunk.fileOffset + b.offset;
+      if (start < 0 || start + b.length > file.buf.byteLength) throw new AresParseError("audio block out of bounds");
+      return parseAudioBlock(file.buf.subarray(start, start + b.length), Number(chunk.ptsStartUs));
     }
     return [];
   }

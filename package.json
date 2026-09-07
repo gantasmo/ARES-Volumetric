@@ -2,7 +2,7 @@
   "name": "ares-monorepo",
   "license": "MIT",
   "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "description": "ARES Volumetric — single-file .ares container + browser runtime for volumetric video (reference implementation)",
   "workspaces": [
     "packages/*",
@@ -12,12 +12,25 @@
   "scripts": {
     "build": "tsc -b",
     "clean": "tsc -b --clean",
-    "probe": "node tools/serve.mjs",
-    "start": "node tools/serve.mjs",
+    "start": "node tools/launch.mjs",
+    "serve": "node tools/serve.mjs",
+    "probe": "node tools/launch.mjs probe",
     "bench": "node bench/dist/run.js",
-    "postinstall": "node tools/fix-ide-symlinks.mjs"
+    "test": "tsc -b && node --test \"packages/*/test/*.test.mjs\"",
+    "postinstall": "node tools/fix-ide-symlinks.mjs",
+    "bundle": "node tools/bundle.mjs",
+    "test:quick": "node --test \"packages/*/test/*.test.mjs\"",
+    "release:check": "npm run build && npm test && npm run bundle && npm pack --workspaces --dry-run"
   },
   "devDependencies": {
+    "esbuild": "^0.25.9",
     "typescript": "^7.0.2"
+  },
+  "engines": {
+    "node": ">=22.15"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gantasmo/ares.git"
   }
 }

@@ -8,18 +8,23 @@
  * atlas. Geometry decodes on the main thread, or on a worker with useWorker (§10.7).
  */
 import { Demuxer, type AresFile } from "./demuxer.js";
-import { decodeGeometryBlock, decodePFrameBlock, meshoptReady } from "./geometry.js";
-import { BlockType } from "./format.js";
+import { decodeGeometryBlock, decodePFrameBlock, decodeSplatBlock, decodeSplatPBlock, meshoptReady } from "./geometry.js";
+import { BlockType, GeometryProfile } from "./format.js";
 import { dequantScale, type Aabb } from "./quant.js";
 import { WebGPURenderer } from "./renderer.js";
-import { WebGL2Renderer, type AresRenderer } from "./renderer-gl2.js";
+import { WebGL2Renderer, type AresRenderer, type SplatParams } from "./renderer-gl2.js";
 import { WorkerGeometryDecoder, type WorkerDecodeResult } from "./worker-decode.js";
 import { keepPredicateAt, filterIndicesByPredicate, type EditList } from "./edits.js";
 import { rasterizeIds, type IdBuffer } from "./raster.js";
-import { orbitViewProj, orbitViewHeight, type OrbitState } from "./camera.js";
+import { orbitViewProj, orbitMatrices, orbitViewHeight, multiply, type OrbitState } from "./camera.js";
+import { SplatSorter } from "./splat-sort.js";
+import type { DecodedSplat } from "./splat.js";
+import { FX_DEFAULTS, packFx, mergeFx, evalFxTrack, type FxParams, type FxTrack } from "./fx.js";
+import { invert as invertMat } from "./camera.js";
 import { gridLod, type GridLod } from "./overlay.js";
 import { resolveOffset, transformAabb, transformMatrix, isIdentityTransform, type ModelTransform } from "./transform.js";
 import { TextureVideo, type CodedTextureFrame } from "./texture-video.js";
+import { AudioTrack, type AudioPacketRef } from "./audio.js";
 
 export interface AresPlayerOptions {
   canvas: HTMLCanvasElement;
@@ -28,6 +33,13 @@ export interface AresPlayerOptions {
   autoOrbit?: boolean;
   /** Decode geometry blocks on a worker thread (spec §10.7). Default false (main-thread decode). */
   useWorker?: boolean;
+  /** Worker script URL for useWorker — needed with the single-file bundles (dist/bundle/ares-decode-worker.js). */
+  workerUrl?: string | URL;
+  /** Play the file's audio track when it has one (default true). Browsers need a user gesture first. */
+  audio?: boolean;
+  /** Initial volume 0..1 (default 1) and mute. */
+  volume?: number;
+  muted?: boolean;
   /** Force the WebGL2 fallback renderer even when WebGPU is available (testing, spec §10.4). */
   forceGL2?: boolean;
   onFrame?: (ptsSec: number, frameIndex: number) => void;
@@ -48,6 +60,7 @@ export interface PlayerStats {
   avgFrameKB: number;
   fileKB: number;
   textureLabel: string;    // "VP9 video 1024²" | "still atlas" | "none"
+  audioLabel: string;      // "Opus 48 kHz stereo" | "none"
   geometryMode: string;    // "meshopt intra" | "meshopt I+P (temporal)" | "meshopt mixed (Nx intra + Mx P of F frames)"
 }
 
@@ -82,6 +95,19 @@ export class AresPlayer {
   /** Live model transform + its resolved offset (see setModelTransform). null = identity. */
   private modelXf: ModelTransform | null = null;
   private modelOffset: [number, number, number] = [0, 0, 0];
+  private modelMat: Float32Array | null = null;
+
+  // Playback effects (fx.ts): live params, a keyframed track from the sidecar, and a host override
+  // layer (audio-reactive modulation) — merged in that order at render time.
+  private fx: FxParams = { ...FX_DEFAULTS };
+  private fxTrack: FxTrack | null = null;
+  private fxOverride: Partial<FxParams> | null = null;
+  private fxData = new Float32Array(32);
+
+  // Gaussian splat profile (spec §6.8): the file's geometry_profile selects this path at create().
+  private readonly splat: boolean;
+  private curSplat: DecodedSplat | null = null;
+  private sorter = new SplatSorter();
 
   // Playback trim (clip in/out, inclusive frame indices; -1 out = to the last frame). Playback loops
   // inside it; an explicit seek OUTSIDE still holds, because you have to be able to look at the
@@ -103,8 +129,10 @@ export class AresPlayer {
     private readonly fileBytes: number,
     private readonly textureVideo: TextureVideo | null,
     private readonly textureLabel: string,
+    private readonly audio: AudioTrack | null,
   ) {
     this.invLevels = dequantScale(file.superblock.quantBitsPos);
+    this.splat = file.header.geometryProfile === GeometryProfile.SplatIPB;
     this.autoOrbit = opts.autoOrbit !== false;
     this.frameToAabb(file.superblock.aabb);
     // Size the origin tripod to the clip. A capture is a person either way, but "a person" is ~1700
@@ -162,13 +190,15 @@ export class AresPlayer {
    */
   setModelTransform(t: ModelTransform | null): void {
     this.modelXf = t && !isIdentityTransform(t) ? t : null;
-    if (!this.modelXf) { this.modelOffset = [0, 0, 0]; this.renderer.setModelMatrix(null); }
+    if (!this.modelXf) { this.modelOffset = [0, 0, 0]; this.modelMat = null; this.renderer.setModelMatrix(null); }
     else {
       // Offset resolves against the CLIP-WIDE AABB, once — not per frame. Centring each frame on
       // its own bounds would re-centre the subject every frame and a walk would moonwalk in place.
       this.modelOffset = resolveOffset(this.file.superblock.aabb, this.modelXf);
-      this.renderer.setModelMatrix(transformMatrix(this.modelXf, this.modelOffset));
+      this.modelMat = transformMatrix(this.modelXf, this.modelOffset);
+      this.renderer.setModelMatrix(this.modelMat);
     }
+    this.sorter.invalidate();
     this.renderCurrent();
   }
   getModelTransform(): ModelTransform | null { return this.modelXf; }
@@ -208,10 +238,71 @@ export class AresPlayer {
     this.renderCurrent();
   }
 
+  /** Lit (lambert) vs unlit — unlit shows video-textured captures' baked lighting verbatim. */
+  setLit(on: boolean): void {
+    this.renderer.setLit(on);
+    this.renderCurrent();
+  }
+
   /** Viewport shading: textured (default) vs untextured clay — judge FORM without the atlas. */
   setTextured(on: boolean): void {
     this.renderer.setTextured(on);
     this.renderCurrent();
+  }
+
+  /** Analysis views: "shaded" (default), "normals", "uv" (checker), "depth", "points" (point-cloud view). */
+  setShadeMode(mode: "shaded" | "normals" | "uv" | "depth" | "points"): void {
+    const idx = { shaded: 0, normals: 1, uv: 2, depth: 3, points: 4 }[mode] ?? 0;
+    this.renderer.setShadeMode(idx);
+    this.renderCurrent();
+  }
+  /** Point size in pixels for the point-cloud view. */
+  setPointSize(px: number): void {
+    this.renderer.setPointSize(px);
+    this.renderCurrent();
+  }
+
+  /** Idle auto-orbit speed in radians per second (default 0.2; a turntable recording sets 2π/duration). */
+  orbitSpeed = 0.2;
+
+  /**
+   * The presented frame's geometry as floats (mesh profile): positions, UVs, normals and indices,
+   * dequantized on the CPU — for in-browser export (OBJ) and measurement. Null for splat clips or
+   * before the first frame is decoded.
+   */
+  exportFrame(): { positions: Float32Array; uvs?: Float32Array; normals?: Float32Array; indices: Uint32Array; frameIndex: number } | null {
+    if (this.splat || !this.curPosQ || !this.curIndices || this.presented < 0) return null;
+    const box = this.frames[this.presented]!.gopBox;
+    const s = this.invLevels;
+    const sx = (box.max[0] - box.min[0]) * s, sy = (box.max[1] - box.min[1]) * s, sz = (box.max[2] - box.min[2]) * s;
+    const q = this.curPosQ;
+    const n = q.length >> 2;
+    const positions = new Float32Array(n * 3);
+    for (let i = 0; i < n; i++) {
+      positions[i * 3] = box.min[0] + q[i * 4]! * sx;
+      positions[i * 3 + 1] = box.min[1] + q[i * 4 + 1]! * sy;
+      positions[i * 3 + 2] = box.min[2] + q[i * 4 + 2]! * sz;
+    }
+    let uvs: Float32Array | undefined;
+    if (this.curUvsQ && this.curUvsQ.length >= n * 2) { uvs = new Float32Array(n * 2); for (let i = 0; i < n * 2; i++) uvs[i] = this.curUvsQ[i]! / 65535; }
+    let normals: Float32Array | undefined;
+    const nq = this.curNormalsQ;
+    if (nq && nq.length >= n * 4) {
+      normals = new Float32Array(n * 3);
+      if (this.file.superblock.normalEncoding === 1) {
+        const o = new Int16Array(nq.buffer, nq.byteOffset, n * 2);
+        for (let i = 0; i < n; i++) {
+          let ox = o[i * 2]! / 32767, oy = o[i * 2 + 1]! / 32767;
+          let oz = 1 - Math.abs(ox) - Math.abs(oy);
+          if (oz < 0) { const tx = (1 - Math.abs(oy)) * (ox >= 0 ? 1 : -1), ty = (1 - Math.abs(ox)) * (oy >= 0 ? 1 : -1); ox = tx; oy = ty; }
+          const l = Math.hypot(ox, oy, oz) || 1;
+          normals[i * 3] = ox / l; normals[i * 3 + 1] = oy / l; normals[i * 3 + 2] = oz / l;
+        }
+      } else {
+        for (let i = 0; i < n; i++) { normals[i * 3] = nq[i * 4]! / 127; normals[i * 3 + 1] = nq[i * 4 + 1]! / 127; normals[i * 3 + 2] = nq[i * 4 + 2]! / 127; }
+      }
+    }
+    return { positions, uvs, normals, indices: this.curIndices.slice(), frameIndex: this.presented };
   }
 
   /** Infinite ground grid + origin tripod overlay. Default ON. */
@@ -263,7 +354,7 @@ export class AresPlayer {
    * positions accessor pieces needed to resolve a hit id to a surface point.
    */
   pickRaster(w = 320, h = 320): { buf: IdBuffer; triCentroid: (triBase: number) => [number, number, number] } | null {
-    if (!this.curPosQ || !this.curIndices || this.presented < 0) return null;
+    if (this.splat || !this.curPosQ || !this.curIndices || this.presented < 0) return null;
     const ref = this.frames[this.presented]!;
     const aspect = this.opts.canvas.width / Math.max(1, this.opts.canvas.height);
     const vp = orbitViewProj(this.orbit, aspect);
@@ -330,8 +421,11 @@ export class AresPlayer {
     const frames: FrameRef[] = [];
     const vinfo = Demuxer.textureVideo(file);
     const texFrames: (CodedTextureFrame | null)[] = new Array(file.header.frameCount).fill(null);
+    const atrack = Demuxer.audioTrack(file);
+    const audioPackets: AudioPacketRef[] = [];
     for (const gop of file.gopIndex) {
       const chunk = Demuxer.chunkAt(file, gop);
+      if (atrack) for (const p of Demuxer.audioPackets(file, chunk)) audioPackets.push(p);
       const blocks = Demuxer.geometryBlocks(file, chunk);
       let keyframeIndex = gop.frameStart;
       blocks.forEach((b, i) => {
@@ -371,12 +465,24 @@ export class AresPlayer {
     const textureLabel = vinfo
       ? `${vinfo.fourcc === "AV01" ? "AV1" : "VP9"} video ${vinfo.width}²`
       : (Demuxer.textureAtlas(file) ? `still atlas ${file.superblock.texture.width}²` : "none");
-    const player = new AresPlayer(opts, file, renderer, frames, bytes.byteLength, textureVideo, textureLabel);
+
+    // Audio (spec §11.5 OPUS): WebCodecs decode → Web Audio; the audio clock then leads the video.
+    let audio: AudioTrack | null = null;
+    if (atrack && opts.audio !== false && audioPackets.length) {
+      const at = new AudioTrack(atrack, audioPackets);
+      if (at.available && await AudioTrack.isSupported(atrack)) {
+        audio = at;
+        if (opts.volume !== undefined) at.setVolume(opts.volume);
+        if (opts.muted) at.setMuted(true);
+      } else console.warn("[ares] audio track present but Opus decode is unsupported here — playing silent");
+    }
+    const player = new AresPlayer(opts, file, renderer, frames, bytes.byteLength, textureVideo, textureLabel, audio);
 
     // Worker-thread geometry decode (spec §10.7): opt-in; falls back to main-thread decode
     // if the worker can't boot (e.g. module workers without import-map inheritance).
-    if (opts.useWorker) {
-      const dec = new WorkerGeometryDecoder();
+    // Splat frames decode on the main thread in this build (one meshopt call per stream).
+    if (opts.useWorker && !player.splat) {
+      const dec = new WorkerGeometryDecoder(opts.workerUrl);
       try { await dec.ready; player.workerDec = dec; }
       catch (e) { console.warn("[ares] worker decode unavailable, using main-thread decode:", e); dec.dispose(); }
     }
@@ -400,6 +506,22 @@ export class AresPlayer {
     const ref = this.frames[idx];
     if (!ref) return 0;
     const t0 = performance.now();
+    if (this.splat) {
+      // Splat profile: I-frames are self-contained; P-frames (dynamic splat profile) apply position
+      // deltas + births/deaths to the previous frame, re-rolled from the keyframe on any jump.
+      const dec = this.decodeSplatFrame(idx);
+      const decMsS = performance.now() - t0;
+      this.curSplat = dec;
+      this.curVerts = dec.count;
+      this.renderer.uploadSplats(dec);
+      this.presented = idx;
+      this.decodedIdx = idx;
+      this.sorter.invalidate();
+      const totalS = performance.now() - t0;
+      this.decEma = this.decEma ? this.decEma * 0.9 + decMsS * 0.1 : decMsS;
+      this.cpuEma = this.cpuEma ? this.cpuEma * 0.9 + totalS * 0.1 : totalS;
+      return totalS;
+    }
     let positionsQ: Uint16Array;
     let decMs: number;
     if (this.workerDone && this.workerDone.idx === idx) {
@@ -436,6 +558,8 @@ export class AresPlayer {
    * from the previous frame, and a non-sequential jump re-rolls from the covering keyframe.
    */
   private curPosQ: Uint16Array | null = null;
+  private curUvsQ: Uint16Array | null = null;
+  private curNormalsQ: Int8Array | null = null;
   private decodedIdx = -1;
   private uploadedGopKey = -1;
   private curVerts = 0;
@@ -477,8 +601,8 @@ export class AresPlayer {
     if (ref.type === BlockType.GeometryPB && this.decodedIdx === idx - 1 && this.curPosQ && this.uploadedGopKey === kf) {
       const p = decodePFrameBlock(ref.block, this.curPosQ);
       this.curPosQ = p.positionsQ;
-      if (p.uvsQ) this.renderer.uploadUVs(p.uvsQ);       // per-frame UVs (re-atlased texture)
-      if (p.normalsQ) this.renderer.uploadNormals(p.normalsQ);
+      if (p.uvsQ) { this.renderer.uploadUVs(p.uvsQ); this.curUvsQ = p.uvsQ; }       // per-frame UVs (re-atlased texture)
+      if (p.normalsQ) { this.renderer.uploadNormals(p.normalsQ); this.curNormalsQ = p.normalsQ; }
       this.decodedIdx = idx;
       return this.curPosQ;
     }
@@ -503,6 +627,8 @@ export class AresPlayer {
     }
     if (lastUvs) this.renderer.uploadUVs(lastUvs);       // present-frame UVs (may differ from the I-frame's)
     if (lastNormals) this.renderer.uploadNormals(lastNormals);
+    this.curUvsQ = lastUvs ?? null;
+    this.curNormalsQ = lastNormals ?? null;
     this.curPosQ = posQ;
     this.decodedIdx = idx;
     return posQ;
@@ -516,7 +642,7 @@ export class AresPlayer {
 
   /** Kick a decode of the next frame on the worker if it's idle (sequential prefetch). */
   private pumpWorker(): void {
-    if (!this.workerDec || this.workerBusy) return;
+    if (!this.workerDec || this.workerBusy || this.splat) return;
     const n = this.frames.length;
     const next = this.loopMode === "loop" ? (this.presented + 1) % n : this.presented + 1;
     if (next >= n || next === this.presented) return;
@@ -552,8 +678,8 @@ export class AresPlayer {
       this.curVerts = res.vertexCount ?? this.curVerts;
       this.uploadedGopKey = this.frames[idx]!.keyframeIndex;
     }
-    if (res.uvsQ) this.renderer.uploadUVs(res.uvsQ);
-    if (res.normalsQ) this.renderer.uploadNormals(res.normalsQ);
+    if (res.uvsQ) { this.renderer.uploadUVs(res.uvsQ); this.curUvsQ = res.uvsQ; }
+    if (res.normalsQ) { this.renderer.uploadNormals(res.normalsQ); this.curNormalsQ = res.normalsQ; }
     this.curPosQ = res.positionsQ;
     this.decodedIdx = idx;
     return res.positionsQ;
@@ -597,9 +723,77 @@ export class AresPlayer {
   private renderCurrent(): void {
     const ref = this.frames[this.presented] ?? this.frames[0]!;
     const aspect = this.opts.canvas.width / Math.max(1, this.opts.canvas.height);
-    const vp = orbitViewProj(this.orbit, aspect);
     if (this.gridOn) this.updateGridParams();
+    if (this.splat) {
+      const m = orbitMatrices(this.orbit, aspect);
+      this.uploadFx(m.eye);
+      const dec = this.curSplat;
+      if (dec) {
+        const mv = this.modelMat ? multiply(m.view, this.modelMat) : m.view;
+        const order = this.sorter.update(dec.positionsQ, dec.count, ref.gopBox, this.invLevels, mv, this.presented);
+        if (order) this.renderer.setSplatOrder(order);
+      }
+      this.renderer.renderSplats({ view: m.view, proj: m.proj, ortho: m.ortho, width: this.opts.canvas.width, height: this.opts.canvas.height },
+        ref.gopBox, this.invLevels, dec?.count ?? 0);
+      return;
+    }
+    const mm = orbitMatrices(this.orbit, aspect);
+    const vp = mm.viewProj;
+    this.uploadFx(mm.eye);
+    // Depth view window: the orbit distance ± half the clip's diagonal (recomputed per frame so the
+    // gradient always spans the subject, whatever the zoom).
+    const bb = this.file.superblock.aabb;
+    const diag = Math.hypot(bb.max[0] - bb.min[0], bb.max[1] - bb.min[1], bb.max[2] - bb.min[2]) || 1;
+    this.renderer.setDepthRange(Math.max(1e-6, this.orbit.distance - diag * 0.5), this.orbit.distance + diag * 0.5);
     this.renderer.render(vp, ref.gopBox, this.invLevels, this.indexCount);
+  }
+
+  /** Splat frame reconstruction: sequential P-frames chain off `curSplat`; anything else re-rolls from the keyframe. */
+  private decodeSplatFrame(idx: number): DecodedSplat {
+    const ref = this.frames[idx]!;
+    if (ref.type === BlockType.GeometryI) return decodeSplatBlock(ref.block);
+    if (this.curSplat && this.decodedIdx === idx - 1 && this.frames[idx - 1]!.keyframeIndex === ref.keyframeIndex) return decodeSplatPBlock(ref.block, this.curSplat);
+    let cur = decodeSplatBlock(this.frames[ref.keyframeIndex]!.block);
+    for (let f = ref.keyframeIndex + 1; f <= idx; f++) cur = decodeSplatPBlock(this.frames[f]!.block, cur);
+    return cur;
+  }
+
+  /** Live playback effects (merged over the current values); see fx.ts for the parameters. */
+  setFx(p: Partial<FxParams>): void { this.fx = mergeFx(this.fx, p); this.renderCurrent(); }
+  getFx(): FxParams { return { ...this.fx }; }
+  resetFx(): void { this.fx = { ...FX_DEFAULTS }; this.renderCurrent(); }
+  /** Keyframed effects track (sidecar `edits.fx`); null clears. Evaluated per presented frame on top of the live params. */
+  setFxTrack(track: FxTrack | null): void { this.fxTrack = track && track.keyframes?.length ? track : null; this.renderCurrent(); }
+  /** A transient layer on top of everything (audio-reactive modulation); null clears. Does not repaint by itself. */
+  setFxOverride(p: Partial<FxParams> | null): void { this.fxOverride = p; }
+  /** Effective params for the presented frame. */
+  currentFx(): FxParams {
+    const base = this.fxTrack ? evalFxTrack(this.fxTrack, Math.max(0, this.presented), this.fx) : this.fx;
+    return this.fxOverride ? mergeFx(base, this.fxOverride) : base;
+  }
+  /** Audio loudness 0..1 for reactive effects (0 without an audio track or while paused). */
+  getAudioLevel(): number { return this.audio?.level() ?? 0; }
+  private uploadFx(eye: [number, number, number]): void {
+    // Rim/dissolve run in MODEL space; bring the camera position across the model transform.
+    let cam: [number, number, number] = eye;
+    if (this.modelMat) {
+      const inv = invertMat(this.modelMat);
+      if (inv) cam = [inv[0]! * eye[0] + inv[4]! * eye[1] + inv[8]! * eye[2] + inv[12]!, inv[1]! * eye[0] + inv[5]! * eye[1] + inv[9]! * eye[2] + inv[13]!, inv[2]! * eye[0] + inv[6]! * eye[1] + inv[10]! * eye[2] + inv[14]!];
+    }
+    packFx(this.currentFx(), performance.now() / 1000, cam, this.fxData);
+    this.renderer.setFx(this.fxData);
+  }
+
+  /** True when the file carries the Gaussian splat profile (spec §6.8) rather than meshes. */
+  isSplat(): boolean { return this.splat; }
+  /** Splat count / SH degree of the presented frame (null for mesh clips). */
+  getSplatInfo(): { count: number; shDegree: number } | null {
+    return this.splat && this.curSplat ? { count: this.curSplat.count, shDegree: this.curSplat.shDegree } : null;
+  }
+  /** Live splat display multipliers (size, opacity) — preview-only VFX hooks. */
+  setSplatParams(p: Partial<SplatParams>): void {
+    this.renderer.setSplatParams(p);
+    this.renderCurrent();
   }
 
   play(): void {
@@ -613,9 +807,43 @@ export class AresPlayer {
     if (this.clockUs < lo * usPerFrame) this.clockUs = lo * usPerFrame;
     this.playing = true;
     this.lastNow = performance.now();
+    this.audioAnchor();
     if (!this.raf) this.loop(this.lastNow);
   }
-  pause(): void { this.playing = false; }
+  pause(): void { this.playing = false; this.audio?.stop(); }
+
+  // --- audio ↔ clock. The audio context is the master while it runs: clockUs = clock at anchor +
+  // (audio media time − media time at anchor). Any non-sequential frame (loop wrap, seek, reverse)
+  // re-anchors; reverse playback (ping-pong) is silent.
+  private audioClockAt = 0;
+  private audioMediaAt = 0;
+  private audioAnchor(): void {
+    if (!this.audio || !this.playing) return;
+    const idx = this.frameIndexForClock();
+    const mediaUs = this.frames[idx]?.ptsUs ?? 0;
+    this.audioClockAt = this.clockUs;
+    this.audioMediaAt = mediaUs;
+    this.audio.start(mediaUs);
+  }
+  private audioTick(idx: number, prevIdx: number): void {
+    if (!this.audio) return;
+    if (!this.playing) { if (this.audio.isRunning) this.audio.stop(); return; }
+    const forwardStep = idx === prevIdx || idx === prevIdx + 1;
+    if (!forwardStep) {
+      if (idx < prevIdx && this.loopMode === "pingpong" && idx !== this.getTrim().in) { this.audio.stop(); return; }   // reverse leg: silent
+      this.audioAnchor();
+      return;
+    }
+    if (!this.audio.isRunning) { this.audioAnchor(); return; }
+    const m = this.audio.currentMediaUs();
+    if (m !== null) this.clockUs = this.audioClockAt + (m - this.audioMediaAt);
+    this.audio.pump(this.audioMediaAt + (this.clockUs - this.audioClockAt));
+  }
+  /** Volume 0..1 and mute for the audio track (no-ops without one). */
+  setVolume(v: number): void { this.audio?.setVolume(v); }
+  setMuted(m: boolean): void { this.audio?.setMuted(m); }
+  hasAudio(): boolean { return !!this.audio; }
+  isMuted(): boolean { return !!this.audio?.isMuted; }
   get isPlaying(): boolean { return this.playing; }
 
   /** Seek to seconds via the GOP index (spec §9.2). */
@@ -626,6 +854,7 @@ export class AresPlayer {
     this.renderCurrent();
     this.emitStats();
     this.opts.onFrame?.((this.frames[idx]?.ptsUs ?? 0) / 1e6, idx);
+    if (this.playing) this.audioAnchor(); else this.audio?.stop();
   }
 
   setTier(_t: "auto" | number): void { /* single tier in P1 (spec §7.6 ladder is P3) */ }
@@ -681,7 +910,7 @@ export class AresPlayer {
    */
   tick(dtSec: number): void {
     this.clockUs += dtSec * 1e6;
-    if (this.autoOrbit && !this.dragging) this.orbit.azimuth += dtSec * 0.2;
+    if (this.autoOrbit && !this.dragging) this.orbit.azimuth += dtSec * this.orbitSpeed;
     const idx = this.frameIndexForClock();
     if (idx !== this.presented) {
       this.present(idx, true); this.opts.onFrame?.(this.frames[idx]!.ptsUs / 1e6, idx);
@@ -695,8 +924,14 @@ export class AresPlayer {
     const dt = Math.min(0.05, (now - this.lastNow) / 1000);
     this.lastNow = now;
     if (this.playing) this.clockUs += dt * 1e6;
-    if (this.autoOrbit && !this.dragging) this.orbit.azimuth += dt * 0.2;
+    if (this.autoOrbit && !this.dragging) this.orbit.azimuth += dt * this.orbitSpeed;
 
+    // Audio-led clock: when the track is running, its context time replaces the accumulator above.
+    if (this.audio && this.playing && this.audio.isRunning) {
+      const m = this.audio.currentMediaUs();
+      if (m !== null) this.clockUs = this.audioClockAt + (m - this.audioMediaAt);
+    }
+    const prevIdx = this.presented;
     const idx = this.frameIndexForClock();
     const advanced = idx !== this.presented;
     if (advanced) {
@@ -704,11 +939,13 @@ export class AresPlayer {
       this.opts.onFrame?.(this.frames[idx]!.ptsUs / 1e6, idx);
       if (this.loopMode === "once" && idx >= this.getTrim().out) {
         this.playing = false;               // reached the out point once → auto-pause (fires onEnded once)
+        this.audio?.stop();
         this.opts.onEnded?.();
       }
     } else if (idx === this.presented) {
       this.pumpTexture(idx);   // paused/held frame: still collect async decoder output
     }
+    this.audioTick(idx, prevIdx);
     this.renderCurrent();
 
     const fps = dt > 0 ? 1 / dt : 0;
@@ -743,7 +980,9 @@ export class AresPlayer {
     let iCount = 0, pbCount = 0;
     for (const f of this.frames) { if (f.type === BlockType.GeometryPB) pbCount++; else iCount++; }
     const numGops = this.file.gopIndex.length;
-    const geometryMode = pbCount === 0 ? "meshopt intra"
+    const geometryMode = this.splat
+      ? (pbCount === 0 ? `splat intra (SH ${this.file.superblock.shDegree})` : `splat I+P (SH ${this.file.superblock.shDegree})`)
+      : pbCount === 0 ? "meshopt intra"
       : iCount === numGops ? "meshopt I+P (temporal)"
       : `meshopt mixed (${iCount} intra + ${pbCount} P of ${this.frames.length} frames)`;
     return {
@@ -758,6 +997,7 @@ export class AresPlayer {
       avgFrameKB: avgBytes / 1024,
       fileKB: this.fileBytes / 1024,
       textureLabel: this.textureLabel,
+      audioLabel: this.audio ? `Opus 48 kHz ${this.audio ? (Demuxer.audioTrack(this.file)?.channels === 1 ? "mono" : "stereo") : ""}` : "none",
       geometryMode,
     };
   }
@@ -826,6 +1066,7 @@ export class AresPlayer {
     this.raf = 0;
     this.idleRaf = 0;
     this.playing = false;
+    this.audio?.dispose();
     this.textureVideo?.dispose();
     this.workerDec?.dispose();
     this.renderer.dispose();

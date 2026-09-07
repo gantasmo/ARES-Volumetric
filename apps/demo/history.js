@@ -8,11 +8,12 @@
  * browser. Entries live in apps/demo/history.json (server-side, survives reloads).
  */
 
+// Kind chips are neutral by design (no per-kind hues): the label text carries the meaning.
 const KINDS = {
-  analyse: { label: "analysed", color: "var(--accent)" },
-  encode: { label: "encoded", color: "#63d68a" },
-  enhance: { label: "enhanced", color: "var(--series-b)" },
-  inspect: { label: "inspected", color: "var(--warn)" },
+  analyse: { label: "analysed" },
+  encode: { label: "encoded" },
+  enhance: { label: "enhanced" },
+  inspect: { label: "inspected" },
 };
 
 /** Post one history entry (best-effort — history must never block the primary action). */
@@ -47,8 +48,7 @@ export function initHistoryPanel({ host, kinds, actions }) {
     <div class="card hist">
       <div style="display:flex;gap:10px;align-items:baseline;margin-bottom:8px">
         <h3 style="margin:0;flex:1">History</h3>
-        <input type="search" class="histSearch" name="history-filter" placeholder="filter by name or path…"
-          style="width:220px;padding:6px 9px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:7px;color:var(--text);font:12px system-ui">
+        <input type="search" class="inp histSearch" name="history-filter" placeholder="filter" style="width:220px">
       </div>
       <div class="histList"></div>
     </div>`;
@@ -62,13 +62,13 @@ export function initHistoryPanel({ host, kinds, actions }) {
       .filter((e) => kinds.includes(e.kind))
       .filter((e) => !q || (e.name || "").toLowerCase().includes(q) || (e.path || "").toLowerCase().includes(q));
     if (!items.length) {
-      list.innerHTML = `<div class="note" style="margin:2px 0 4px">${all.some((e) => kinds.includes(e.kind)) ? "no matches" : "nothing yet — items appear here as folders are analysed, files inspected, and encodes finish"}</div>`;
+      list.innerHTML = `<div class="note" style="margin:2px 0 4px">${all.some((e) => kinds.includes(e.kind)) ? "no matches" : "No history yet. Analyses, probes, and encodes are recorded here."}</div>`;
       return;
     }
     list.innerHTML = items.slice(0, 40).map((e, i) => {
-      const k = KINDS[e.kind] || { label: e.kind, color: "var(--text-dim)" };
+      const k = KINDS[e.kind] || { label: e.kind };
       return `<div class="hrow" data-h="${i}">
-        <span class="chip" style="background:${k.color}22;color:${k.color}">${k.label}</span>
+        <span class="chip" style="border:1px solid var(--border-st);color:var(--text-dim)">${k.label}</span>
         <span class="nm" title="${esc(e.name)}">${esc(e.name || "—")}</span>
         <span class="pth" title="${esc(e.path)}">${esc(e.path || "")}</span>
         <span class="mt">${esc(metaSummary(e))}</span>
@@ -82,6 +82,7 @@ export function initHistoryPanel({ host, kinds, actions }) {
       const act = row.querySelector(".act");
       for (const a of (actions ? actions(item) : [])) {
         const b = document.createElement("button");
+        b.className = "u";
         b.textContent = a.label;
         b.onclick = (ev) => { ev.stopPropagation(); a.run(item); };
         act.append(b);

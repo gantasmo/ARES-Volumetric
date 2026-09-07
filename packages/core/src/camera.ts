@@ -115,8 +115,20 @@ const FOV_Y = (50 * Math.PI) / 180;
  *  toggling projection keeps the subject the same size instead of jumping. */
 export const orbitViewHeight = (distance: number): number => 2 * distance * Math.tan(FOV_Y / 2);
 
-/** viewProj for an orbit camera looking at `target` from spherical (azimuth, elevation, distance). */
-export function orbitViewProj(o: OrbitState, aspect: number): Mat4 {
+export interface OrbitMatrices {
+  view: Mat4;
+  proj: Mat4;
+  viewProj: Mat4;
+  eye: [number, number, number];
+  ortho: boolean;
+}
+
+/**
+ * View and projection for an orbit camera looking at `target` from spherical (azimuth, elevation,
+ * distance), returned separately: the mesh path only needs the product, but the splat path
+ * projects covariances through the view rotation and the projection's focal terms on their own.
+ */
+export function orbitMatrices(o: OrbitState, aspect: number): OrbitMatrices {
   const ce = Math.cos(o.elevation), se = Math.sin(o.elevation);
   const eye: [number, number, number] = [
     o.target[0] + o.distance * ce * Math.sin(o.azimuth),
@@ -129,5 +141,10 @@ export function orbitViewProj(o: OrbitState, aspect: number): Mat4 {
   const proj = o.ortho
     ? orthographic(orbitViewHeight(o.distance), aspect, near, far)
     : perspective(FOV_Y, aspect, near, far);
-  return multiply(proj, view);
+  return { view, proj, viewProj: multiply(proj, view), eye, ortho: !!o.ortho };
+}
+
+/** viewProj for an orbit camera (see orbitMatrices). */
+export function orbitViewProj(o: OrbitState, aspect: number): Mat4 {
+  return orbitMatrices(o, aspect).viewProj;
 }

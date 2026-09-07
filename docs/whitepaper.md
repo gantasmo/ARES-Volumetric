@@ -447,7 +447,7 @@ Every published size figure regenerates from the repository. `node
 tools/measure-baselines.cjs <captureDir> <file.ares>` measures the raw folder, re-encodes
 every OBJ frame with real draco3d (position 14, UV 12, normal 10 bits, edgebreaker), walks
 the `.ares` chunk directory for the geometry/texture split, and prints the 4DViews
-estimate lines with their assumptions visible. `Run ARES Bench.vbs` (or `node
+estimate lines with their assumptions visible. `ARES.vbs bench` (or `node
 bench/dist/run.js`) reruns the intra codec benchmark and rebuilds the Pareto report at
 `/bench/report/`. `node tools/probe-4ds.cjs <file.4ds>` reprints the structural teardown,
 writing nothing. Playback numbers come from the demo HUD on the machine at hand.

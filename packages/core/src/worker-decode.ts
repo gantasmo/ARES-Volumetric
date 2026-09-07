@@ -47,13 +47,30 @@ interface Pending {
 export class WorkerGeometryDecoder {
   /** Resolves once the worker booted and the meshopt WASM is ready; rejects if the worker can't start. */
   readonly ready: Promise<void>;
-  private readonly worker: Worker;
+  private readonly worker: Worker | null;
   private nextId = 1;
   private pending = new Map<number, Pending>();
   private dead: Error | null = null;
 
-  constructor() {
-    this.worker = new Worker(new URL("./decode-worker.js", import.meta.url), { type: "module", name: "ares-geom-decode" });
+  /**
+   * `workerUrl` overrides the sibling-module default — required when @ares/core is consumed from a
+   * single-file bundle (tools/bundle.mjs emits `ares-decode-worker.js` for exactly this). A URL that
+   * cannot be resolved (e.g. the IIFE bundle without `workerUrl`) rejects `ready` instead of
+   * throwing out of the constructor, so the player's main-thread fallback engages.
+   */
+  constructor(workerUrl?: string | URL) {
+    let worker: Worker | null = null;
+    try {
+      const url = workerUrl ?? new URL("./decode-worker.js", import.meta.url);
+      worker = new Worker(url, { type: "module", name: "ares-geom-decode" });
+    } catch (e) {
+      this.worker = null;
+      this.dead = e instanceof Error ? e : new Error(String(e));
+      this.ready = Promise.reject(this.dead);
+      this.ready.catch(() => { /* surfaced to whoever awaits `ready` */ });
+      return;
+    }
+    this.worker = worker;
     this.worker.onmessage = (ev: MessageEvent) => {
       const msg = ev.data as DecodeResponse;
       const p = this.pending.get(msg.id);
@@ -76,10 +93,11 @@ export class WorkerGeometryDecoder {
   get inFlight(): number { return this.pending.size; }
 
   private send(req: DecodeRequest, transfer: Transferable[]): Promise<DecodeOk> {
-    if (this.dead) return Promise.reject(this.dead);
+    if (this.dead || !this.worker) return Promise.reject(this.dead ?? new Error("decode worker unavailable"));
+    const w = this.worker;
     return new Promise<DecodeOk>((resolve, reject) => {
       this.pending.set(req.id, { resolve, reject });
-      this.worker.postMessage(req, transfer);
+      w.postMessage(req, transfer);
     });
   }
 
@@ -117,7 +135,7 @@ export class WorkerGeometryDecoder {
 
   dispose(): void {
     this.failAll(new Error("WorkerGeometryDecoder disposed"));
-    this.worker.terminate();
+    this.worker?.terminate();
   }
 }
 

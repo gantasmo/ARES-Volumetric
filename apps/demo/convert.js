@@ -55,12 +55,22 @@ async function statsFromFiles(files) {
   const objs = files.filter((f) => /\.obj$/i.test(f.name)).sort((a, b) => a.name.localeCompare(b.name));
   const plys = files.filter((f) => /\.ply$/i.test(f.name)).sort((a, b) => a.name.localeCompare(b.name));
   const pngs = files.filter((f) => /\.png$/i.test(f.name)).sort((a, b) => a.name.localeCompare(b.name));
-  const meshes = objs.length ? objs : plys;
+  const splats = files.filter((f) => /\.(spz|splat|sog|glb|gltf)$/i.test(f.name)).sort((a, b) => a.name.localeCompare(b.name));
+  let meshes = objs.length ? objs : plys;
+  let kind = objs.length ? "OBJ" : "PLY", splat = false;
+  // Splat sequences (spec §6.8): a 3DGS PLY (header carries f_dc_0) or one SPZ/.splat/SOG/glTF per frame.
+  if (!objs.length && plys.length) {
+    try { const head = await plys[0].slice(0, 16384).text(); if (/f_dc_0/.test(head.slice(0, head.indexOf("end_header") >>> 0 || head.length))) { splat = true; kind = "3DGS PLY"; } } catch { /* mesh */ }
+  } else if (!objs.length && splats.length) {
+    const ext = (splats[0].name.match(/\.[^.]+$/) || [""])[0].toLowerCase();
+    kind = ext === ".spz" ? "SPZ" : ext === ".splat" ? ".splat" : ext === ".sog" ? "SOG" : "glTF splat";
+    meshes = splats; splat = true;
+  }
   if (!meshes.length) return null;
   const [sampleVerts, atlasDims] = await Promise.all([objs.length ? objVerts(meshes[0]) : 0, pngs.length ? pngDims(pngs[0]) : null]);
   const rel = (meshes[0].webkitRelativePath || "").split("/")[0] || "";
   return {
-    meshes: meshes.length, kind: objs.length ? "OBJ" : "PLY", pngs: pngs.length, atlasDims,
+    meshes: meshes.length, kind, pngs: pngs.length, atlasDims, splat, splatCount: kind === ".splat" ? Math.floor(meshes[0].size / 32) : 0,
     sampleVerts, rawBytes: files.reduce((s, f) => s + f.size, 0), files: files.length,
     folderHint: rel, name: (rel || "converted").replace(/[^a-z0-9._-]/gi, "_"), path: "",
   };
@@ -68,7 +78,7 @@ async function statsFromFiles(files) {
 
 async function analyse(files) {
   const stats = await statsFromFiles(files);
-  if (!stats) { $("convertOut").innerHTML = `<div class="card"><h3>No meshes found</h3><div class="note">Drop a folder containing per-frame <b>.obj</b> or <b>.ply</b> files (plus <b>atlas-*.png</b> textures) — or a single <b>.ares</b>/<b>.4ds</b> file to inspect it.</div></div>`; return; }
+  if (!stats) { $("convertOut").innerHTML = `<div class="card"><h3>No frames found</h3><div class="note">Drop a folder containing per-frame <b>.obj</b> or <b>.ply</b> meshes (plus <b>atlas-*.png</b> textures), or per-frame splats (<b>.spz</b>, 3DGS <b>.ply</b>, <b>.splat</b>, <b>.sog</b>, <b>.glb</b>) — or a single <b>.ares</b>/<b>.4ds</b> file to inspect it.</div></div>`; return; }
   renderConvertCard(stats);
 }
 
@@ -101,7 +111,7 @@ async function handleProbeFile(file) {
       meta: { format: probe.kind === "4ds" ? "4DViews .4ds" : "ARES", frames: probe.frameCount, sizeMB: Math.round(probe.size / 1048576), probe },
     }).then(() => history && history.refresh());
   } catch (e) {
-    out.innerHTML = `<div class="card"><h3 style="color:#f0a3a3">Could not parse ${file.name}</h3><div class="note">${e && e.message ? e.message : e}</div></div>`;
+    out.innerHTML = `<div class="card"><h3 style="color:var(--bad)">Could not parse ${file.name}</h3><div class="note">${e && e.message ? e.message : e}</div></div>`;
   }
 }
 
@@ -112,26 +122,25 @@ async function handleProbeFile(file) {
 // frame/fps/texture info straight from the codec and gate the Convert button on it. The path
 // input is plain and editable (like #cvPath above) so it can also be filled without the native
 // dialog — e.g. by automation.
-const inputCss = "flex:1;min-width:0;padding:7px 9px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:7px;color:var(--text);font:12px ui-monospace,monospace";
 function fourdsConvertRowHtml(defaultName) {
   return `
     <div class="card" id="cv4dsCard">
       <h3>Convert this .4ds on this machine</h3>
       <div class="kv" style="grid-template-columns:120px 1fr;gap:8px 12px">
         <div class="k">source path</div><div style="display:flex;gap:6px;align-items:center">
-          <input id="cv4dsPath" placeholder="click Locate… to pick this file on disk (needed to decode it)" style="${inputCss}">
-          <button class="btn ghost" id="cv4dsPickBtn" style="margin:0;padding:6px 10px;white-space:nowrap">📁 Locate…</button>
+          <input id="cv4dsPath" class="inp" placeholder="path to .4ds" style="flex:1;min-width:0">
+          <button class="u" id="cv4dsPickBtn">Locate…</button>
         </div>
-        <div class="k">output name</div><div><input id="cv4dsName" value="${defaultName}" style="width:200px;padding:7px 9px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:7px;color:var(--text);font:12px system-ui">.ares</div>
-        <div class="k">max frames</div><div><input id="cv4dsMax" type="number" min="1" placeholder="all" style="width:90px;padding:6px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:6px;color:var(--text)"> <small style="color:var(--text-faint)">full clip decodes at ~2 fps — a 455-frame capture takes ~4 min</small></div>
+        <div class="k">output name</div><div><input id="cv4dsName" class="inp" value="${defaultName}" style="width:200px">.ares</div>
+        <div class="k">max frames</div><div><input id="cv4dsMax" class="inp" type="number" min="1" placeholder="all" style="width:90px"> <small style="color:var(--text-faint)">full clip decodes at ~2 fps — a 455-frame capture takes ~4 min</small></div>
         <div class="k">mirror X</div><div><label style="font:12px system-ui;color:var(--text-mid);cursor:pointer"><input type="checkbox" id="cv4dsMirror"> <span title="left-handed → right-handed: negates X and reverses triangle winding together">fix left/right-mirrored bakes</span></label></div>
       </div>
       <div class="note" id="cv4dsCodecNote" style="margin-top:6px">Pick the file on disk to check codec status and real frame count.</div>
       <div style="display:flex;gap:8px;align-items:center;margin-top:10px">
-        <button class="btn" id="cv4dsGo" disabled>Convert on this machine</button>
+        <button class="u primary" id="cv4dsGo" disabled>Convert on this machine</button>
       </div>
       <div class="prog" id="cv4dsProg"><div></div></div>
-      <pre id="cv4dsLog" style="display:none;margin-top:12px;max-height:220px;overflow:auto;background:rgba(0,0,0,.35);border-radius:8px;padding:10px;font:11px ui-monospace,monospace;color:var(--text-mid);white-space:pre-wrap"></pre>
+      <pre id="cv4dsLog" style="display:none;margin-top:12px;max-height:220px;overflow:auto;background:var(--surface);border-radius:var(--r);padding:6px 8px;font:11px ui-monospace,monospace;color:var(--text-mid);white-space:pre-wrap"></pre>
       <div id="cv4dsDone"></div>
     </div>`;
 }
@@ -143,9 +152,9 @@ async function probe4dsPath(p) {
   go.disabled = true;
   let info;
   try { info = await fetch("/probe-4ds?path=" + encodeURIComponent(p)).then((r) => r.json()); }
-  catch { note.textContent = "Probe failed — is the ARES dev server running?"; note.style.color = "#f0a3a3"; return; }
+  catch { note.textContent = "Probe failed — is the ARES dev server running?"; note.style.color = "var(--bad)"; return; }
   if (info.error) {
-    note.innerHTML = `⚠ ${info.error}${info.missing ? ": " + info.missing.join("; ") : ""} <a href="#" id="cv4dsSettingsLink">— ⚙ Settings</a>`;
+    note.innerHTML = `${info.error}${info.missing ? ": " + info.missing.join("; ") : ""} — <a href="#" id="cv4dsSettingsLink">Settings</a>`;
     note.style.color = "var(--warn)";
     const link = $("cv4dsSettingsLink");
     if (link) link.onclick = (e) => { e.preventDefault(); const b = document.querySelector('#tabs button[data-tab="settings"]'); if (b) b.click(); };
@@ -153,7 +162,7 @@ async function probe4dsPath(p) {
   }
   note.innerHTML = `✓ ${info.nbFrames} frames @ ${info.framerate.toFixed(2)}fps · ${info.textureSize}² ${info.textureEncoding} — ready to convert` +
     (info.nbFrames >= 200 ? ` <small style="color:var(--text-faint)">(full clip ≈ ${(info.nbFrames / 2 / 60).toFixed(1)} min to decode at ~2 fps — use max frames to bound a test run)</small>` : "");
-  note.style.color = "#63d68a";
+  note.style.color = "var(--good)";
   maxInp.placeholder = `all ${info.nbFrames}`;
   maxInp.max = String(info.nbFrames);
   go.disabled = false;
@@ -163,7 +172,7 @@ function wireFourdsConvertRow() {
   $("cv4dsPickBtn").onclick = async () => {
     let picked;
     try { picked = await fetch("/pick?type=file&filter=" + encodeURIComponent("4DViews captures (*.4ds)|*.4ds") + "&for=convert4ds").then((r) => r.json()); }
-    catch { $("cv4dsCodecNote").innerHTML = `<span style="color:#f0a3a3">Picker needs the ARES dev server running.</span>`; return; }
+    catch { $("cv4dsCodecNote").innerHTML = `<span style="color:var(--bad)">Picker needs the ARES dev server running.</span>`; return; }
     if (!picked || !picked.path) return; // cancelled
     $("cv4dsPath").value = picked.path;
     probe4dsPath(picked.path);
@@ -184,18 +193,11 @@ async function run4dsConvert() {
   if (maxFrames) q.set("maxFrames", maxFrames);
   if (mirrorX) q.set("mirrorX", "1");
 
-  // Overwrite guard: EventSource can't read an error body, so check the target name up front
-  // and ask; the server 409s as the hard backstop (overwrite=1 bypasses both, deliberately).
-  try {
-    const existing = await fetch("/list-ares").then((r) => r.json());
-    if (Array.isArray(existing) && existing.some((f) => f.src === name + ".ares")) {
-      if (!confirm(`${name}.ares already exists in apps/demo — overwrite it?`)) return;
-      q.set("overwrite", "1");
-    }
-  } catch { /* server will 409 if it exists */ }
+  // Name collisions never overwrite: the server versions the output (-v2, -v3 …) and reports
+  // the name it actually wrote, so there is nothing to confirm here.
 
   const log = $("cv4dsLog"), prog = $("cv4dsProg"), done = $("cv4dsDone"), go = $("cv4dsGo");
-  log.style.display = "block"; prog.style.display = "block"; prog.firstChild.style.width = "4%"; prog.firstChild.style.background = "#d98a3a";
+  log.style.display = "block"; prog.style.display = "block"; prog.firstChild.style.width = "4%"; prog.firstChild.style.background = "";
   done.innerHTML = ""; go.disabled = true; go.textContent = "Converting…";
   const line = (t) => { log.textContent += t + "\n"; log.scrollTop = log.scrollHeight; };
   line(`\n=== ${name}.ares ← ${p} (max ${maxFrames || "all"} frames${mirrorX ? ", mirror-X" : ""}) ===`);
@@ -204,7 +206,7 @@ async function run4dsConvert() {
   const finish = (ok, msg) => {
     es.close(); go.disabled = false; go.textContent = "Convert on this machine";
     if (ok) prog.firstChild.style.width = "100%";
-    else { prog.firstChild.style.background = "#f0a3a3"; line("✗ " + msg); done.innerHTML = `<div class="note" style="color:#f0a3a3;margin-top:10px">✗ ${msg}</div>`; }
+    else { prog.firstChild.style.background = "var(--bad)"; line("✗ " + msg); done.innerHTML = `<div class="note" style="color:var(--bad);margin-top:10px">✗ ${msg}</div>`; }
   };
   es.addEventListener("start", (e) => { const d = JSON.parse(e.data); line(`▶ decoding ${d.path.split(/[\\/]/).pop()} → ${d.out}`); });
   es.addEventListener("log", (e) => { line(JSON.parse(e.data)); });
@@ -216,15 +218,15 @@ async function run4dsConvert() {
   es.addEventListener("done", (e) => {
     const d = JSON.parse(e.data);
     finish(true);
-    done.innerHTML = `<div class="note" style="color:#63d68a;margin-top:12px">✓ wrote ${d.out} (${d.frames ?? "?"} frames @ ${d.fps}fps)</div>
-      <button class="btn" id="cv4dsOpen">Open in Viewer</button>
-      <button class="btn ghost" id="cv4dsShowcase" style="margin-left:6px">★ Add to source bar</button>`;
+    done.innerHTML = `<div class="note" style="color:var(--good);margin-top:12px">✓ wrote ${d.out} (${d.frames ?? "?"} frames @ ${d.fps}fps)</div>
+      <button class="u" id="cv4dsOpen">Open in Viewer</button>
+      <button class="u" id="cv4dsShowcase" style="margin-left:6px">★ Add to source bar</button>`;
     $("cv4dsOpen").onclick = () => { location.search = "?src=" + name + ".ares"; };
-    $("cv4dsShowcase").onclick = async (ev) => { const ok = await addToShowcase(name + ".ares", name); ev.target.textContent = ok ? "★ Added" : "✗ failed"; ev.target.disabled = ok; };
+    $("cv4dsShowcase").onclick = async (ev) => { const ok = await addToShowcase(name + ".ares", name); ev.target.textContent = ok ? "Added" : "✗ failed"; ev.target.disabled = ok; };
     if (history) history.refresh();
   });
   es.addEventListener("error", (e) => {
-    let msg = "conversion failed — is the ARES dev server running and the codec available? (check ⚙ Settings)";
+    let msg = "conversion failed — is the ARES dev server running and the codec available? (check Settings)";
     try { const d = JSON.parse(e.data); msg = d.message || msg; } catch { /* connection close */ }
     finish(false, msg);
   });
@@ -245,7 +247,7 @@ async function handleImport(files) {
 async function pickAndAnalyse() {
   let picked;
   try { picked = await fetch("/pick?type=folder&for=convert").then((r) => r.json()); }
-  catch { $("convertOut").innerHTML = `<div class="card"><div class="note" style="color:#f0a3a3">Picker needs the ARES dev server running.</div></div>`; return; }
+  catch { $("convertOut").innerHTML = `<div class="card"><div class="note" style="color:var(--bad)">Picker needs the ARES dev server running.</div></div>`; return; }
   if (!picked || !picked.path) return; // cancelled
   await analyseServer(picked.path);
 }
@@ -254,12 +256,12 @@ async function analyseServer(dir) {
   out.innerHTML = `<div class="card"><div class="note">Analysing ${dir}…</div></div>`;
   let info;
   try { info = await fetch("/analyse?dir=" + encodeURIComponent(dir)).then((r) => r.json()); }
-  catch (e) { out.innerHTML = `<div class="card"><h3>Analyse failed</h3><div class="note" style="color:#f0a3a3">${e.message || e}</div></div>`; return; }
-  if (info.error) { out.innerHTML = `<div class="card"><h3>Couldn't read that folder</h3><div class="note" style="color:#f0a3a3">${info.error}</div></div>`; return; }
-  if (!info.meshes) { out.innerHTML = `<div class="card"><h3>No meshes found</h3><div class="note">${info.dir} has no <b>.obj</b>/<b>.ply</b> frames.</div></div>`; return; }
+  catch (e) { out.innerHTML = `<div class="card"><h3>Analyse failed</h3><div class="note" style="color:var(--bad)">${e.message || e}</div></div>`; return; }
+  if (info.error) { out.innerHTML = `<div class="card"><h3>Couldn't read that folder</h3><div class="note" style="color:var(--bad)">${info.error}</div></div>`; return; }
+  if (!info.meshes) { out.innerHTML = `<div class="card"><h3>No frames found</h3><div class="note">${info.dir} has no <b>.obj</b>/<b>.ply</b> mesh frames and no <b>.spz</b>/<b>.splat</b>/<b>.sog</b>/<b>.glb</b> splat frames.</div></div>`; return; }
   const base = info.dir.split(/[\\/]/).pop() || "converted";
   renderConvertCard({
-    meshes: info.meshes, kind: info.kind, pngs: info.pngs, atlasDims: info.atlasDims,
+    meshes: info.meshes, kind: info.kind, pngs: info.pngs, atlasDims: info.atlasDims, splat: !!info.splat, splatCount: info.splatCount || 0,
     sampleVerts: info.verts, rawBytes: info.rawBytes, files: undefined,
     folderHint: base, name: base.replace(/[^a-z0-9._-]/gi, "_"), path: info.dir,
   });
@@ -268,6 +270,7 @@ async function analyseServer(dir) {
 
 function renderConvertCard(stats) {
   const out = $("convertOut");
+  if (stats.splat) return renderSplatCard(stats);
   const { meshes, kind, pngs, atlasDims, sampleVerts, rawBytes, folderHint, path } = stats;
   // Rough .ares estimate from measured daniel ratios: meshopt geom ~17.6 B/vert/frame (+normals),
   // VP9 texture ~55 KB/frame @1024². Clearly labelled as an estimate; real number comes from encoding.
@@ -289,62 +292,70 @@ function renderConvertCard(stats) {
 
       <div style="margin-top:14px;display:flex;gap:6px;align-items:center;flex-wrap:wrap">
         <span class="k" style="color:var(--text-dim);font-size:12px;margin-right:4px">presets</span>
-        <button class="btn ghost" style="margin:0;padding:6px 12px" data-preset="web">Web · VP9 1024² crf32</button>
-        <button class="btn ghost" style="margin:0;padding:6px 12px" data-preset="balanced">Balanced ✨ · AV1 1024² crf30 · smooth 0</button>
-        <button class="btn ghost" style="margin:0;padding:6px 12px" data-preset="hq">HQ · AV1 2048² crf26 <small>(~+2–3× texture)</small></button>
-        <button class="btn" style="margin:0;padding:6px 12px" data-preset="cohA" title="coherent pre-pass with the exact per-texel bake + VP9 2048² crf28 smooth0 — the long-but-right one (~1–2 h for a full clip)">Coherent A ★ · exact bake · VP9 2048² crf28</button>
+        <button class="u" data-preset="web">Web · VP9 1024² crf32</button>
+        <button class="u" data-preset="balanced">Balanced · AV1 1024² crf30 · smooth 0</button>
+        <button class="u" data-preset="hq">HQ · AV1 2048² crf26 <small>(~+2–3× texture)</small></button>
+        <button class="u" data-preset="cohA" title="coherent pre-pass with the exact per-texel bake + VP9 2048² crf28 smooth0 — slowest, highest quality (~1–2 h for a full clip)">Coherent A ★ · exact bake · VP9 2048² crf28</button>
       </div>
       <div class="kv" style="grid-template-columns:168px 1fr;margin-top:12px;gap:8px 12px">
         <div class="k">folder</div><div style="display:flex;gap:6px;align-items:center">
-          <input id="cvPath" value="${path || ""}" placeholder="${folderHint ? "…full path to " + folderHint : "click Choose… to pick a folder"}" style="flex:1;min-width:0;padding:7px 9px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:7px;color:var(--text);font:12px ui-monospace,monospace">
-          <button class="btn ghost" id="cvPickBtn" style="margin:0;padding:6px 10px;white-space:nowrap">📁 Choose…</button>
+          <input id="cvPath" class="inp" value="${path || ""}" placeholder="${folderHint ? "full path to " + folderHint : "folder path"}" style="flex:1;min-width:0">
+          <button class="u" id="cvPickBtn">Choose folder…</button>
         </div>
-        <div class="k">output name</div><div><input id="cvName" value="${lastState.name}" style="width:180px;padding:7px 9px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:7px;color:var(--text);font:12px system-ui">.ares</div>
-        <div class="k">coherent</div><div><label style="font:12px system-ui;color:var(--text-mid);cursor:pointer"><input type="checkbox" id="cvCoherent" checked> <span title="stable-template GOPs: registers one mesh per GOP and rebakes atlases into its UVs — kills texture boiling and cuts file size ~3.7× (default). Needs mesh-fNNNNN.obj + atlas-fNNNNN.png frames; adds a pre-pass (minutes on long clips).">stable-template GOPs — less boiling, much smaller (default)</span></label></div>
+        <div class="k">output name</div><div><input id="cvName" class="inp" value="${lastState.name}" style="width:180px">.ares</div>
+        <div class="k">coherent</div><div><label style="font:12px system-ui;color:var(--text-mid);cursor:pointer"><input type="checkbox" id="cvCoherent" checked> <span title="stable-template GOPs: registers one mesh per GOP and rebakes atlases into its UVs — suppresses texture shimmer and cuts file size ~3.7× (default). Needs mesh-fNNNNN.obj + atlas-fNNNNN.png frames; adds a pre-pass (minutes on long clips).">stable-template GOPs — reduces texture shimmer, ~3.7× smaller (default)</span></label></div>
         <div class="k">texture</div><div>
-          <select id="cvCodec" class="cvsel"><option value="av1">AV1 (smaller, HW)</option><option value="vp9">VP9</option></select>
-          <select id="cvSize" class="cvsel"><option value="1024">1024²</option><option value="2048">2048² (sharper, bigger)</option></select>
-          CRF <input id="cvCrf" type="number" value="30" min="10" max="50" style="width:56px;padding:6px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:6px;color:var(--text)">
+          <select id="cvCodec" class="inp"><option value="av1">AV1 (smaller, HW)</option><option value="vp9">VP9</option></select>
+          <select id="cvSize" class="inp"><option value="1024">1024²</option><option value="2048">2048² (sharper, bigger)</option></select>
+          CRF <input id="cvCrf" class="inp" type="number" value="30" min="10" max="50" style="width:56px">
         </div>
-        <div class="k">smoothing</div><div><input id="cvSmooth" type="number" value="0" min="0" max="6" style="width:56px;padding:6px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:6px;color:var(--text)"> Taubin passes (weld-aware; 0 = keeper default)</div>
-        <div class="k">decimate</div><div><input id="cvDecimate" type="number" placeholder="off" min="0.2" max="0.95" step="0.05" style="width:64px;padding:6px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:6px;color:var(--text)" title="keep this fraction of triangles; atlas seams stay locked (0.6 measured: geometry −35%)"> ratio of triangles kept (blank = off)</div>
-        <div class="k">max frames</div><div><input id="cvMax" type="number" placeholder="all" min="1" style="width:80px;padding:6px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:6px;color:var(--text)"></div>
+        <div class="k">smoothing</div><div><input id="cvSmooth" class="inp" type="number" value="0" min="0" max="6" style="width:56px"> Taubin passes (weld-aware; 0 = recommended)</div>
+        <div class="k">decimate</div><div><input id="cvDecimate" class="inp" type="number" placeholder="off" min="0.2" max="0.95" step="0.05" style="width:64px" title="keep this fraction of triangles; atlas seams stay locked (0.6 measured: geometry −35%)"> ratio of triangles kept (blank = off)</div>
+        <div class="k">max frames</div><div><input id="cvMax" class="inp" type="number" placeholder="all" min="1" style="width:80px"></div>
+        <div class="k">audio</div><div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <input id="cvAudio" class="inp" placeholder="optional — any audio/video file ffmpeg reads" style="flex:1;min-width:160px" title="Audio track for the clip: transcoded to Opus 48 kHz and muxed into the .ares (spec §11.5). Leave empty for a silent clip.">
+          <button class="u" id="cvAudioPick" title="Choose an audio (or video) file — its sound becomes the clip's Opus track">Choose…</button>
+          <span class="k" style="font-size:11px">offset</span><input id="cvAudioOffset" class="inp" type="number" step="0.01" value="0" style="width:64px" title="shift the audio in seconds — positive starts it later">s
+        </div>
       </div>
-      <div style="margin-top:16px;padding-top:12px;border-top:1px solid rgba(255,255,255,.08)">
-        <div class="cap" style="font-size:10.5px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim);margin-bottom:6px">Enhance texture (AI) — optional pre-step</div>
+      <div style="margin-top:16px;padding-top:12px;border-top:1px solid var(--border)">
+        <div class="cap">Enhance texture (AI) — optional pre-step</div>
         <div class="kv" style="grid-template-columns:168px 1fr;gap:8px 12px">
           <div class="k">tier</div><div>
-            <select id="enTier" class="cvsel"><option value="ncnn">Fast — Real-ESRGAN (no server, ~few s/frame)</option><option value="sd">Generative — SD img2img (Forge, auto-starts; minutes/frame)</option></select>
+            <select id="enTier" class="inp"><option value="ncnn">Fast — Real-ESRGAN (seconds/frame)</option><option value="sd">Generative — SD img2img (Forge, auto-starts; minutes/frame)</option></select>
           </div>
           <div class="k">strength</div><div><input id="enStrength" type="range" min="0" max="100" value="70" style="width:180px;vertical-align:middle"> <span id="enStrengthVal" style="font:12px ui-monospace,monospace;color:var(--text-mid)">70%</span></div>
           <div class="k">scale</div><div>
-            <select id="enScale" class="cvsel"><option value="2">2× (2048→4096)</option><option value="1">1× (re-detail only)</option></select>
+            <select id="enScale" class="inp"><option value="2">2× (2048→4096)</option><option value="1">1× (re-detail only)</option></select>
             <small style="color:var(--text-faint)">SD tier runs at source resolution (scale ignored)</small>
           </div>
-          <div class="k">max frames</div><div><input id="enMax" type="number" placeholder="all" min="1" style="width:80px;padding:6px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:6px;color:var(--text)"></div>
+          <div class="k">max frames</div><div><input id="enMax" class="inp" type="number" placeholder="all" min="1" style="width:80px"></div>
         </div>
         <div style="display:flex;gap:8px;align-items:center;margin-top:10px;flex-wrap:wrap">
-          <button class="btn ghost" id="enGo" style="margin:0;padding:6px 14px">Enhance frames</button>
-          <button class="btn ghost" id="enForge" style="margin:0;padding:6px 12px;display:none">⚡ Pre-start Forge</button>
+          <button class="u primary" id="enGo">Enhance frames</button>
+          <button class="u" id="enForge" style="display:none">Pre-start Forge</button>
         </div>
-        <div class="note" style="margin-top:6px" id="enNote"><b>Fast</b> uses a bundled Real-ESRGAN (Vulkan) — no server, no terminal, fits your GPU. Writes enhanced atlas PNGs to a sibling folder and repoints the folder above at them, so “Convert on this machine” encodes the enhanced frames.</div>
+        <div class="note" style="margin-top:6px" id="enNote"><b>Fast</b> uses a bundled Real-ESRGAN (Vulkan) — runs locally on this machine's GPU. Writes enhanced atlas PNGs to a sibling folder and repoints the folder above at them, so “Convert on this machine” encodes the enhanced frames.</div>
         <div class="prog" id="enProg"><div></div></div>
-        <pre id="enLog" style="display:none;margin-top:10px;max-height:160px;overflow:auto;background:rgba(0,0,0,.35);border-radius:8px;padding:10px;font:11px ui-monospace,monospace;color:var(--text-mid);white-space:pre-wrap"></pre>
+        <pre id="enLog" style="display:none;margin-top:10px;max-height:160px;overflow:auto;background:var(--surface);border-radius:var(--r);padding:6px 8px;font:11px ui-monospace,monospace;color:var(--text-mid);white-space:pre-wrap"></pre>
         <div id="enDone"></div>
       </div>
 
-      <div style="display:flex;gap:8px;align-items:center">
-        <button class="btn" id="cvGo">Convert on this machine</button>
-        <button class="btn ghost" id="cvQueueAdd" style="margin-top:14px">＋ Add to batch</button>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:12px">
+        <button class="u primary" id="cvGo">Convert on this machine</button>
+        <button class="u" id="cvQueueAdd">＋ Add to batch</button>
       </div>
       <div id="cvQueue" style="margin-top:10px"></div>
       <div class="prog" id="cvProg"><div></div></div>
-      <pre id="cvLog" style="display:none;margin-top:12px;max-height:220px;overflow:auto;background:rgba(0,0,0,.35);border-radius:8px;padding:10px;font:11px ui-monospace,monospace;color:var(--text-mid);white-space:pre-wrap"></pre>
+      <pre id="cvLog" style="display:none;margin-top:12px;max-height:220px;overflow:auto;background:var(--surface);border-radius:var(--r);padding:6px 8px;font:11px ui-monospace,monospace;color:var(--text-mid);white-space:pre-wrap"></pre>
       <div id="cvDone"></div>
     </div>`;
   $("cvGo").onclick = () => runEncode();
   $("cvQueueAdd").onclick = addToQueue;
+  wireAudioPick();
+  renderQueue();   // a re-analysed folder keeps the batch visible (it lives in memory across cards)
   $("cvPickBtn").onclick = pickAndAnalyse;
+  $("cvPath").addEventListener("input", () => { $("cvPath").style.borderColor = ""; }); // clear the validation border once the user edits the field
   $("enGo").onclick = runEnhance;
   $("enForge").onclick = prewarmForge;
   $("enStrength").oninput = () => { $("enStrengthVal").textContent = $("enStrength").value + "%"; };
@@ -353,13 +364,13 @@ function renderConvertCard(stats) {
     const sd = enTier.value === "sd";
     $("enForge").style.display = sd ? "inline-block" : "none";
     $("enNote").innerHTML = sd
-      ? "<b>Generative</b> re-imagines each frame with SD img2img via Forge — Forge <b>auto-starts</b> the first time (headless, ~30–60 s cold start), no terminal. Needs a checkpoint on your Forge install."
-      : "<b>Fast</b> uses a bundled Real-ESRGAN (Vulkan) — no server, no terminal, fits your GPU. Writes enhanced atlas PNGs to a sibling folder and repoints the folder above at them, so “Convert on this machine” encodes the enhanced frames.";
+      ? "<b>Generative</b> regenerates each frame with SD img2img via Forge — Forge <b>auto-starts</b> the first time (headless, ~30–60 s cold start). Needs a checkpoint on your Forge install."
+      : "<b>Fast</b> uses a bundled Real-ESRGAN (Vulkan) — runs locally on this machine's GPU. Writes enhanced atlas PNGs to a sibling folder and repoints the folder above at them, so “Convert on this machine” encodes the enhanced frames.";
   };
   enTier.onchange = syncTier; syncTier();
   const PRESETS = {
     web: { codec: "vp9", size: "1024", crf: "32", smooth: "0" },
-    balanced: { codec: "av1", size: "1024", crf: "30", smooth: "0" },   // keeper recipe (smooth 0)
+    balanced: { codec: "av1", size: "1024", crf: "30", smooth: "0" },   // recommended recipe (smooth 0)
     hq: { codec: "av1", size: "2048", crf: "26", smooth: "0" },
     // The Coherent A recipe, exact: vp9 2048² crf28 smooth0 + coherent pre-pass (exact bake is the
     // runner default; the smeary "fast" bake is CLI-only now).
@@ -375,48 +386,130 @@ function renderConvertCard(stats) {
 }
 
 // ---- copy/transpose conversion settings between clips -----------
-// Every GUI encode records its full recipe in History meta; "⧉ Use settings" re-applies that
+// Every GUI encode records its full recipe in History meta; "Use settings" re-applies that
 // recipe to the card so ANY clip can be converted/baked with another clip's exact settings.
 let pendingSettings = null;
 function applySettingsToCard(m) {
   const set = (id, v) => { const el = $(id); if (el && v != null && v !== "") el.value = v; };
   set("cvCodec", m.codec); set("cvSize", m.texSize); set("cvCrf", m.crf);
-  if (m.smooth != null && $("cvSmooth")) $("cvSmooth").value = m.smooth;         // "0" is a real value (keeper)
+  if (m.smooth != null && $("cvSmooth")) $("cvSmooth").value = m.smooth;         // "0" is a real value (recommended)
   if ($("cvDecimate")) $("cvDecimate").value = m.decimate || "";                 // recipe match: absent = off
   if ($("cvMax")) $("cvMax").value = m.maxFrames || "";
   if ($("cvCoherent")) $("cvCoherent").checked = m.coherent === "1";            // pre-coherent entries → unchecked (accurate)
 }
 function useSettings(meta) {
-  if ($("cvCodec")) { applySettingsToCard(meta); window.scrollTo(0, 0); }
+  if ($("cvCodec")) { applySettingsToCard(meta); $("convertOut").scrollTop = 0; }
   else {
     pendingSettings = meta;
-    $("convertOut").innerHTML = `<div class="note" style="margin:8px 0">⧉ settings copied (${meta.coherent === "1" ? "coherent " : ""}${meta.codec || "?"} ${meta.texSize || "?"}² crf${meta.crf || "?"} smooth${meta.smooth ?? "?"}) — pick a folder above and they'll be applied.</div>`;
+    $("convertOut").innerHTML = `<div class="note" style="margin:8px 0">Settings copied (${meta.coherent === "1" ? "coherent " : ""}${meta.codec || "?"} ${meta.texSize || "?"}² crf${meta.crf || "?"} smooth${meta.smooth ?? "?"}) — they apply when a folder is chosen.</div>`;
   }
+}
+
+/**
+ * Convert card for a splat sequence (spec §6.8). No atlases, no coherent pre-pass, no decimation:
+ * the settings that exist are the SH cap, the outlier-alpha filter and the position quantization.
+ */
+function renderSplatCard(stats) {
+  const out = $("convertOut");
+  const { meshes, kind, rawBytes, folderHint, path, splatCount } = stats;
+  lastState = { meshes, kind, pngs: 0, folderHint, name: (folderHint || "converted").replace(/[^a-z0-9._-]/gi, "_"), path, splat: true };
+  // Measured on the synthetic splat clip: ~9–10 B/splat/frame at SH 0 after meshopt (positions 6 B
+  // + attrs 12 B raw); SH 1 adds ~7 B, SH 3 ~34 B. Labelled rough; the encode reports the truth.
+  const perSplat = { 0: 10, 1: 17, 2: 28, 3: 44 };
+  const est = (deg) => splatCount ? (splatCount * perSplat[deg] * meshes) / 1048576 : 0;
+  out.innerHTML = `
+    <div class="card">
+      <h3>Detected splat sequence</h3>
+      <div class="kv">
+        <div class="k">frames</div><div class="v">${meshes} × ${kind}${splatCount ? ` (~${(splatCount / 1000).toFixed(0)}k splats/frame)` : ""}</div>
+        <div class="k">raw size</div><div class="v">${MB(rawBytes)}${stats.files ? ` · ${stats.files} files` : ""}</div>
+        <div class="k">est. .ares</div><div class="v" id="cvSplatEst">${splatCount ? `~${est(0).toFixed(0)} MB at SH 0 · ~${est(3).toFixed(0)} MB at SH 3 <small style="color:var(--text-faint)">(rough)</small>` : "—"}</div>
+      </div>
+      <div class="note">Encodes as the Gaussian splat profile: per-chunk AABB quantization, meshopt-coded attribute streams, Morton-ordered splats. Colour is the base 8-bit colour plus the SH bands you keep.</div>
+      <div class="kv" style="grid-template-columns:168px 1fr;margin-top:12px;gap:8px 12px">
+        <div class="k">folder</div><div style="display:flex;gap:6px;align-items:center">
+          <input id="cvPath" class="inp" value="${path || ""}" placeholder="${folderHint ? "full path to " + folderHint : "folder path"}" style="flex:1;min-width:0">
+          <button class="u" id="cvPickBtn">Choose folder…</button>
+        </div>
+        <div class="k">output name</div><div><input id="cvName" class="inp" value="${lastState.name}" style="width:180px">.ares</div>
+        <div class="k">SH bands</div><div>
+          <select id="cvShDegree" class="inp">
+            <option value="">as captured</option>
+            <option value="0">0 — base colour only (smallest; view-independent)</option>
+            <option value="1">1</option><option value="2">2</option><option value="3">3 — full view dependence</option>
+          </select>
+        </div>
+        <div class="k">min opacity</div><div><input id="cvMinAlpha" class="inp" type="number" value="0" min="0" max="1" step="0.05" style="width:64px" title="drop splats below this opacity before quantization — generated captures carry a haze of near-transparent outliers that wastes precision on empty space"> drop splats below (0 = keep all)</div>
+        <div class="k">position bits</div><div><input id="cvQuantBits" class="inp" type="number" value="14" min="8" max="16" style="width:64px" title="fixed-point bits per axis over each chunk's bounding box: 14 bits over a 16 m room = 1 mm steps"> per axis over the chunk box</div>
+        <div class="k">max frames</div><div><input id="cvMax" class="inp" type="number" placeholder="all" min="1" style="width:80px"></div>
+        <div class="k">audio</div><div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap">
+          <input id="cvAudio" class="inp" placeholder="optional — any audio/video file ffmpeg reads" style="flex:1;min-width:160px" title="Audio track for the clip: transcoded to Opus 48 kHz and muxed into the .ares (spec §11.5). Leave empty for a silent clip.">
+          <button class="u" id="cvAudioPick" title="Choose an audio (or video) file — its sound becomes the clip's Opus track">Choose…</button>
+          <span class="k" style="font-size:11px">offset</span><input id="cvAudioOffset" class="inp" type="number" step="0.01" value="0" style="width:64px" title="shift the audio in seconds — positive starts it later">s
+        </div>
+      </div>
+      <div style="display:flex;gap:8px;align-items:center;margin-top:12px">
+        <button class="u primary" id="cvGo">Convert on this machine</button>
+        <button class="u" id="cvQueueAdd">＋ Add to batch</button>
+      </div>
+      <div id="cvQueue" style="margin-top:10px"></div>
+      <div class="prog" id="cvProg"><div></div></div>
+      <pre id="cvLog" style="display:none;margin-top:12px;max-height:220px;overflow:auto;background:var(--surface);border-radius:var(--r);padding:6px 8px;font:11px ui-monospace,monospace;color:var(--text-mid);white-space:pre-wrap"></pre>
+      <div id="cvDone"></div>
+    </div>`;
+  $("cvGo").onclick = () => runEncode();
+  $("cvQueueAdd").onclick = addToQueue;
+  $("cvPickBtn").onclick = pickAndAnalyse;
+  wireAudioPick();
+  renderQueue();
+}
+
+/** Native file dialog for the audio row (serve.mjs /pick?type=file, remembered under "audio"). */
+function wireAudioPick() {
+  const b = $("cvAudioPick");
+  if (!b) return;
+  b.onclick = async () => {
+    try {
+      const r = await fetch("/pick?type=file&for=audio&filter=" + encodeURIComponent("Audio/video|*.wav;*.mp3;*.m4a;*.aac;*.flac;*.ogg;*.opus;*.mp4;*.mov;*.webm;*.mkv|All files|*.*")).then((r) => r.json());
+      if (r && r.path) $("cvAudio").value = r.path;
+    } catch { /* picker needs the dev server */ }
+  };
 }
 
 // ---- batch queue: collect several folder/settings jobs, run them sequentially -------------
 const queue = [];
 function currentJob() {
   const path = $("cvPath").value.trim();
-  if (!path) { $("cvPath").focus(); $("cvPath").style.borderColor = "#f0a3a3"; return null; }
+  if (!path) { $("cvPath").focus(); $("cvPath").style.borderColor = "var(--bad)"; return null; }
+  const audio = ($("cvAudio")?.value || "").trim(), audioOffset = $("cvAudioOffset")?.value || "0";
+  if (lastState?.splat) {
+    return {
+      path, splat: true,
+      name: ($("cvName").value.trim() || "converted").replace(/[^a-z0-9._-]/gi, "_"),
+      codec: "", size: "", crf: "", smooth: "0", decimate: "", coherent: "",
+      max: $("cvMax").value, shDegree: $("cvShDegree").value, splatMinAlpha: $("cvMinAlpha").value, quantBits: $("cvQuantBits").value,
+      audio, audioOffset,
+    };
+  }
   return {
     path,
     name: ($("cvName").value.trim() || "converted").replace(/[^a-z0-9._-]/gi, "_"),
     codec: $("cvCodec").value, size: $("cvSize").value, crf: $("cvCrf").value,
     smooth: $("cvSmooth").value, max: $("cvMax").value, decimate: $("cvDecimate").value,
     coherent: $("cvCoherent")?.checked ? "1" : "",
+    audio, audioOffset,
   };
 }
 function renderQueue() {
   const host = $("cvQueue");
   if (!queue.length) { host.innerHTML = ""; return; }
-  host.innerHTML = `<div class="cap" style="font-size:10.5px;text-transform:uppercase;letter-spacing:.4px;color:var(--text-dim);margin-bottom:5px">Batch (${queue.length})</div>` +
+  host.innerHTML = `<div class="cap">Batch (${queue.length})</div>` +
     queue.map((j, i) => `<div style="display:flex;gap:8px;align-items:center;font:12px ui-monospace,monospace;color:var(--text-mid);padding:3px 0">
-      <span style="color:${j.state === "done" ? "#63d68a" : j.state === "running" ? "var(--warn)" : j.state === "failed" ? "#f0a3a3" : "var(--text-faint)"}">${j.state === "done" ? "✓" : j.state === "running" ? "▶" : j.state === "failed" ? "✗" : "·"}</span>
+      <span style="color:${j.state === "done" ? "var(--good)" : j.state === "running" ? "var(--warn)" : j.state === "failed" ? "var(--bad)" : "var(--text-faint)"}">${j.state === "done" ? "✓" : j.state === "running" ? "▶" : j.state === "failed" ? "✗" : "·"}</span>
       <span style="flex:1;overflow:hidden;text-overflow:ellipsis;white-space:nowrap">${j.name}.ares ← ${j.path}</span>
-      ${j.state === "pending" ? `<button data-rm="${i}" style="background:none;border:0;color:var(--text-faint);cursor:pointer">✕</button>` : ""}
+      ${j.state === "pending" ? `<button class="u" data-rm="${i}">✕</button>` : ""}
     </div>`).join("") +
-    (queue.some((j) => j.state === "pending") ? `<button class="btn" id="cvRunAll" style="margin-top:8px">Convert all (${queue.filter((j) => j.state === "pending").length})</button>` : "");
+    (queue.some((j) => j.state === "pending") ? `<button class="u primary" id="cvRunAll" style="margin-top:8px">Convert all (${queue.filter((j) => j.state === "pending").length})</button>` : "");
   for (const b of host.querySelectorAll("[data-rm]")) b.onclick = () => { queue.splice(Number(b.dataset.rm), 1); renderQueue(); };
   const run = host.querySelector("#cvRunAll");
   if (run) run.onclick = runBatch;
@@ -442,13 +535,13 @@ async function runBatch() {
  *  point #cvPath at the enhanced sibling folder so the normal encode picks it up. */
 async function runEnhance() {
   const path = $("cvPath").value.trim();
-  if (!path) { $("cvPath").focus(); $("cvPath").style.borderColor = "#f0a3a3"; return; }
+  if (!path) { $("cvPath").focus(); $("cvPath").style.borderColor = "var(--bad)"; return; }
   // Graceful dependency gate: warn with a download pointer instead of failing mid-run.
   if ($("enTier").value === "ncnn") {
     const dep = await depStatus("realesrgan").catch(() => null);
     if (dep && !dep.present) {
-      $("enDone").innerHTML = `<div class="note" style="color:var(--warn);margin-top:8px">⚠ The Fast tier needs Real-ESRGAN (~50 MB), which is not installed.
-        <a href="${dep.action.url}" target="_blank" rel="noopener">Download it here</a> and unzip into <code>ares/tools/bin/realesrgan-ncnn-vulkan/</code> — or check ⚙ Settings.</div>`;
+      $("enDone").innerHTML = `<div class="note" style="color:var(--warn);margin-top:8px">The Fast tier needs Real-ESRGAN (~50 MB), which is not installed.
+        <a href="${dep.action.url}" target="_blank" rel="noopener">Download it here</a> and unzip into <code>ares/tools/bin/realesrgan-ncnn-vulkan/</code> — or check Settings.</div>`;
       return;
     }
   }
@@ -462,7 +555,7 @@ async function runEnhance() {
 
   const log = $("enLog"), prog = $("enProg"), done = $("enDone"), go = $("enGo");
   log.style.display = "block"; prog.style.display = "block";
-  prog.firstChild.style.width = "4%"; prog.firstChild.style.background = "#d98a3a";
+  prog.firstChild.style.width = "4%"; prog.firstChild.style.background = "";
   done.innerHTML = ""; go.disabled = true; go.textContent = "Enhancing…";
   const line = (t) => { log.textContent += t + "\n"; log.scrollTop = log.scrollHeight; };
   line(`\n=== enhance ${path} (${$("enTier").value} · ${$("enStrength").value}% · ${$("enScale").value}×) ===`);
@@ -471,7 +564,7 @@ async function runEnhance() {
   const finish = (ok, msg) => {
     es.close(); go.disabled = false; go.textContent = "Enhance frames";
     if (ok) prog.firstChild.style.width = "100%";
-    else { prog.firstChild.style.background = "#f0a3a3"; line("✗ " + msg); done.innerHTML = `<div class="note" style="color:#f0a3a3;margin-top:10px">✗ ${msg}</div>`; }
+    else { prog.firstChild.style.background = "var(--bad)"; line("✗ " + msg); done.innerHTML = `<div class="note" style="color:var(--bad);margin-top:10px">✗ ${msg}</div>`; }
   };
   es.addEventListener("start", (e) => {
     const d = JSON.parse(e.data);
@@ -487,7 +580,7 @@ async function runEnhance() {
     const d = JSON.parse(e.data);
     finish(true);
     $("cvPath").value = d.out;
-    done.innerHTML = `<div class="note" style="color:#63d68a;margin-top:10px">✓ enhanced ${d.frames} frame(s) → <b>${d.out}</b><br>Folder path above now points at the enhanced frames — “Convert on this machine” will encode them.</div>`;
+    done.innerHTML = `<div class="note" style="color:var(--good);margin-top:10px">✓ enhanced ${d.frames} frame(s) → <b>${d.out}</b><br>Folder path above now points at the enhanced frames — “Convert on this machine” will encode them.</div>`;
     if (history) history.refresh();
   });
   es.addEventListener("error", (e) => {
@@ -502,12 +595,12 @@ async function runEnhance() {
 function prewarmForge() {
   const btn = $("enForge"), done = $("enDone");
   btn.disabled = true; const orig = btn.textContent; btn.textContent = "Starting Forge…";
-  done.innerHTML = `<div class="note" style="margin-top:8px">⏳ starting Forge (headless, ~30–60 s)…</div>`;
+  done.innerHTML = `<div class="note" style="margin-top:8px">starting Forge (headless, ~30–60 s)…</div>`;
   const es = new EventSource("/forge/start");
   const stop = (html) => { es.close(); btn.disabled = false; btn.textContent = orig; done.innerHTML = html; };
-  es.addEventListener("log", (e) => { done.innerHTML = `<div class="note" style="margin-top:8px">⏳ ${JSON.parse(e.data)}</div>`; });
-  es.addEventListener("done", () => stop(`<div class="note" style="margin-top:8px;color:#63d68a">✓ Forge ready — the Generative tier will use it.</div>`));
-  es.addEventListener("error", (e) => { let m = "could not start Forge"; try { m = JSON.parse(e.data).message || m; } catch { /* connection close */ } stop(`<div class="note" style="margin-top:8px;color:#f0a3a3">✗ ${m}</div>`); });
+  es.addEventListener("log", (e) => { done.innerHTML = `<div class="note" style="margin-top:8px">${JSON.parse(e.data)}</div>`; });
+  es.addEventListener("done", () => stop(`<div class="note" style="margin-top:8px;color:var(--good)">✓ Forge ready — the Generative tier will use it.</div>`));
+  es.addEventListener("error", (e) => { let m = "could not start Forge"; try { m = JSON.parse(e.data).message || m; } catch { /* connection close */ } stop(`<div class="note" style="margin-top:8px;color:var(--bad)">✗ ${m}</div>`); });
   es.onerror = () => { /* SSE stream closed by server */ };
 }
 
@@ -529,18 +622,26 @@ function runEncode(job) {
   return new Promise((resolve, reject) => {
     const j = job ?? currentJob();
     if (!j) return reject(new Error("no folder path"));
-    const q = new URLSearchParams({ dir: j.path, name: j.name, textureCodec: j.codec, texSize: j.size, crf: j.crf });
+    const q = new URLSearchParams({ dir: j.path, name: j.name });
+    if (j.splat) {
+      if (j.shDegree !== "" && j.shDegree != null) q.set("shDegree", j.shDegree);
+      if (Number(j.splatMinAlpha) > 0) q.set("splatMinAlpha", j.splatMinAlpha);
+      if (j.quantBits && Number(j.quantBits) !== 14) q.set("quantBits", j.quantBits);
+    } else { q.set("textureCodec", j.codec); q.set("texSize", j.size); q.set("crf", j.crf); }
     if (Number(j.smooth) > 0) q.set("smooth", j.smooth);
+    if (j.audio) { q.set("audio", j.audio); if (Number(j.audioOffset)) q.set("audioOffset", j.audioOffset); }
     if (j.max) q.set("maxFrames", j.max);
     if (j.crop) q.set("crop", j.crop);
     if (j.decimate && Number(j.decimate) > 0 && Number(j.decimate) < 1) q.set("decimate", j.decimate);
     if (j.coherent) q.set("coherent", "1");
 
     const log = $("cvLog"), prog = $("cvProg"), done = $("cvDone"), go = $("cvGo");
-    log.style.display = "block"; prog.style.display = "block"; prog.firstChild.style.width = "12%"; prog.firstChild.style.background = "#d98a3a";
+    log.style.display = "block"; prog.style.display = "block"; prog.firstChild.style.width = "12%"; prog.firstChild.style.background = "";
     done.innerHTML = ""; go.disabled = true; go.textContent = "Converting…";
     const line = (t) => { log.textContent += t + "\n"; log.scrollTop = log.scrollHeight; };
-    line(`\n=== ${j.name}.ares ← ${j.path} (${j.coherent ? "coherent " : ""}${j.codec} ${j.size}² crf${j.crf} smooth${j.smooth}) ===`);
+    line(j.splat
+      ? `\n=== ${j.name}.ares ← ${j.path} (splat profile · SH ${j.shDegree === "" ? "as captured" : j.shDegree} · min opacity ${j.splatMinAlpha || 0} · ${j.quantBits || 14} bits) ===`
+      : `\n=== ${j.name}.ares ← ${j.path} (${j.coherent ? "coherent " : ""}${j.codec} ${j.size}² crf${j.crf} smooth${j.smooth}) ===`);
 
     const es = new EventSource("/encode?" + q.toString());
     let pulse = 12;
@@ -548,15 +649,15 @@ function runEncode(job) {
       es.close(); go.disabled = false; go.textContent = "Convert on this machine";
       if (ok) {
         prog.firstChild.style.width = "100%";
-        done.innerHTML = `<div class="note" style="color:#63d68a;margin-top:12px">✓ wrote ${msg}</div>
-          <button class="btn" id="cvOpen">Open in Viewer</button>
-          <button class="btn ghost" id="cvShowcase" style="margin-left:6px">★ Add to source bar</button>`;
+        done.innerHTML = `<div class="note" style="color:var(--good);margin-top:12px">✓ wrote ${msg}</div>
+          <button class="u" id="cvOpen">Open in Viewer</button>
+          <button class="u" id="cvShowcase" style="margin-left:6px">★ Add to source bar</button>`;
         $("cvOpen").onclick = () => { location.search = "?src=" + j.name + ".ares"; };
-        $("cvShowcase").onclick = async (e) => { const ok = await addToShowcase(j.name + ".ares", j.name); e.target.textContent = ok ? "★ Added" : "✗ failed"; e.target.disabled = ok; };
+        $("cvShowcase").onclick = async (e) => { const ok = await addToShowcase(j.name + ".ares", j.name); e.target.textContent = ok ? "Added" : "✗ failed"; e.target.disabled = ok; };
         if (history) history.refresh();
         resolve(msg);
       } else {
-        prog.firstChild.style.background = "#f0a3a3";
+        prog.firstChild.style.background = "var(--bad)";
         line("✗ " + msg);
         reject(new Error(msg));
       }
@@ -592,10 +693,10 @@ export function initConvert() {
     actions: (item) => {
       const acts = [];
       if (item.kind === "encode" && item.out) acts.push({ label: "Play", run: () => { location.search = "?src=" + item.out.split("/").pop(); } });
-      if (item.kind === "encode" && item.meta) acts.push({ label: "⧉ Use settings", run: () => useSettings(item.meta) });
+      if (item.kind === "encode" && item.meta) acts.push({ label: "Use settings", run: () => useSettings(item.meta) });
       if (item.kind === "enhance" && item.out) acts.push({ label: "Use output", run: () => analyseServer(item.out) });
-      if (item.kind === "inspect" && item.meta && item.meta.probe) acts.push({ label: "View", run: () => { $("convertOut").innerHTML = renderProbeOut(item.meta.probe); window.scrollTo(0, 0); } });
-      if (item.path) acts.push({ label: "Re-analyse", run: () => { analyseServer(item.path); window.scrollTo(0, 0); } });
+      if (item.kind === "inspect" && item.meta && item.meta.probe) acts.push({ label: "View", run: () => { $("convertOut").innerHTML = renderProbeOut(item.meta.probe); $("convertOut").scrollTop = 0; } });
+      if (item.path) acts.push({ label: "Re-analyse", run: () => { analyseServer(item.path); $("convertOut").scrollTop = 0; } });
       return acts;
     },
   });

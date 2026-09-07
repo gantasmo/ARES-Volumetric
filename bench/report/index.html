@@ -200,7 +200,7 @@ async function load() {
   } catch {
     document.getElementById("err").hidden = false;
     document.getElementById("err").textContent =
-      "No results found. Run the bench first: double-click “Run ARES Bench.vbs” (repo root) or `npm run bench` in ares/.";
+      "No results found. Run the bench first: “ARES.vbs bench” (repo root) or `npm run bench` in ares/.";
     document.getElementById("envline").textContent = "";
     return;
   }

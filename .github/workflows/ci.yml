@@ -1,0 +1,44 @@
+name: ci
+
+on:
+  push:
+    branches: [master, main]
+  pull_request:
+
+jobs:
+  build-test:
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, windows-latest]
+        node: [22, 24]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: ${{ matrix.node }}
+          cache: npm
+      - name: ffmpeg (texture tests skip without it; the SOG importer needs it)
+        if: runner.os == 'Linux'
+        run: sudo apt-get update && sudo apt-get install -y ffmpeg
+      - run: npm ci --no-audit --no-fund
+      - run: npm run build
+      - run: npm test
+      - run: npm run bundle
+      - name: encoder smoke (synth mesh + splat, info, export)
+        shell: bash
+        run: |
+          node packages/encoder/dist/cli.js synth -o /tmp/mesh.ares --frames 4 --no-texture
+          node packages/encoder/dist/cli.js synth -o /tmp/splat.ares --shape splat --frames 4
+          node packages/encoder/dist/cli.js info /tmp/splat.ares
+          node packages/encoder/dist/cli.js export /tmp/splat.ares -o /tmp/f0.spz
+          node packages/encoder/dist/cli.js export /tmp/mesh.ares -o /tmp/f0.obj
+      - name: upload bundles
+        if: matrix.os == 'ubuntu-latest' && matrix.node == 24
+        uses: actions/upload-artifact@v4
+        with:
+          name: ares-bundles
+          path: |
+            packages/core/dist/bundle/
+            packages/three/dist/bundle/

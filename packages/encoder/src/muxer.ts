@@ -5,11 +5,13 @@
  */
 import {
   H, HEADER_SIZE, MAGIC_BYTES, VERSION_MAJOR, VERSION_MINOR, crc32,
-  GeometryProfile, TextureCodec, IntraCodec, EntropyCodec, BlockType, TrackType,
+  GeometryProfile, TextureCodec, IntraCodec, EntropyCodec, BlockType, TrackType, HeaderFlags,
   FourCC, CHUNK_MAGIC, TextureBlobFormat, ByteWriter, quantizePositions, type Aabb,
 } from "@ares/core";
 import { encodeGeometryBlock, encodePFrameBlock, computeSmoothNormals, meshoptEncoderReady, type EncodeMeshFrame } from "./geometry-encode.js";
 import { buildTemporalGops, type TemporalOptions } from "./temporal.js";
+import { encodeSplatStateBlock, encodeSplatPBlock, quantizeSplatFrame, matchSplatsByIndex, matchSplatsNearest, orderForPFrame, splatAabb, mortonOrder, permuteSplatFrame, type SplatFrame, type SplatTemporalOptions } from "./splat-frame.js";
+import { buildAudioBlock, packetsInWindow, type AudioTrackData } from "./audio-mux.js";
 
 export interface MuxTextureVideo {
   fourcc: string; // "VP09" | "AV01"
@@ -21,9 +23,22 @@ export interface MuxTextureVideo {
 
 export interface MuxClip {
   fps: number;
-  frames: EncodeMeshFrame[];
+  /** Mesh profile frames (spec §6.2–§6.7). Mutually exclusive with `splatFrames`. */
+  frames?: EncodeMeshFrame[];
+  /** Splat profile frames (spec §6.8): one intra block per frame, chunked at gopLength. */
+  splatFrames?: SplatFrame[];
+  /** Splat profile: cap on the SH degree carried (0–3, default: what the frames have). */
+  shDegree?: number;
+  /** Splat profile: Morton-order splats within each frame for stream coherence (default true). */
+  splatMorton?: boolean;
+  /** Splat profile: opacity threshold for the quantization AABB (outlier haze; default 0 = all). */
+  splatBoxMinAlpha?: number;
+  /** Dynamic splat profile (P-frames with deltas + births/deaths); default mode "auto". */
+  splatTemporal?: SplatTemporalOptions;
   gopLength?: number;        // frames per chunk (default 30)
   quantBitsPos?: number;     // default 14
+  /** Audio track (spec §11.5 OPUS): packets are laid into the chunk whose span holds their pts. */
+  audio?: AudioTrackData;
   meta?: Record<string, string>;
   texture?: { png: Uint8Array; width: number; height: number };  // still atlas (spec §7.7)
   textureVideo?: MuxTextureVideo;                                 // video track (spec §7.1)
@@ -41,15 +56,17 @@ export async function muxClip(clip: MuxClip): Promise<Uint8Array> {
 
 export async function muxClipWithStats(clip: MuxClip): Promise<MuxResult> {
   await meshoptEncoderReady();
+  if (clip.splatFrames) return muxSplatClip(clip);
   const bits = clip.quantBitsPos ?? 14;
   const gopLength = clip.gopLength ?? 30;
-  const frameCount = clip.frames.length;
+  const meshFrames = clip.frames ?? [];
+  const frameCount = meshFrames.length;
   if (!frameCount) throw new Error("muxClip: no frames");
   const usPerFrame = 1e6 / clip.fps;
 
   // Temporal plan (P2). With no temporal opts + varying topology this is all-intra (P1 behaviour);
   // with stable topology or track:true it produces I-frame + P-frame GOPs.
-  const gops = buildTemporalGops(clip.frames, {
+  const gops = buildTemporalGops(meshFrames, {
     gopLength,
     track: clip.temporal?.track ?? false,
     smoothTemporal: clip.temporal?.smoothTemporal ?? 0,
@@ -75,9 +92,9 @@ export async function muxClipWithStats(clip: MuxClip): Promise<MuxResult> {
   // The texture GOPs are a flat, in-order sequence covering frame 0..frameCount-1, so flattening and
   // slicing by the chunk's own frame range is correct for ANY chunking, uniform or not.
   const texFrames = clip.textureVideo ? clip.textureVideo.gops.flatMap((g) => g.frames) : null;
-  if (texFrames && texFrames.length !== clip.frames.length) {
+  if (texFrames && texFrames.length !== meshFrames.length) {
     // Don't paper over it: a mismatch here means some frame would silently ship the wrong texture.
-    throw new Error(`texture/geometry frame count mismatch: ${texFrames.length} coded texture frames for ${clip.frames.length} geometry frames`);
+    throw new Error(`texture/geometry frame count mismatch: ${texFrames.length} coded texture frames for ${meshFrames.length} geometry frames`);
   }
 
   gops.forEach((gop, chunkIdx) => {
@@ -110,14 +127,102 @@ export async function muxClipWithStats(clip: MuxClip): Promise<MuxResult> {
     // This chunk's OWN frames, by index — see the note above the loop.
     const tframes = texFrames ? texFrames.slice(start, start + framesInChunk) : null;
     if (tframes && tframes.length) blocks.push({ type: BlockType.TextureColor, trackId: 1, payload: buildTextureBlock(tframes) });
-    void chunkIdx;
     const startPts = BigInt(Math.round(start * usPerFrame));
+    if (clip.audio) {
+      const isLast = chunkIdx === gops.length - 1;
+      const a0 = Math.round(start * usPerFrame), a1 = isLast ? Infinity : Math.round((start + framesInChunk) * usPerFrame);
+      const pk = packetsInWindow(clip.audio.packets, chunkIdx === 0 ? -Infinity : a0, a1);
+      if (pk.length) blocks.push({ type: BlockType.Audio, trackId: 2, payload: buildAudioBlock(pk, a0) });
+    }
     chunks.push({ bytes: assembleChunk(startPts, framesInChunk, gopBox, blocks), startPts, frameStart: start, frameCount: framesInChunk });
   });
 
+  return layoutFile(clip, chunks, globalBox, bits, gopLength, 0, GeometryProfile.MeshIPB, FourCC.Meshopt, { temporalFrames, intraFrames, meanTrackError: errN ? errAcc / errN : 0 });
+}
+
+/**
+ * Splat profile (spec §6.8): every frame is one intra splat block; frames are chunked at gopLength
+ * with a per-chunk AABB (positions quantize over it exactly like mesh vertices). Splats are
+ * Morton-ordered per frame so meshopt's delta prediction sees spatial neighbours.
+ */
+async function muxSplatClip(clip: MuxClip): Promise<MuxResult> {
+  const frames = clip.splatFrames!;
+  const bits = clip.quantBitsPos ?? 14;
+  const gopLength = clip.gopLength ?? 30;
+  if (!frames.length) throw new Error("muxClip: no splat frames");
+  const usPerFrame = 1e6 / clip.fps;
+  let temporalFrames = 0, intraFrames = 0;
+  const maxDegree = frames.reduce((m, f) => Math.max(m, f.sh ? f.shDegree : 0), 0);
+  const shDegree = Math.max(0, Math.min(3, clip.shDegree ?? maxDegree, maxDegree));
+  const chunks: EncodedChunk[] = [];
+  let globalBox: Aabb | null = null;
+  for (let start = 0; start < frames.length; start += gopLength) {
+    const member = frames.slice(start, start + gopLength);
+    const gopBox = member.reduce((acc, f) => { const b = splatAabb(f, clip.splatBoxMinAlpha ?? 0); return acc ? unionBox(acc, b) : b; }, null as Aabb | null)!;
+    globalBox = globalBox ? unionBox(globalBox, gopBox) : gopBox;
+    const blocks: { type: BlockType; trackId: number; payload: Uint8Array }[] = [];
+    // Dynamic splat profile: P-frames chain off the previous frame's DECODED state (quantized
+    // streams as the runtime holds them). Correspondence by index when the Gaussian set is
+    // stable, else nearest neighbour; a frame that keeps too few survivors is coded intra.
+    const tmode = clip.splatTemporal?.mode ?? "auto";
+    const diagQ = Math.hypot((1 << bits) - 1, (1 << bits) - 1, (1 << bits) - 1);
+    const radiusQ = Math.max(1, (clip.splatTemporal?.matchDist ?? 0.01) * diagQ);
+    const minSurvive = clip.splatTemporal?.minSurvive ?? 0.5;
+    let prevState: import("@ares/core").DecodedSplat | null = null;
+    for (const f of member) {
+      // Morton order only on frames coded intra; a P-frame keeps the previous order by construction.
+      const fr = clip.splatMorton === false || (prevState && tmode !== "off") ? f : permuteSplatFrame(f, mortonOrder(f, gopBox));
+      const q = quantizeSplatFrame(fr, gopBox, bits, shDegree);
+      let coded = false;
+      if (prevState && tmode !== "off" && prevState.shDegree === q.shDegree) {
+        let match = null;
+        if (tmode === "index" || tmode === "auto") {
+          match = matchSplatsByIndex(prevState, q);
+          if (match && tmode === "auto") {
+            // Index correspondence must also be plausible: most splats within the match radius.
+            let near = 0;
+            for (let i = 0; i < q.count; i++) {
+              const dx = q.positionsQ[i * 4]! - prevState.positionsQ[i * 4]!, dy = q.positionsQ[i * 4 + 1]! - prevState.positionsQ[i * 4 + 1]!, dz = q.positionsQ[i * 4 + 2]! - prevState.positionsQ[i * 4 + 2]!;
+              if (dx * dx + dy * dy + dz * dz <= radiusQ * radiusQ * 4) near++;
+            }
+            if (near < q.count * 0.9) match = null;
+          }
+        }
+        if (!match && (tmode === "nn" || tmode === "auto")) match = matchSplatsNearest(prevState, q, radiusQ);
+        if (match && match.survivors >= Math.max(1, prevState.count * minSurvive)) {
+          const { state, survivorPrev, deaths } = orderForPFrame(prevState, q, match);
+          blocks.push({ type: BlockType.GeometryPB, trackId: 0, payload: encodeSplatPBlock(prevState, state, survivorPrev, deaths) });
+          prevState = state;
+          temporalFrames++;
+          coded = true;
+        }
+      }
+      if (!coded) {
+        blocks.push({ type: BlockType.GeometryI, trackId: 0, payload: encodeSplatStateBlock(q) });
+        prevState = q;
+        intraFrames++;
+      }
+    }
+    const startPts = BigInt(Math.round(start * usPerFrame));
+    if (clip.audio) {
+      const isLast = start + gopLength >= frames.length;
+      const a0 = Math.round(start * usPerFrame), a1 = isLast ? Infinity : Math.round((start + member.length) * usPerFrame);
+      const pk = packetsInWindow(clip.audio.packets, start === 0 ? -Infinity : a0, a1);
+      if (pk.length) blocks.push({ type: BlockType.Audio, trackId: 2, payload: buildAudioBlock(pk, a0) });
+    }
+    chunks.push({ bytes: assembleChunk(startPts, member.length, gopBox, blocks), startPts, frameStart: start, frameCount: member.length });
+  }
+  return layoutFile(clip, chunks, globalBox!, bits, gopLength, shDegree, GeometryProfile.SplatIPB, FourCC.Splat, { temporalFrames, intraFrames, meanTrackError: 0 });
+}
+
+/** Lay out header + superblock + GOP index + track dir + texture blob + chunks (shared by both profiles). */
+function layoutFile(clip: MuxClip, chunks: EncodedChunk[], globalBox: Aabb, bits: number, gopLength: number, shDegree: number,
+  profile: GeometryProfile, geomFourcc: string, stats: Omit<MuxResult, "bytes">): MuxResult {
+  const frameCount = chunks.reduce((s, c) => s + c.frameCount, 0);
+  const usPerFrame = 1e6 / clip.fps;
   // Sections (superblock offset patched after layout).
-  const { bytes: sb, texOffsetPos } = writeSuperblock(globalBox, bits, gopLength, clip.meta ?? {}, clip.texture, clip.textureVideo);
-  const trackDir = writeTrackDir(clip.texture, clip.textureVideo);
+  const { bytes: sb, texOffsetPos } = writeSuperblock(globalBox, bits, gopLength, shDegree, clip.meta ?? {}, clip.texture, clip.textureVideo);
+  const trackDir = writeTrackDir(geomFourcc, clip.texture, clip.textureVideo, clip.audio);
   const texBlob = clip.texture ? clip.texture.png : new Uint8Array(0);
   const gopIndexSize = 4 + chunks.length * (8 + 4 + 2 + 2 + 8 + 4);
 
@@ -146,7 +251,8 @@ export async function muxClipWithStats(clip: MuxClip): Promise<MuxResult> {
     : TextureCodec.None;
   const header = writeHeader({
     fps: clip.fps, frameCount, durationUs: BigInt(Math.round(frameCount * usPerFrame)),
-    superblockOffset, gopIndexOffset, trackDirOffset, firstChunkOffset, textureCodec: texCodec,
+    superblockOffset, gopIndexOffset, trackDirOffset, firstChunkOffset, textureCodec: texCodec, profile,
+    flags: clip.audio ? HeaderFlags.HasAudio : 0,
   });
 
   const out = new Uint8Array(offset);
@@ -156,7 +262,7 @@ export async function muxClipWithStats(clip: MuxClip): Promise<MuxResult> {
   out.set(trackDir, trackDirOffset);
   out.set(texBlob, textureOffset);
   chunks.forEach((c, i) => out.set(c.bytes, chunkOffsets[i]!));
-  return { bytes: out, temporalFrames, intraFrames, meanTrackError: errN ? errAcc / errN : 0 };
+  return { bytes: out, ...stats };
 }
 
 function unionBox(a: Aabb, b: Aabb): Aabb {
@@ -195,10 +301,12 @@ function textureFormat(texture?: { png: Uint8Array }, video?: MuxTextureVideo): 
   return TextureBlobFormat.None;
 }
 
-function writeSuperblock(box: Aabb, bits: number, gopLength: number, meta: Record<string, string>, texture?: { png: Uint8Array; width: number; height: number }, video?: MuxTextureVideo): { bytes: Uint8Array; texOffsetPos: number } {
+function writeSuperblock(box: Aabb, bits: number, gopLength: number, shDegree: number, meta: Record<string, string>, texture?: { png: Uint8Array; width: number; height: number }, video?: MuxTextureVideo): { bytes: Uint8Array; texOffsetPos: number } {
   const w = new ByteWriter(256);
   w.f32x3(box.min).f32x3(box.max);
-  w.u8(bits).u8(14).u8(1).u8(0);            // quant_bits_pos, quant_bits_uv, normal_encoding (1 = oct16), reserved
+  // quant_bits_pos, quant_bits_uv, normal_encoding (1 = oct16), sh_degree (splat profile; spec §11.3)
+  // UVs are written at 16 bits by quantizeUVs (core quant.ts); the field used to claim 14.
+  w.u8(bits).u8(16).u8(1).u8(shDegree & 0xff);
   w.u16(gopLength);
   const texOffsetPos = w.pos;
   w.u64(0n);                                 // texture_offset (patched after layout; 0 for video/none)
@@ -211,15 +319,17 @@ function writeSuperblock(box: Aabb, bits: number, gopLength: number, meta: Recor
   return { bytes: w.finish(), texOffsetPos };
 }
 
-function writeTrackDir(texture?: { png: Uint8Array }, video?: MuxTextureVideo): Uint8Array {
+function writeTrackDir(geomFourcc: string, texture?: { png: Uint8Array }, video?: MuxTextureVideo, audio?: AudioTrackData): Uint8Array {
   const hasTex = !!(texture || video);
-  const w = new ByteWriter(64);
-  w.u16(hasTex ? 2 : 1);
-  w.u16(0).u8(TrackType.Geometry).fourcc(FourCC.Meshopt).u8(0).u16(0);
+  const w = new ByteWriter(128);
+  w.u16(1 + (hasTex ? 1 : 0) + (audio ? 1 : 0));
+  w.u16(0).u8(TrackType.Geometry).fourcc(geomFourcc).u8(0).u16(0);
   if (hasTex) {
     const fourcc = video ? video.fourcc : FourCC.PNGAtlas;
     w.u16(1).u8(TrackType.TextureColor).fourcc(fourcc).u8(0).u16(0);
   }
+  // Audio rides as track 2 even without a texture track: block dir entries name their track id.
+  if (audio) w.u16(2).u8(TrackType.Audio).fourcc(FourCC.Opus).u8(0).u16(audio.codecConfig.byteLength).bytes(audio.codecConfig);
   return w.finish();
 }
 
@@ -227,6 +337,8 @@ interface HeaderFields {
   fps: number; frameCount: number; durationUs: bigint;
   superblockOffset: number; gopIndexOffset: number; trackDirOffset: number; firstChunkOffset: number;
   textureCodec: TextureCodec;
+  profile: GeometryProfile;
+  flags: number;
 }
 
 function writeHeader(f: HeaderFields): Uint8Array {
@@ -235,8 +347,8 @@ function writeHeader(f: HeaderFields): Uint8Array {
   buf.set(MAGIC_BYTES, H.magic);
   buf[H.versionMajor] = VERSION_MAJOR;
   buf[H.versionMinor] = VERSION_MINOR;
-  dv.setUint16(H.headerFlags, 0, true);
-  buf[H.geometryProfile] = GeometryProfile.MeshIPB;
+  dv.setUint16(H.headerFlags, f.flags & 0xffff, true);
+  buf[H.geometryProfile] = f.profile;
   buf[H.textureCodec] = f.textureCodec; // None for still-atlas (§7.7) or no texture; VP9/AV1 for video (§7.1)
   buf[H.intraCodec] = IntraCodec.Meshopt;
   buf[H.entropyCodec] = EntropyCodec.None;

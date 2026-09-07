@@ -17,8 +17,8 @@
 # SAM_TEXT=0 disables it (tracker/click-select is unaffected either way).
 #
 # Run: the dev server auto-starts this on demand (serve.mjs samEnsure, /sam/start SSE, and
-# the editor's SAM row); tools/sam-service/run-sam-service.ps1 and "Launch SAM Service.vbs"
-# remain as manual alternatives. Direct command (dedicated env, torch cu124 + transformers 5):
+# the editor's SAM row); `ARES.vbs sam` and tools/sam-service/run-sam-service.ps1 remain as
+# manual alternatives. Direct command (dedicated env, torch cu124 + transformers 5):
 #   tools/sam-service/env/Scripts/python.exe -m uvicorn main:app --host 127.0.0.1 --port 7263
 #
 # The ARES dev server reverse-proxies this under /sam/* (COEP blocks direct cross-origin
@@ -43,7 +43,7 @@ _REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__fil
 SAM3_DIR = os.environ.get("SAM3_DIR", os.path.join(_REPO_ROOT, "sam3"))
 VITH_CHECKPOINT = os.environ.get(
     "SAM_CKPT",
-    r"D:/Dev/pinokio/api/wan.git/app/ckpts/mask/sam_vit_h_4b8939_fp16.safetensors",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "sam_vit_h_4b8939_fp16.safetensors"),
 )
 BACKEND_PREF = os.environ.get("SAM_BACKEND", "auto")  # auto | sam3 | vit_h
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -464,5 +464,200 @@ def segment_text(req: SegmentTextRequest):
     return {
         "masks": mask_b64,
         "scores": [float(s) for s in scores],
+        "ms": round((time.time() - t0) * 1000, 1),
+    }
+
+
+# =========================================================== UPSCALE (Real-ESRGAN) ==
+# Added for Fauxtofab. GPU super-resolution via spandrel. Loads LAZILY on the first
+# /upscale call so it never slows SAM startup or holds VRAM unless used; a load failure
+# is isolated (503 on /upscale, reported on /health) and never touches segmentation.
+# Tiled inference keeps peak VRAM ~1 GB, so it coexists with SAM 3 on a 6 GB card.
+UPSCALE_CKPT = os.environ.get("UPSCALE_CKPT",
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "RealESRGAN_x4plus.pth"))
+UPSCALE_TILE = int(os.environ.get("UPSCALE_TILE", "256"))
+UPSCALE_PAD  = int(os.environ.get("UPSCALE_PAD", "16"))
+
+_upscaler = None
+_upscale_error = None
+
+
+def _ensure_upscaler():
+    global _upscaler, _upscale_error
+    if _upscaler is not None:
+        return _upscaler
+    if _upscale_error is not None:
+        raise HTTPException(status_code=503, detail=f"upscaler failed to load: {_upscale_error}")
+    try:
+        from spandrel import ModelLoader
+        if not os.path.isfile(UPSCALE_CKPT):
+            raise FileNotFoundError(f"upscale weight not found: {UPSCALE_CKPT}")
+        t0 = time.time()
+        _upscaler = ModelLoader().load_from_file(UPSCALE_CKPT).to(DEVICE).eval()
+        print(f"[ares-sam] upscaler loaded ({_upscaler.architecture.name} x{_upscaler.scale}) "
+              f"from {UPSCALE_CKPT} on {DEVICE} in {time.time() - t0:.1f}s")
+        return _upscaler
+    except Exception as e:
+        _upscale_error = f"{type(e).__name__}: {e}"
+        print(f"[ares-sam] upscaler failed to load: {_upscale_error}")
+        raise HTTPException(status_code=503, detail=f"upscaler failed to load: {_upscale_error}")
+
+
+def _run_sr(img, tile, pad):
+    """Padded-tile super-resolution: each output tile keeps only its centre (the pad gives
+    seam-free context), accumulated on CPU so peak GPU memory stays ~one tile."""
+    scale = _upscaler.scale
+    h, w, _ = img.shape
+    t = torch.from_numpy(img).permute(2, 0, 1).unsqueeze(0).float().div(255).to(DEVICE)
+    out = np.zeros((h * scale, w * scale, 3), np.uint8)
+    for ty in range(0, h, tile):
+        for tx in range(0, w, tile):
+            y0, x0 = max(0, ty - pad), max(0, tx - pad)
+            y1, x1 = min(h, ty + tile + pad), min(w, tx + tile + pad)
+            sub = t[:, :, y0:y1, x0:x1]
+            with torch.no_grad():
+                if DEVICE == "cuda":
+                    with torch.autocast("cuda", dtype=torch.float16):
+                        sr = _upscaler(sub)
+                else:
+                    sr = _upscaler(sub)
+            ky1, kx1 = min(h, ty + tile), min(w, tx + tile)
+            oy, ox = (ty - y0) * scale, (tx - x0) * scale
+            kh, kw = (ky1 - ty) * scale, (kx1 - tx) * scale
+            region = sr[:, :, oy:oy + kh, ox:ox + kw].clamp(0, 1).mul(255).round().byte().squeeze(0).permute(1, 2, 0).cpu().numpy()
+            out[ty * scale:ky1 * scale, tx * scale:kx1 * scale] = region
+    del t
+    if DEVICE == "cuda":
+        torch.cuda.empty_cache()
+    return out
+
+
+class UpscaleRequest(BaseModel):
+    image: str            # base64 PNG/JPEG (data: URL tolerated)
+    tile: int = 0         # 0 -> UPSCALE_TILE
+
+
+@app.post("/upscale")
+def upscale(req: UpscaleRequest):
+    raw, img = _decode_image(req)
+    t0 = time.time()
+    with _lock:  # share the GPU lock with SAM so the two never run concurrently (OOM guard)
+        _ensure_upscaler()
+        tile = req.tile if req.tile and req.tile > 0 else UPSCALE_TILE
+        out = _run_sr(img, tile, UPSCALE_PAD)
+    buf = io.BytesIO()
+    Image.fromarray(out).save(buf, "PNG")
+    return {
+        "image": base64.b64encode(buf.getvalue()).decode("ascii"),
+        "scale": int(_upscaler.scale),
+        "ms": round((time.time() - t0) * 1000, 1),
+    }
+
+
+# ============================================================== ADD DETAIL (SD 1.5) ==
+# Added for Fauxtofab. Tiled SD 1.5 img2img detail pass (DreamShaper 8) via diffusers.
+# Loads LAZILY on first /detail; model_cpu_offload + vae tiling + attention slicing keep
+# peak GPU ~2 GB so it coexists with SAM 3 on a 6 GB card. Tiled with seam-free feather
+# blending so full resolution is preserved. Isolated failure (503), never touches SAM.
+DETAIL_MODEL    = os.environ.get("DETAIL_MODEL", "Lykon/dreamshaper-8")
+DETAIL_TILE     = int(os.environ.get("DETAIL_TILE", "448"))
+DETAIL_OVERLAP  = int(os.environ.get("DETAIL_OVERLAP", "64"))
+DETAIL_STEPS    = int(os.environ.get("DETAIL_STEPS", "20"))
+DETAIL_GUIDANCE = float(os.environ.get("DETAIL_GUIDANCE", "6.0"))
+
+_detail_pipe = None
+_detail_error = None
+
+
+def _ensure_detail():
+    global _detail_pipe, _detail_error
+    if _detail_pipe is not None:
+        return _detail_pipe
+    if _detail_error is not None:
+        raise HTTPException(status_code=503, detail=f"detail model failed to load: {_detail_error}")
+    try:
+        from diffusers import StableDiffusionImg2ImgPipeline
+        t0 = time.time()
+        pipe = StableDiffusionImg2ImgPipeline.from_pretrained(
+            DETAIL_MODEL, torch_dtype=(torch.float16 if DEVICE == "cuda" else torch.float32), safety_checker=None)
+        pipe.set_progress_bar_config(disable=True)
+        pipe.enable_attention_slicing()
+        if DEVICE == "cuda":
+            pipe.enable_vae_tiling()
+            pipe.enable_model_cpu_offload()   # stream to GPU -> coexists with SAM on 6 GB
+        else:
+            pipe = pipe.to(DEVICE)
+        _detail_pipe = pipe
+        print(f"[ares-sam] detail model loaded ({DETAIL_MODEL}) on {DEVICE} in {time.time() - t0:.1f}s")
+        return _detail_pipe
+    except Exception as e:
+        _detail_error = f"{type(e).__name__}: {e}"
+        print(f"[ares-sam] detail model failed to load: {_detail_error}")
+        raise HTTPException(status_code=503, detail=f"detail model failed to load: {_detail_error}")
+
+
+def _detail_ramp(n, ov):
+    r = np.ones(n, np.float32)
+    ov = min(ov, n // 2)
+    if ov > 0:
+        r[:ov] = np.linspace(0.0, 1.0, ov, endpoint=False)
+        r[-ov:] = np.linspace(1.0, 0.0, ov, endpoint=False)
+    return np.maximum(r, 0.02)  # floor so image-border pixels never divide to black
+
+
+def _run_detail(img, prompt, negative, strength, steps, guidance, tile, overlap):
+    h, w, _ = img.shape
+    acc = np.zeros((h, w, 3), np.float32)
+    wsum = np.zeros((h, w, 1), np.float32)
+    step = max(8, tile - overlap)
+    ys = sorted(set(list(range(0, max(1, h - overlap), step)) + [max(0, h - tile)]))
+    xs = sorted(set(list(range(0, max(1, w - overlap), step)) + [max(0, w - tile)]))
+    gen = torch.Generator("cpu").manual_seed(0)
+    ntiles = 0
+    for y0 in ys:
+        for x0 in xs:
+            th = min(tile, h - y0) // 8 * 8
+            tw = min(tile, w - x0) // 8 * 8
+            if th < 8 or tw < 8:
+                continue
+            sub = img[y0:y0 + th, x0:x0 + tw]
+            res = _detail_pipe(prompt=prompt, negative_prompt=negative, image=Image.fromarray(sub),
+                               strength=strength, num_inference_steps=steps, guidance_scale=guidance,
+                               generator=gen).images[0]
+            rn = np.asarray(res, np.float32)
+            wt = (_detail_ramp(th, overlap)[:, None] * _detail_ramp(tw, overlap)[None, :])[:, :, None]
+            acc[y0:y0 + th, x0:x0 + tw] += rn * wt
+            wsum[y0:y0 + th, x0:x0 + tw] += wt
+            ntiles += 1
+    wsum[wsum == 0] = 1.0
+    return (acc / wsum).clip(0, 255).astype(np.uint8), ntiles
+
+
+class DetailRequest(BaseModel):
+    image: str
+    prompt: str = "highly detailed, sharp focus, fine texture, natural detail, high quality"
+    negative: str = "blurry, low quality, deformed, oversharpened, artifacts"
+    strength: float = 0.30
+    tile: int = 0
+
+
+@app.post("/detail")
+def detail(req: DetailRequest):
+    raw, img = _decode_image(req)
+    strength = min(0.95, max(0.05, float(req.strength)))
+    tile = req.tile if req.tile and req.tile > 0 else DETAIL_TILE
+    t0 = time.time()
+    with _lock:  # share the GPU lock with SAM/upscale
+        _ensure_detail()
+        try:
+            out, ntiles = _run_detail(img, req.prompt, req.negative, strength, DETAIL_STEPS, DETAIL_GUIDANCE, tile, DETAIL_OVERLAP)
+        except getattr(torch.cuda, "OutOfMemoryError", RuntimeError):  # CPU-only torch has no cuda.OutOfMemoryError
+            torch.cuda.empty_cache()
+            out, ntiles = _run_detail(img, req.prompt, req.negative, strength, DETAIL_STEPS, DETAIL_GUIDANCE, 320, 48)
+    buf = io.BytesIO()
+    Image.fromarray(out).save(buf, "PNG")
+    return {
+        "image": base64.b64encode(buf.getvalue()).decode("ascii"),
+        "tiles": ntiles,
         "ms": round((time.time() - t0) * 1000, 1),
     }

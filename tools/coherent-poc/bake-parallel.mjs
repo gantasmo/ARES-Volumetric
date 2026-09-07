@@ -16,7 +16,7 @@ const SRC_DIR = process.env.ARES_SRC_DIR
   || fileURLToPath(new URL("../../../Daniel_Microsoft_Volcap/Daniel_Volcap", import.meta.url));
 const CKPT_DIR = process.argv[2];
 const OUT_DIR = process.argv[3];
-const GOP_START = 1;
+const GOP_START = Number(process.env.ARES_GOP_START || 1);
 const DILATE_RADIUS = 2;
 
 function fname(i) { return `mesh-f${String(i).padStart(5, "0")}.obj`; }
@@ -39,7 +39,13 @@ async function main() {
 
   const posBuf = await readFile(join(CKPT_DIR, "positions.bin"));
   const frameCount = posBuf.readUInt32LE(0);
-  const workFrames = Array.from({ length: frameCount - 1 }, (_, i) => i + 1); // 1..frameCount-1
+  let workFrames = Array.from({ length: frameCount - 1 }, (_, i) => i + 1); // 1..frameCount-1
+  // ARES_BAKE_FRAMES="27,28,29" (LOCAL indices) re-bakes only those frames into OUT_DIR —
+  // for ramp iterations that touch a handful of frames in an otherwise finished span.
+  if (process.env.ARES_BAKE_FRAMES) {
+    const want = new Set(process.env.ARES_BAKE_FRAMES.split(",").map(Number));
+    workFrames = workFrames.filter((f) => want.has(f));
+  }
 
   // Frame 0 = template verbatim.
   await copyFile(join(SRC_DIR, atlasName(GOP_START)), join(OUT_DIR, atlasName(GOP_START)));

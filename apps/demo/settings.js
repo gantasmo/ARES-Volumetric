@@ -21,34 +21,33 @@ export async function depStatus(id) {
 async function render() {
   const out = $("depsOut");
   try { deps = (await fetch("/deps").then((r) => r.json())).deps || []; }
-  catch { out.innerHTML = `<div class="card"><div class="note" style="color:#f0a3a3">Dependency check needs the ARES dev server (launch via Play ARES Demo.vbs).</div></div>`; return; }
+  catch { out.innerHTML = `<div class="card"><div class="note" style="color:var(--bad)">Dependency check needs the ARES dev server (start it with ARES.vbs, or npm start).</div></div>`; return; }
 
   const row = (d, i) => {
-    const color = d.present ? "#63d68a" : d.optional ? "var(--text-faint)" : "var(--warn)";
     const size = d.sizeMB ? d.sizeMB + " MB" : (d.sizeNote || "");
     let action = "";
     if (!d.present && d.action) {
-      if (d.action.kind === "link") action = `<a class="btn ghost" style="margin:0;padding:5px 12px;font-size:12px;text-decoration:none" href="${esc(d.action.url)}" target="_blank" rel="noopener">Download page ↗</a>`;
-      else if (d.action.kind === "sse") action = `<button class="btn ghost" style="margin:0;padding:5px 12px;font-size:12px" data-sse="${esc(d.action.route)}" data-i="${i}">${esc(d.action.label || "Install")}</button>`;
+      if (d.action.kind === "link") action = `<a class="u" style="text-decoration:none" href="${esc(d.action.url)}" target="_blank" rel="noopener">Download page ↗</a>`;
+      else if (d.action.kind === "sse") action = `<button class="u" data-sse="${esc(d.action.route)}" data-i="${i}">${esc(d.action.label || "Install")}</button>`;
     }
     const note = d.action && d.action.note ? `<div class="note2">${d.present ? "" : esc(d.action.note)}</div>` : "";
+    const status = d.present ? "installed" + (size ? " · " + size : "") : "not installed" + (size ? " · " + size : "");
     return `<div class="dep">
-      <span class="dot" style="background:${color}"></span>
       <span class="lbl">${esc(d.label)}${d.optional ? ' <small style="color:var(--text-faint);font-weight:400">optional</small>' : ""}</span>
       <span class="en">${esc(d.enables)}</span>
-      <span class="side">${action}<span class="size">${d.present ? "installed" + (size ? " · " + size : "") : size}</span></span>
+      <span class="side">${action}<span class="size"${d.present ? "" : ' style="color:var(--text-dim)"'}>${status}</span></span>
       ${d.present && d.path ? `<div class="pth" title="${esc(d.path)}">${esc(d.path)}</div>` : note}
-      <div id="depLog${i}" class="note2" style="display:none;font:10.5px ui-monospace,monospace;white-space:pre-wrap;max-height:120px;overflow:auto"></div>
+      <div id="depLog${i}" class="note2" style="display:none;font:11px ui-monospace,monospace;white-space:pre-wrap;max-height:120px;overflow:auto"></div>
     </div>`;
   };
 
   const ready = deps.filter((d) => d.present).length;
   out.innerHTML = `
     <div class="card">
-      <div style="display:flex;gap:10px;align-items:baseline;margin-bottom:4px">
+      <div class="row" style="margin-bottom:4px">
         <h3 style="margin:0;flex:1">Components</h3>
         <span class="note" style="margin:0">${ready}/${deps.length} present</span>
-        <button class="btn ghost" id="depRefresh" style="margin:0;padding:5px 12px;font-size:12px">Refresh</button>
+        <button class="u" id="depRefresh">Refresh</button>
       </div>
       ${deps.map(row).join("")}
     </div>

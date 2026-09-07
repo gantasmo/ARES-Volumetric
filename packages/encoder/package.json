@@ -1,19 +1,52 @@
 {
   "name": "@ares/encoder",
+  "description": "ARES Volumetric encoder: OBJ/PLY meshes and SPZ/3DGS PLY/.splat/glTF (KHR_gaussian_splatting)/SOG splats → .ares; temporal GOPs, meshopt, VP9/AV1 texture mux, exporters, `ares` CLI",
   "license": "MIT",
-  "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
+  "engines": {
+    "node": ">=22.15"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gantasmo/ares.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "!dist/**/*.tsbuildinfo",
+    "README.md"
+  ],
+  "keywords": [
+    "volumetric",
+    "encoder",
+    "gaussian-splatting",
+    "spz",
+    "gltf",
+    "meshopt",
+    "cli"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
   "bin": {
     "ares": "./dist/cli.js"
   },
   "scripts": {
-    "build": "tsc -b"
+    "build": "tsc -b",
+    "prepublishOnly": "tsc -b"
   },
   "dependencies": {
-    "@ares/core": "*",
+    "@ares/core": "0.1.0",
     "meshoptimizer": "^1.2.0"
   },
   "devDependencies": {

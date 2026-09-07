@@ -14,6 +14,8 @@
 import type { Aabb } from "./quant.js";
 import { invert, multiply } from "./camera.js";
 import { buildOriginTripod, type GridParams } from "./overlay.js";
+import type { DecodedSplat } from "./splat.js";
+import type { SplatCamera, SplatParams } from "./renderer-gl2.js";
 
 // Origin tripod: world-space colored lines. Reads only viewProj from the shared uniform (first 64
 // bytes); vertex buffer is interleaved position(vec3)+color(vec3).
@@ -130,11 +132,17 @@ struct Uniforms {
   aabbMin  : vec3<f32>,
   invLevels: f32,
   aabbSize : vec3<f32>,
-  _pad     : f32,
+  litMix   : f32,        // 1 = lit (lambert), 0 = unlit — video-textured captures carry baked lighting
   cropMin  : vec3<f32>,   // world-space crop box (mesh editor preview)
   cropOn   : f32,
   cropMax  : vec3<f32>,
   texMix   : f32,        // 1 = textured (shaded), 0 = untextured clay — the viewport shading mode
+  shadeMode : f32,       // 0 shaded, 1 normals, 2 uv checker, 3 depth, 4 points
+  pointSize : f32,       // pixels (mode 4)
+  depthLo   : f32,       // depth view window (view-space distance)
+  depthHi   : f32,
+  viewport  : vec2<f32>, // pixels (mode 4 quad expansion)
+  pad2      : vec2<f32>,
 };
 @group(0) @binding(0) var<uniform> u : Uniforms;
 @group(0) @binding(1) var<storage, read> qpos : array<u32>; // 2 u32 / vertex (u16 x,y,z,pad)
@@ -142,29 +150,74 @@ struct Uniforms {
 @group(0) @binding(3) var samp : sampler;
 @group(0) @binding(4) var tex  : texture_2d<f32>;
 @group(0) @binding(5) var<storage, read> qnrm : array<u32>; // 1 u32 / vertex (i8 x,y,z,pad snorm)
+@group(0) @binding(6) var<uniform> fx : array<vec4<f32>, 8>;   // playback effects (fx.ts)
+
+// ---- playback effects (fx.ts packFx layout: 8 × vec4) ----
+fn fxHash(p : vec3<f32>) -> f32 { return fract(sin(dot(p, vec3<f32>(12.9898, 78.233, 37.719))) * 43758.5453); }
+fn fxNoise(p : vec3<f32>) -> f32 {
+  let i = floor(p); let f = fract(p); let u = f * f * (3.0 - 2.0 * f);
+  let a = mix(mix(fxHash(i), fxHash(i + vec3<f32>(1.0, 0.0, 0.0)), u.x), mix(fxHash(i + vec3<f32>(0.0, 1.0, 0.0)), fxHash(i + vec3<f32>(1.0, 1.0, 0.0)), u.x), u.y);
+  let b = mix(mix(fxHash(i + vec3<f32>(0.0, 0.0, 1.0)), fxHash(i + vec3<f32>(1.0, 0.0, 1.0)), u.x), mix(fxHash(i + vec3<f32>(0.0, 1.0, 1.0)), fxHash(i + vec3<f32>(1.0, 1.0, 1.0)), u.x), u.y);
+  return mix(a, b, u.z);
+}
+fn fxWobble(p : vec3<f32>) -> vec3<f32> {
+  let amp = fx[4].w;
+  if (amp <= 0.0) { return p; }
+  let f = fx[5].x; let t = fx[5].y;
+  return p + amp * vec3<f32>(sin(p.y * f + t * 3.0), sin(p.z * f * 1.3 + t * 2.2), sin(p.x * f * 0.7 + t * 2.7));
+}
+// Colour-side effects; alpha 0 = discard. n is a unit normal (meshes) or zero (no rim).
+fn fxApply(world : vec3<f32>, n : vec3<f32>, colIn : vec3<f32>) -> vec4<f32> {
+  var col = colIn;
+  if (fx[1].x > 0.5 && dot(world, fx[0].xyz) + fx[0].w < 0.0) { return vec4<f32>(col, 0.0); }
+  let d = fx[1].y;
+  if (d > 0.0) {
+    let nz = fxNoise(world * fx[1].z);
+    if (nz < d) { return vec4<f32>(col, 0.0); }
+    col = mix(fx[4].xyz, col, smoothstep(d, d + 0.08, nz));
+  }
+  if (fx[1].w > 0.0) { col = col * (1.0 - fx[1].w * 0.5 * (0.5 + 0.5 * sin(world.y * fx[5].z + fx[5].y * 4.0))); }
+  if (fx[3].w > 0.0 && dot(n, n) > 0.5) { let v = normalize(fx[6].xyz - world); let fr = pow(1.0 - abs(dot(n, v)), 3.0); col = col + fx[3].xyz * fx[3].w * fr; }
+  if (fx[2].w > 0.0) { col = mix(col, col * fx[2].xyz, fx[2].w); }
+  return vec4<f32>(col, 1.0);
+}
 
 struct VSOut {
   @builtin(position) clip : vec4<f32>,
   @location(0) uv         : vec2<f32>,
   @location(1) world      : vec3<f32>,
   @location(2) normal     : vec3<f32>,
+  @location(3) depth      : f32,
 };
 
 fn sx8(v : u32) -> f32 { return f32(i32(v << 24u) >> 24u); }
 
-@vertex
-fn vs(@builtin(vertex_index) vi : u32) -> VSOut {
+fn vertexAt(vi : u32) -> VSOut {
   let a = qpos[vi * 2u];
   let b = qpos[vi * 2u + 1u];
   let q = vec3<f32>(f32(a & 0xffffu), f32((a >> 16u) & 0xffffu), f32(b & 0xffffu));
-  let world = u.aabbMin + (q * u.invLevels) * u.aabbSize;   // GPU-side dequant
+  let world = fxWobble(u.aabbMin + (q * u.invLevels) * u.aabbSize);   // GPU-side dequant (+ wobble fx)
   let uvp = quv[vi];
   let np = qnrm[vi];
   var o : VSOut;
   o.clip = u.viewProj * vec4<f32>(world, 1.0);
   o.uv = vec2<f32>(f32(uvp & 0xffffu), f32((uvp >> 16u) & 0xffffu)) / 65535.0;
   o.world = world;
+  o.depth = o.clip.w;
   ${NRM_DECODE[normalEncoding] ?? NRM_DECODE[0]!}
+  return o;
+}
+
+@vertex
+fn vs(@builtin(vertex_index) vi : u32) -> VSOut { return vertexAt(vi); }
+
+// Point-cloud view: one screen-aligned quad per vertex (4 strip vertices × vertexCount instances).
+@vertex
+fn vs_points(@builtin(vertex_index) vi : u32, @builtin(instance_index) ii : u32) -> VSOut {
+  var o = vertexAt(ii);
+  let corner = vec2<f32>(f32((vi & 1u) * 2u) - 1.0, f32((vi >> 1u) * 2u) - 1.0);
+  let px = corner * u.pointSize * 0.5;
+  o.clip = vec4<f32>(o.clip.xy + px * 2.0 / u.viewport * o.clip.w, o.clip.zw);
   return o;
 }
 
@@ -183,7 +236,233 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
   let albedo = mix(vec3<f32>(0.72, 0.71, 0.68), textureSample(tex, samp, in.uv).rgb, u.texMix);
   // Crop preview (mesh editor): discard LAST so derivatives/samples above stay uniform.
   if (u.cropOn > 0.5 && (any(in.world < u.cropMin) || any(in.world > u.cropMax))) { discard; }
-  return vec4<f32>(albedo * (0.4 + 0.6 * diff), 1.0);
+  let lit = mix(1.0, 0.4 + 0.6 * diff, u.litMix);
+  var col = albedo * lit;
+  let mode = u32(u.shadeMode + 0.5);
+  if (mode == 1u) { col = n * 0.5 + vec3<f32>(0.5, 0.5, 0.5); }
+  else if (mode == 2u) {
+    let ck = (floor(in.uv.x * 32.0) + floor(in.uv.y * 32.0)) % 2.0;
+    col = mix(vec3<f32>(0.22, 0.22, 0.24), vec3<f32>(0.82, 0.80, 0.76), ck) * mix(1.0, lit, 0.5);
+  } else if (mode == 3u) {
+    let d = clamp((in.depth - u.depthLo) / max(1e-6, u.depthHi - u.depthLo), 0.0, 1.0);
+    col = vec3<f32>(1.0 - d) * vec3<f32>(0.92, 0.9, 0.86);
+  } else if (mode == 4u) { col = albedo; }   // points: unlit, the texture verbatim
+  let fxo = fxApply(in.world, n, col);
+  if (fxo.a < 0.5) { discard; }
+  return vec4<f32>(fxo.rgb, 1.0);
+}
+`;
+
+/**
+ * Gaussian splat pipeline (spec §6.8): one instanced quad per splat, ordered back-to-front by the
+ * CPU sorter (splat-sort.ts) through the `order` indirection. The vertex stage dequantizes the
+ * centre exactly like the mesh path, rebuilds the 3D covariance R·S·Sᵀ·Rᵀ from the packed scale +
+ * quaternion (splat.ts), projects it to a screen-space 2×2 covariance through the view rotation
+ * and the projection Jacobian (EWA splatting, Zwicker 2001 / 3DGS), and stretches the quad along
+ * the ellipse's eigenvectors to 3σ. The fragment stage evaluates the Gaussian and composites
+ * premultiplied "over". Colour is the base 8-bit colour plus the optional SH bands evaluated in
+ * the direction from the camera (model space, so SH survive the model transform).
+ */
+const SPLAT_WGSL = /* wgsl */ `
+struct SU {
+  view     : mat4x4<f32>,      // view * model
+  proj     : mat4x4<f32>,
+  aabbMin  : vec3<f32>, invLevels : f32,
+  aabbSize : vec3<f32>, shDegree  : f32,
+  viewport : vec2<f32>, focal     : vec2<f32>,   // pixels
+  camPos   : vec3<f32>, ortho     : f32,         // camera position in model space
+  cropMin  : vec3<f32>, cropOn    : f32,
+  cropMax  : vec3<f32>, scaleMul  : f32,
+  opacityMul : f32, texMix : f32, pad0 : f32, pad1 : f32,
+};
+@group(0) @binding(0) var<uniform> u : SU;
+@group(0) @binding(1) var<storage, read> qpos  : array<u32>;  // 2 u32 / splat (u16 x,y,z,pad)
+@group(0) @binding(2) var<storage, read> attr  : array<u32>;  // 3 u32 / splat (splat.ts)
+@group(0) @binding(3) var<storage, read> order : array<u32>;  // back-to-front splat ids
+@group(0) @binding(4) var<storage, read> sh    : array<u32>;  // shStride/4 u32 per splat (degree >= 1)
+@group(0) @binding(5) var<uniform> fx : array<vec4<f32>, 8>;   // playback effects (fx.ts)
+
+struct VO {
+  @builtin(position) clip : vec4<f32>,
+  @location(0) local : vec2<f32>,
+  @location(1) color : vec4<f32>,
+  @location(2) world : vec3<f32>,
+};
+
+// ---- playback effects (fx.ts packFx layout: 8 × vec4) ----
+fn fxHash(p : vec3<f32>) -> f32 { return fract(sin(dot(p, vec3<f32>(12.9898, 78.233, 37.719))) * 43758.5453); }
+fn fxNoise(p : vec3<f32>) -> f32 {
+  let i = floor(p); let f = fract(p); let u = f * f * (3.0 - 2.0 * f);
+  let a = mix(mix(fxHash(i), fxHash(i + vec3<f32>(1.0, 0.0, 0.0)), u.x), mix(fxHash(i + vec3<f32>(0.0, 1.0, 0.0)), fxHash(i + vec3<f32>(1.0, 1.0, 0.0)), u.x), u.y);
+  let b = mix(mix(fxHash(i + vec3<f32>(0.0, 0.0, 1.0)), fxHash(i + vec3<f32>(1.0, 0.0, 1.0)), u.x), mix(fxHash(i + vec3<f32>(0.0, 1.0, 1.0)), fxHash(i + vec3<f32>(1.0, 1.0, 1.0)), u.x), u.y);
+  return mix(a, b, u.z);
+}
+fn fxWobble(p : vec3<f32>) -> vec3<f32> {
+  let amp = fx[4].w;
+  if (amp <= 0.0) { return p; }
+  let f = fx[5].x; let t = fx[5].y;
+  return p + amp * vec3<f32>(sin(p.y * f + t * 3.0), sin(p.z * f * 1.3 + t * 2.2), sin(p.x * f * 0.7 + t * 2.7));
+}
+// Colour-side effects; alpha 0 = discard. n is a unit normal (meshes) or zero (no rim).
+fn fxApply(world : vec3<f32>, n : vec3<f32>, colIn : vec3<f32>) -> vec4<f32> {
+  var col = colIn;
+  if (fx[1].x > 0.5 && dot(world, fx[0].xyz) + fx[0].w < 0.0) { return vec4<f32>(col, 0.0); }
+  let d = fx[1].y;
+  if (d > 0.0) {
+    let nz = fxNoise(world * fx[1].z);
+    if (nz < d) { return vec4<f32>(col, 0.0); }
+    col = mix(fx[4].xyz, col, smoothstep(d, d + 0.08, nz));
+  }
+  if (fx[1].w > 0.0) { col = col * (1.0 - fx[1].w * 0.5 * (0.5 + 0.5 * sin(world.y * fx[5].z + fx[5].y * 4.0))); }
+  if (fx[3].w > 0.0 && dot(n, n) > 0.5) { let v = normalize(fx[6].xyz - world); let fr = pow(1.0 - abs(dot(n, v)), 3.0); col = col + fx[3].xyz * fx[3].w * fr; }
+  if (fx[2].w > 0.0) { col = mix(col, col * fx[2].xyz, fx[2].w); }
+  return vec4<f32>(col, 1.0);
+}
+
+const SH_C1 : f32 = 0.4886025119029199;
+const SH_C2 = array<f32, 5>(1.0925484305920792, -1.0925484305920792, 0.31539156525252005, -1.0925484305920792, 0.5462742152960396);
+const SH_C3 = array<f32, 7>(-0.5900435899266435, 2.890611442640554, -0.4570457994644658, 0.3731763325901154, -0.4570457994644658, 1.445305721320277, -0.5900435899266435);
+
+fn shByte(base : u32, idx : u32) -> f32 {
+  let w = sh[base + (idx >> 2u)];
+  return (f32((w >> ((idx & 3u) * 8u)) & 0xffu) - 128.0) / 128.0;
+}
+fn shCoef(base : u32, k : u32) -> vec3<f32> {
+  return vec3<f32>(shByte(base, k * 3u), shByte(base, k * 3u + 1u), shByte(base, k * 3u + 2u));
+}
+// Higher-order SH (3DGS ordering); stride = u32 words per splat.
+fn evalSH(id : u32, stride : u32, d : vec3<f32>, degree : u32) -> vec3<f32> {
+  let base = id * stride;
+  let x = d.x; let y = d.y; let z = d.z;
+  var c = -SH_C1 * y * shCoef(base, 0u) + SH_C1 * z * shCoef(base, 1u) - SH_C1 * x * shCoef(base, 2u);
+  if (degree >= 2u) {
+    let xx = x * x; let yy = y * y; let zz = z * z; let xy = x * y; let yz = y * z; let xz = x * z;
+    c = c + SH_C2[0] * xy * shCoef(base, 3u) + SH_C2[1] * yz * shCoef(base, 4u)
+          + SH_C2[2] * (2.0 * zz - xx - yy) * shCoef(base, 5u)
+          + SH_C2[3] * xz * shCoef(base, 6u) + SH_C2[4] * (xx - yy) * shCoef(base, 7u);
+    if (degree >= 3u) {
+      c = c + SH_C3[0] * y * (3.0 * xx - yy) * shCoef(base, 8u)
+            + SH_C3[1] * xy * z * shCoef(base, 9u)
+            + SH_C3[2] * y * (4.0 * zz - xx - yy) * shCoef(base, 10u)
+            + SH_C3[3] * z * (2.0 * zz - 3.0 * xx - 3.0 * yy) * shCoef(base, 11u)
+            + SH_C3[4] * x * (4.0 * zz - xx - yy) * shCoef(base, 12u)
+            + SH_C3[5] * z * (xx - yy) * shCoef(base, 13u)
+            + SH_C3[6] * x * (xx - 3.0 * yy) * shCoef(base, 14u);
+    }
+  }
+  return c;
+}
+
+// SPZ v3 "smallest three" (splat.ts packQuaternion) -> unit quaternion (x, y, z, w).
+fn unpackQuat(c : u32) -> vec4<f32> {
+  let iL = c >> 30u;
+  let m0 = f32((c >> 20u) & 0x1ffu) / 511.0 * 0.70710678118;
+  let m1 = f32((c >> 10u) & 0x1ffu) / 511.0 * 0.70710678118;
+  let m2 = f32(c & 0x1ffu) / 511.0 * 0.70710678118;
+  let v0 = select(m0, -m0, ((c >> 29u) & 1u) == 1u);
+  let v1 = select(m1, -m1, ((c >> 19u) & 1u) == 1u);
+  let v2 = select(m2, -m2, ((c >> 9u) & 1u) == 1u);
+  let big = sqrt(max(0.0, 1.0 - v0 * v0 - v1 * v1 - v2 * v2));
+  if (iL == 0u) { return vec4<f32>(big, v0, v1, v2); }
+  if (iL == 1u) { return vec4<f32>(v0, big, v1, v2); }
+  if (iL == 2u) { return vec4<f32>(v0, v1, big, v2); }
+  return vec4<f32>(v0, v1, v2, big);
+}
+fn quatToMat(q : vec4<f32>) -> mat3x3<f32> {
+  let x = q.x; let y = q.y; let z = q.z; let w = q.w;
+  return mat3x3<f32>(
+    1.0 - 2.0 * (y * y + z * z), 2.0 * (x * y + w * z),       2.0 * (x * z - w * y),
+    2.0 * (x * y - w * z),       1.0 - 2.0 * (x * x + z * z), 2.0 * (y * z + w * x),
+    2.0 * (x * z + w * y),       2.0 * (y * z - w * x),       1.0 - 2.0 * (x * x + y * y));
+}
+
+@vertex fn vs(@builtin(vertex_index) vi : u32, @builtin(instance_index) ii : u32) -> VO {
+  var o : VO;
+  o.clip = vec4<f32>(0.0, 0.0, 2.0, 1.0);   // default: outside the clip volume
+  o.local = vec2<f32>(0.0, 0.0);
+  o.color = vec4<f32>(0.0, 0.0, 0.0, 0.0);
+  o.world = vec3<f32>(0.0, 0.0, 0.0);
+  let id = order[ii];
+  let a = qpos[id * 2u];
+  let b = qpos[id * 2u + 1u];
+  let q = vec3<f32>(f32(a & 0xffffu), f32((a >> 16u) & 0xffffu), f32(b & 0xffffu));
+  var pos = fxWobble(u.aabbMin + (q * u.invLevels) * u.aabbSize);      // model space (+ wobble fx)
+  if (fx[5].w > 0.0) {                                                   // per-splat jitter (holo-glitch)
+    let hid = f32(id) * 0.001; let t = floor(fx[5].y * 12.0);
+    pos = pos + (vec3<f32>(fxHash(vec3<f32>(hid, 1.0, t)), fxHash(vec3<f32>(hid, 2.0, t)), fxHash(vec3<f32>(hid, 3.0, t))) - vec3<f32>(0.5, 0.5, 0.5)) * 2.0 * fx[5].w;
+  }
+  o.world = pos;
+  if (u.cropOn > 0.5 && (any(pos < u.cropMin) || any(pos > u.cropMax))) { return o; }
+  if (fx[1].x > 0.5 && dot(pos, fx[0].xyz) + fx[0].w < 0.0) { return o; }
+  var edgeMix = 0.0;
+  if (fx[1].y > 0.0) { let nz = fxNoise(pos * fx[1].z); if (nz < fx[1].y) { return o; } edgeMix = 1.0 - smoothstep(fx[1].y, fx[1].y + 0.08, nz); }
+  let cam = u.view * vec4<f32>(pos, 1.0);
+  let clip = u.proj * cam;
+  if (u.ortho < 0.5 && clip.w <= 1e-6) { return o; }
+  let ndc = clip.xyz / clip.w;
+  if (any(abs(ndc.xy) > vec2<f32>(1.5, 1.5)) || ndc.z < 0.0 || ndc.z > 1.0) { return o; }
+
+  let w0 = attr[id * 3u];
+  let w1 = attr[id * 3u + 1u];
+  let w2 = attr[id * 3u + 2u];
+  let s = exp(vec3<f32>(f32(w0 & 0xffu), f32((w0 >> 8u) & 0xffu), f32((w0 >> 16u) & 0xffu)) / 16.0 - 10.0) * u.scaleMul * fx[6].w;
+  let alpha = f32(w0 >> 24u) / 255.0 * u.opacityMul * fx[7].x;
+  let R = quatToMat(unpackQuat(w1));
+  let M = R * mat3x3<f32>(s.x, 0.0, 0.0, 0.0, s.y, 0.0, 0.0, 0.0, s.z);
+  let cov3 = M * transpose(M);
+  let W = mat3x3<f32>(u.view[0].xyz, u.view[1].xyz, u.view[2].xyz);
+  var J : mat3x3<f32>;
+  if (u.ortho > 0.5) {
+    J = mat3x3<f32>(u.focal.x, 0.0, 0.0,  0.0, u.focal.y, 0.0,  0.0, 0.0, 0.0);
+  } else {
+    let z = cam.z;
+    let lim = 1.3 * 0.5 * u.viewport / u.focal;
+    let tx = clamp(cam.x / z, -lim.x, lim.x) * z;
+    let ty = clamp(cam.y / z, -lim.y, lim.y) * z;
+    J = mat3x3<f32>(u.focal.x / z, 0.0, 0.0,  0.0, u.focal.y / z, 0.0,  -u.focal.x * tx / (z * z), -u.focal.y * ty / (z * z), 0.0);
+  }
+  let T = J * W;
+  let cov2 = T * cov3 * transpose(T);
+  let cxx = cov2[0][0] + 0.3;
+  let cyy = cov2[1][1] + 0.3;
+  let cxy = cov2[0][1];
+  let mid = 0.5 * (cxx + cyy);
+  let rad = sqrt(max(0.0, mid * mid - (cxx * cyy - cxy * cxy)));
+  let l1 = mid + rad;
+  let l2 = max(mid - rad, 0.1);
+  let r1 = 3.0 * sqrt(l1);
+  let r2 = 3.0 * sqrt(l2);
+  var v1 : vec2<f32>;
+  if (abs(cxy) < 1e-6) { v1 = select(vec2<f32>(0.0, 1.0), vec2<f32>(1.0, 0.0), cxx >= cyy); }
+  else { v1 = normalize(vec2<f32>(cxy, l1 - cxx)); }
+  let v2 = vec2<f32>(-v1.y, v1.x);
+  let corner = vec2<f32>(f32((vi & 1u) * 2u) - 1.0, f32((vi >> 1u) * 2u) - 1.0);
+  let offsetPx = corner.x * r1 * v1 + corner.y * r2 * v2;
+  let ndcOff = offsetPx * 2.0 / u.viewport;
+  o.clip = vec4<f32>((ndc.xy + ndcOff) * clip.w, ndc.z * clip.w, clip.w);
+  o.local = corner * 3.0;
+  var col = vec3<f32>(f32(w2 & 0xffu), f32((w2 >> 8u) & 0xffu), f32((w2 >> 16u) & 0xffu)) / 255.0;
+  let degree = u32(u.shDegree + 0.5);
+  if (degree > 0u) {
+    let stride = select(select(12u, 6u, degree == 2u), 3u, degree == 1u);
+    col = col + evalSH(id, stride, normalize(pos - u.camPos), degree);
+  }
+  col = clamp(col, vec3<f32>(0.0, 0.0, 0.0), vec3<f32>(1.0, 1.0, 1.0));
+  col = mix(vec3<f32>(0.72, 0.71, 0.68), col, u.texMix);
+  col = mix(col, fx[4].xyz, edgeMix);                                   // dissolve rim
+  if (fx[2].w > 0.0) { col = mix(col, col * fx[2].xyz, fx[2].w); }     // tint
+  o.color = vec4<f32>(col, alpha);
+  return o;
+}
+
+@fragment fn fs(in : VO) -> @location(0) vec4<f32> {
+  let d2 = dot(in.local, in.local);
+  if (d2 > 9.0) { discard; }
+  let a = in.color.a * exp(-0.5 * d2);
+  if (a < 1.0 / 255.0) { discard; }
+  var col = in.color.rgb;
+  if (fx[1].w > 0.0) { col = col * (1.0 - fx[1].w * 0.5 * (0.5 + 0.5 * sin(in.world.y * fx[5].z + fx[5].y * 4.0))); }
+  return vec4<f32>(col * a, a);
 }
 `;
 
@@ -211,12 +490,18 @@ export class WebGPURenderer {
   private texH = 0;
   private depth: GPUTexture | null = null;
   private slot = 0;
-  private uni = new Float32Array(32);
+  private uni = new Float32Array(40);
   private normalEncoding = 0;
+  private shadeMode = 0;
+  private pointSize = 2;
+  private depthRange: [number, number] = [0, 1];
+  private vertexCount = 0;
+  private pointsPipeline: GPURenderPipeline | null = null;
   private crop: { min: [number, number, number]; max: [number, number, number] } | null = null;
   // Wireframe (mesh editor): triangles expanded to a line-list (3 edges/tri) + a line-topology pipeline.
   private wireframe = false;
   private texMix = 1;          // viewport shading: 1 = textured, 0 = untextured clay
+  private litMix = 1;          // 1 = lit (lambert), 0 = unlit (albedo verbatim)
   private linePipeline: GPURenderPipeline | null = null;
   private lineIdxBuf: GPUBuffer | null = null;
   private lineIdxCap = 0;
@@ -238,12 +523,26 @@ export class WebGPURenderer {
   private tripodVbuf: GPUBuffer | null = null;
   private tripodCount = 0;
   private tripodBind: GPUBindGroup | null = null;
+  // Gaussian splat profile (spec §6.8): separate storage buffers + pipeline, see SPLAT_WGSL.
+  private splatPipeline: GPURenderPipeline | null = null;
+  private splatUni: GPUBuffer | null = null;
+  private splatUniData = new Float32Array(64);
+  private sposBuf: GPUBuffer | null = null; private sposCap = 0;
+  private sattrBuf: GPUBuffer | null = null; private sattrCap = 0;
+  private sshBuf: GPUBuffer | null = null; private sshCap = 0;
+  private sorderBuf: GPUBuffer | null = null; private sorderCap = 0;
+  private splatCount = 0;
+  private splatShDegree = 0;
+  private splatParams: SplatParams = { scaleMul: 1, opacityMul: 1 };
+  // Playback effects (fx.ts): one 128-byte uniform block shared by the mesh and splat pipelines.
+  private fxUni: GPUBuffer | null = null;
+  private fxData = new Float32Array(32);
 
   private constructor(public readonly device: GPUDevice, canvas: HTMLCanvasElement | OffscreenCanvas) {
     this.ctx = canvas.getContext("webgpu") as unknown as GPUCanvasContext;
     this.format = navigator.gpu.getPreferredCanvasFormat();
     this.ctx.configure({ device, format: this.format, alphaMode: "opaque" });
-    this.uniform = device.createBuffer({ size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.uniform = device.createBuffer({ size: 160, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.sampler = device.createSampler({ magFilter: "linear", minFilter: "linear", mipmapFilter: "linear", addressModeU: "repeat", addressModeV: "repeat" });
     this.buildPipeline();
     // 1x1 white placeholder so the first render works even before the atlas loads.
@@ -275,6 +574,18 @@ export class WebGPURenderer {
       depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
     });
     this.linePipeline = null; // rebuilt lazily against the new module/encoding
+    this.pointsPipeline = null;
+  }
+
+  private buildPointsPipeline(): GPURenderPipeline {
+    const module = this.device.createShaderModule({ code: WGSL(this.normalEncoding) });
+    return this.device.createRenderPipeline({
+      layout: "auto",
+      vertex: { module, entryPoint: "vs_points" },
+      fragment: { module, entryPoint: "fs", targets: [{ format: this.format }] },
+      primitive: { topology: "triangle-strip", cullMode: "none" },
+      depthStencil: { format: "depth24plus", depthWriteEnabled: true, depthCompare: "less" },
+    });
   }
 
   private buildLinePipeline(): GPURenderPipeline {
@@ -296,6 +607,12 @@ export class WebGPURenderer {
 
   /** Viewport shading: textured (default) vs untextured clay. Judge FORM without the atlas. */
   setTextured(on: boolean): void { this.texMix = on ? 1 : 0; }
+  setShadeMode(mode: number): void { this.shadeMode = mode | 0; }
+  setPointSize(px: number): void { this.pointSize = Math.max(1, px); }
+  setDepthRange(lo: number, hi: number): void { this.depthRange = [lo, hi]; }
+  /** Lit (lambert) vs unlit (albedo verbatim) — unlit is the honest display for video-textured
+   *  captures whose footage already carries the scene's real lighting. */
+  setLit(on: boolean): void { this.litMix = on ? 1 : 0; }
 
   /** Infinite ground grid + origin tripod overlay; builds the tripod's vertex buffer lazily. */
   setGrid(on: boolean): void {
@@ -398,6 +715,7 @@ export class WebGPURenderer {
       buf = this.posBufs[this.slot]!;
     }
     this.device.queue.writeBuffer(buf, 0, positionsQ.buffer as ArrayBuffer, positionsQ.byteOffset, positionsQ.byteLength);
+    this.vertexCount = positionsQ.length >> 2;
   }
 
   setTextureFromBitmap(bitmap: ImageBitmap): void {
@@ -435,16 +753,20 @@ export class WebGPURenderer {
     this.uni[16] = aabb.min[0]; this.uni[17] = aabb.min[1]; this.uni[18] = aabb.min[2];
     this.uni[19] = invLevels;
     this.uni[20] = aabb.max[0] - aabb.min[0]; this.uni[21] = aabb.max[1] - aabb.min[1]; this.uni[22] = aabb.max[2] - aabb.min[2];
+    this.uni[23] = this.litMix;
     const c = this.crop;
     this.uni[24] = c ? c.min[0] : 0; this.uni[25] = c ? c.min[1] : 0; this.uni[26] = c ? c.min[2] : 0;
     this.uni[27] = c ? 1 : 0;
     this.uni[28] = c ? c.max[0] : 0; this.uni[29] = c ? c.max[1] : 0; this.uni[30] = c ? c.max[2] : 0;
     this.uni[31] = this.texMix;
+    this.uni[32] = this.shadeMode; this.uni[33] = this.pointSize; this.uni[34] = this.depthRange[0]; this.uni[35] = this.depthRange[1];
+    this.uni[36] = this.depth ? this.depth.width : 1; this.uni[37] = this.depth ? this.depth.height : 1; this.uni[38] = 0; this.uni[39] = 0;
     this.device.queue.writeBuffer(this.uniform, 0, this.uni);
 
     // Pick the pipeline FIRST — with layout:"auto" the bind group must come from the active pipeline.
-    const wire = this.wireframe && this.lineIdxBuf && this.lineIndexCount > 0;
-    const activePipeline = wire ? (this.linePipeline ??= this.buildLinePipeline()) : this.pipeline;
+    const points = this.shadeMode === 4 && this.vertexCount > 0;
+    const wire = !points && this.wireframe && this.lineIdxBuf && this.lineIndexCount > 0;
+    const activePipeline = points ? (this.pointsPipeline ??= this.buildPointsPipeline()) : wire ? (this.linePipeline ??= this.buildLinePipeline()) : this.pipeline;
     const bindGroup = this.device.createBindGroup({
       layout: activePipeline.getBindGroupLayout(0),
       entries: [
@@ -454,6 +776,7 @@ export class WebGPURenderer {
         { binding: 3, resource: this.sampler },
         { binding: 4, resource: this.texView },
         { binding: 5, resource: { buffer: this.nrmBuf } },
+        { binding: 6, resource: { buffer: this.fxBuffer() } },
       ],
     });
 
@@ -471,70 +794,191 @@ export class WebGPURenderer {
     });
     pass.setPipeline(activePipeline);
     pass.setBindGroup(0, bindGroup);
-    pass.setIndexBuffer(wire ? this.lineIdxBuf! : this.idxBuf, "uint32");
-    pass.drawIndexed(wire ? this.lineIndexCount : indexCount);
+    if (points) {
+      pass.draw(4, this.vertexCount);
+    } else {
+      pass.setIndexBuffer(wire ? this.lineIdxBuf! : this.idxBuf, "uint32");
+      pass.drawIndexed(wire ? this.lineIndexCount : indexCount);
+    }
     // Overlay (after the mesh; depth write off so it never occludes, but the mesh occludes it).
-    if (this.gridOn) {
-      // Infinite grid: a fullscreen triangle, alpha-blended, writing its own frag_depth.
-      const inv = invert(viewProj);
-      if (inv) {
-        if (!this.gridPipeline) {
-          const gm = this.device.createShaderModule({ code: GRID_WGSL });
-          this.gridPipeline = this.device.createRenderPipeline({
-            layout: "auto",
-            vertex: { module: gm, entryPoint: "vs" },
-            fragment: {
-              module: gm, entryPoint: "fs",
-              targets: [{
-                format: this.format,
-                blend: {
-                  color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
-                  alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
-                },
-              }],
-            },
-            primitive: { topology: "triangle-list" },
-            depthStencil: { format: "depth24plus", depthWriteEnabled: false, depthCompare: "less" },
-          });
-          this.gridBind = null;
-        }
-        this.gridUni ??= this.device.createBuffer({ size: 160, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
-        const gp = this.gridParams;
-        this.gridData.set(inv, 0);
-        this.gridData.set(viewProj, 16);
-        this.gridData[32] = gp.step0; this.gridData[33] = gp.step1; this.gridData[34] = gp.fineFade; this.gridData[35] = gp.floorY;
-        this.gridData[36] = gp.centerX; this.gridData[37] = gp.centerZ; this.gridData[38] = gp.fadeRadius; this.gridData[39] = 0;
-        this.device.queue.writeBuffer(this.gridUni, 0, this.gridData);
-        this.gridBind ??= this.device.createBindGroup({ layout: this.gridPipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: this.gridUni } }] });
-        pass.setPipeline(this.gridPipeline);
-        pass.setBindGroup(0, this.gridBind);
-        pass.draw(3);
-      }
-      // Origin tripod (real lines — a 3D marker the flat grid can't express).
-      if (this.tripodVbuf && this.tripodCount > 0) {
-        if (!this.tripodPipeline) {
-          const tm = this.device.createShaderModule({ code: LINES_WGSL });
-          this.tripodPipeline = this.device.createRenderPipeline({
-            layout: "auto",
-            vertex: { module: tm, entryPoint: "vs", buffers: [{ arrayStride: 24, attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }, { shaderLocation: 1, offset: 12, format: "float32x3" }] }] },
-            fragment: { module: tm, entryPoint: "fs", targets: [{ format: this.format }] },
-            primitive: { topology: "line-list" },
-            depthStencil: { format: "depth24plus", depthWriteEnabled: false, depthCompare: "less" },
-          });
-          this.tripodBind = null;
-        }
-        this.tripodBind ??= this.device.createBindGroup({ layout: this.tripodPipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: this.uniform } }] });
-        pass.setPipeline(this.tripodPipeline);
-        pass.setBindGroup(0, this.tripodBind);
-        pass.setVertexBuffer(0, this.tripodVbuf);
-        pass.draw(this.tripodCount);
-      }
+    this.drawOverlay(pass, viewProj);
+    pass.end();
+    this.device.queue.submit([encoder.finish()]);
+  }
+
+  // ---- Gaussian splat profile ---------------------------------------------------------------
+
+  /** Upload one decoded splat frame (positions, packed attributes, optional SH) — every frame. */
+  uploadSplats(f: DecodedSplat): void {
+    [this.sposBuf, this.sposCap] = this.growStorage(this.sposBuf, this.sposCap, Math.max(16, f.positionsQ.byteLength));
+    this.device.queue.writeBuffer(this.sposBuf, 0, f.positionsQ.buffer as ArrayBuffer, f.positionsQ.byteOffset, f.positionsQ.byteLength);
+    [this.sattrBuf, this.sattrCap] = this.growStorage(this.sattrBuf, this.sattrCap, Math.max(16, f.attrs.byteLength));
+    this.device.queue.writeBuffer(this.sattrBuf, 0, f.attrs.buffer as ArrayBuffer, f.attrs.byteOffset, f.attrs.byteLength);
+    const shBytes = f.sh && f.shDegree > 0 ? f.sh : null;
+    [this.sshBuf, this.sshCap] = this.growStorage(this.sshBuf, this.sshCap, Math.max(16, shBytes?.byteLength ?? 0));
+    if (shBytes) this.device.queue.writeBuffer(this.sshBuf, 0, shBytes.buffer as ArrayBuffer, shBytes.byteOffset, shBytes.byteLength);
+    this.splatCount = f.count;
+    this.splatShDegree = shBytes ? f.shDegree : 0;
+    if (!this.sorderBuf || this.sorderCap < f.count * 4) {
+      // Identity order until the sorter delivers one, so a frame never draws with a stale/short list.
+      const id = new Uint32Array(f.count);
+      for (let i = 0; i < f.count; i++) id[i] = i;
+      this.setSplatOrder(id);
+    }
+  }
+
+  /** Back-to-front splat ids from the sorter (splat-sort.ts). */
+  setSplatOrder(order: Uint32Array): void {
+    [this.sorderBuf, this.sorderCap] = this.growStorage(this.sorderBuf, this.sorderCap, Math.max(16, order.byteLength));
+    this.device.queue.writeBuffer(this.sorderBuf, 0, order.buffer as ArrayBuffer, order.byteOffset, order.byteLength);
+  }
+
+  setSplatParams(p: Partial<SplatParams>): void { this.splatParams = { ...this.splatParams, ...p }; }
+
+  /** Packed effects block (fx.ts packFx). Uploaded before each pass. */
+  setFx(data: Float32Array): void { this.fxData.set(data.subarray(0, 32)); }
+  private fxBuffer(): GPUBuffer {
+    this.fxUni ??= this.device.createBuffer({ size: 128, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(this.fxUni, 0, this.fxData);
+    return this.fxUni;
+  }
+
+  private buildSplatPipeline(): GPURenderPipeline {
+    const module = this.device.createShaderModule({ code: SPLAT_WGSL });
+    return this.device.createRenderPipeline({
+      layout: "auto",
+      vertex: { module, entryPoint: "vs" },
+      fragment: {
+        module, entryPoint: "fs",
+        targets: [{
+          format: this.format,
+          blend: {   // premultiplied "over", drawn back-to-front
+            color: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+            alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+          },
+        }],
+      },
+      primitive: { topology: "triangle-strip", cullMode: "none" },
+      depthStencil: { format: "depth24plus", depthWriteEnabled: false, depthCompare: "less" },
+    });
+  }
+
+  /**
+   * Draw the current splat frame. The overlay (grid, tripod) goes FIRST here: splats write no depth,
+   * so drawing them last lets an opaque-looking cloud cover the floor grid instead of the grid
+   * being painted over it.
+   */
+  renderSplats(cam: SplatCamera, aabb: Aabb, invLevels: number, count: number): void {
+    if (!this.depth) return;
+    const n = Math.min(count, this.splatCount);
+    const modelView = this.model ? multiply(cam.view, this.model) : cam.view;
+    const viewProjWorld = multiply(cam.proj, cam.view);
+    // Camera position in MODEL space: inverse(view*model) · origin.
+    const inv = invert(modelView);
+    const camPos: [number, number, number] = inv ? [inv[12]!, inv[13]!, inv[14]!] : [0, 0, 0];
+    const d = this.splatUniData;
+    d.set(modelView, 0); d.set(cam.proj, 16);
+    d[32] = aabb.min[0]; d[33] = aabb.min[1]; d[34] = aabb.min[2]; d[35] = invLevels;
+    d[36] = aabb.max[0] - aabb.min[0]; d[37] = aabb.max[1] - aabb.min[1]; d[38] = aabb.max[2] - aabb.min[2]; d[39] = this.splatShDegree;
+    d[40] = cam.width; d[41] = cam.height;
+    d[42] = cam.proj[0]! * cam.width / 2; d[43] = cam.proj[5]! * cam.height / 2;
+    d[44] = camPos[0]; d[45] = camPos[1]; d[46] = camPos[2]; d[47] = cam.ortho ? 1 : 0;
+    const c = this.crop;
+    d[48] = c ? c.min[0] : 0; d[49] = c ? c.min[1] : 0; d[50] = c ? c.min[2] : 0; d[51] = c ? 1 : 0;
+    d[52] = c ? c.max[0] : 0; d[53] = c ? c.max[1] : 0; d[54] = c ? c.max[2] : 0; d[55] = this.splatParams.scaleMul;
+    d[56] = this.splatParams.opacityMul; d[57] = this.texMix; d[58] = 0; d[59] = 0;
+    this.splatUni ??= this.device.createBuffer({ size: 256, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.device.queue.writeBuffer(this.splatUni, 0, d);
+    // The overlay's tripod reads viewProj from the mesh uniform's first 64 bytes.
+    this.uni.set(viewProjWorld, 0);
+    this.device.queue.writeBuffer(this.uniform, 0, this.uni);
+
+    const encoder = this.device.createCommandEncoder();
+    const pass = encoder.beginRenderPass({
+      colorAttachments: [{ view: this.ctx.getCurrentTexture().createView(), clearValue: { r: 0.05, g: 0.055, b: 0.07, a: 1 }, loadOp: "clear", storeOp: "store" }],
+      depthStencilAttachment: { view: this.depth.createView(), depthClearValue: 1.0, depthLoadOp: "clear", depthStoreOp: "store" },
+    });
+    this.drawOverlay(pass, viewProjWorld);
+    if (n > 0 && this.sposBuf && this.sattrBuf && this.sshBuf && this.sorderBuf) {
+      this.splatPipeline ??= this.buildSplatPipeline();
+      const bind = this.device.createBindGroup({
+        layout: this.splatPipeline.getBindGroupLayout(0),
+        entries: [
+          { binding: 0, resource: { buffer: this.splatUni } },
+          { binding: 1, resource: { buffer: this.sposBuf } },
+          { binding: 2, resource: { buffer: this.sattrBuf } },
+          { binding: 3, resource: { buffer: this.sorderBuf } },
+          { binding: 4, resource: { buffer: this.sshBuf } },
+          { binding: 5, resource: { buffer: this.fxBuffer() } },
+        ],
+      });
+      pass.setPipeline(this.splatPipeline);
+      pass.setBindGroup(0, bind);
+      pass.draw(4, n);
     }
     pass.end();
     this.device.queue.submit([encoder.finish()]);
   }
 
+  /** Infinite grid + origin tripod (shared by the mesh and splat passes). Depth write off. */
+  private drawOverlay(pass: GPURenderPassEncoder, viewProj: Float32Array): void {
+    if (!this.gridOn) return;
+    const inv = invert(viewProj);
+    if (inv) {
+      if (!this.gridPipeline) {
+        const gm = this.device.createShaderModule({ code: GRID_WGSL });
+        this.gridPipeline = this.device.createRenderPipeline({
+          layout: "auto",
+          vertex: { module: gm, entryPoint: "vs" },
+          fragment: {
+            module: gm, entryPoint: "fs",
+            targets: [{
+              format: this.format,
+              blend: {
+                color: { srcFactor: "src-alpha", dstFactor: "one-minus-src-alpha", operation: "add" },
+                alpha: { srcFactor: "one", dstFactor: "one-minus-src-alpha", operation: "add" },
+              },
+            }],
+          },
+          primitive: { topology: "triangle-list" },
+          depthStencil: { format: "depth24plus", depthWriteEnabled: false, depthCompare: "less" },
+        });
+        this.gridBind = null;
+      }
+      this.gridUni ??= this.device.createBuffer({ size: 160, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+      const gp = this.gridParams;
+      this.gridData.set(inv, 0);
+      this.gridData.set(viewProj, 16);
+      this.gridData[32] = gp.step0; this.gridData[33] = gp.step1; this.gridData[34] = gp.fineFade; this.gridData[35] = gp.floorY;
+      this.gridData[36] = gp.centerX; this.gridData[37] = gp.centerZ; this.gridData[38] = gp.fadeRadius; this.gridData[39] = 0;
+      this.device.queue.writeBuffer(this.gridUni, 0, this.gridData);
+      this.gridBind ??= this.device.createBindGroup({ layout: this.gridPipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: this.gridUni } }] });
+      pass.setPipeline(this.gridPipeline);
+      pass.setBindGroup(0, this.gridBind);
+      pass.draw(3);
+    }
+    if (this.tripodVbuf && this.tripodCount > 0) {
+      if (!this.tripodPipeline) {
+        const tm = this.device.createShaderModule({ code: LINES_WGSL });
+        this.tripodPipeline = this.device.createRenderPipeline({
+          layout: "auto",
+          vertex: { module: tm, entryPoint: "vs", buffers: [{ arrayStride: 24, attributes: [{ shaderLocation: 0, offset: 0, format: "float32x3" }, { shaderLocation: 1, offset: 12, format: "float32x3" }] }] },
+          fragment: { module: tm, entryPoint: "fs", targets: [{ format: this.format }] },
+          primitive: { topology: "line-list" },
+          depthStencil: { format: "depth24plus", depthWriteEnabled: false, depthCompare: "less" },
+        });
+        this.tripodBind = null;
+      }
+      this.tripodBind ??= this.device.createBindGroup({ layout: this.tripodPipeline.getBindGroupLayout(0), entries: [{ binding: 0, resource: { buffer: this.uniform } }] });
+      pass.setPipeline(this.tripodPipeline);
+      pass.setBindGroup(0, this.tripodBind);
+      pass.setVertexBuffer(0, this.tripodVbuf);
+      pass.draw(this.tripodCount);
+    }
+  }
+
   dispose(): void {
+    this.sposBuf?.destroy(); this.sattrBuf?.destroy(); this.sshBuf?.destroy(); this.sorderBuf?.destroy(); this.splatUni?.destroy(); this.fxUni?.destroy();
     this.posBufs.forEach((b) => b?.destroy());
     this.uvBuf?.destroy();
     this.nrmBuf?.destroy();

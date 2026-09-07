@@ -1,19 +1,49 @@
 {
   "name": "@ares/three",
+  "description": "ARES Volumetric for Three.js: AresObject wrapper around AresPlayer",
   "license": "MIT",
-  "private": true,
-  "version": "0.0.0",
+  "version": "0.1.0",
   "type": "module",
+  "engines": {
+    "node": ">=22.15"
+  },
+  "repository": {
+    "type": "git",
+    "url": "git+https://github.com/gantasmo/ares.git"
+  },
+  "publishConfig": {
+    "access": "public"
+  },
+  "sideEffects": false,
+  "files": [
+    "dist",
+    "!dist/**/*.tsbuildinfo",
+    "README.md"
+  ],
+  "keywords": [
+    "volumetric",
+    "three",
+    "threejs",
+    "gaussian-splatting"
+  ],
   "main": "./dist/index.js",
   "types": "./dist/index.d.ts",
+  "exports": {
+    ".": {
+      "types": "./dist/index.d.ts",
+      "import": "./dist/index.js",
+      "default": "./dist/index.js"
+    }
+  },
   "scripts": {
-    "build": "tsc -b"
+    "build": "tsc -b",
+    "prepublishOnly": "tsc -b"
   },
   "peerDependencies": {
     "three": ">=0.160"
   },
   "dependencies": {
-    "@ares/core": "*"
+    "@ares/core": "0.1.0"
   },
   "devDependencies": {
     "three": "^0.185.1",

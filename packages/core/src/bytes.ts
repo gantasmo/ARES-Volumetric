@@ -30,6 +30,17 @@ export class ByteReader {
   str(): string { return new TextDecoder("utf-8").decode(this.bytes(this.u16())); }
   fourcc(): string { return String.fromCharCode(this.u8(), this.u8(), this.u8(), this.u8()); }
   skip(n: number): void { this.pos = this.p + n; }
+  /** Unsigned LEB128 (≤ 35 bits). */
+  varint(): number {
+    let v = 0, shift = 0;
+    for (let i = 0; i < 5; i++) {
+      const b = this.u8();
+      v += (b & 0x7f) * 2 ** shift;
+      if (!(b & 0x80)) return v;
+      shift += 7;
+    }
+    throw new AresParseError("varint too long");
+  }
 }
 
 /** Growable little-endian writer. */
@@ -44,7 +55,7 @@ export class ByteWriter {
   get pos(): number { return this.p; }
   private ensure(extra: number): void {
     if (this.p + extra <= this.buf.byteLength) return;
-    let cap = this.buf.byteLength * 2;
+    let cap = Math.max(64, this.buf.byteLength * 2);   // a 0-capacity writer used to spin here forever
     while (cap < this.p + extra) cap *= 2;
     const next = new Uint8Array(cap);
     next.set(this.buf);
@@ -61,6 +72,12 @@ export class ByteWriter {
   bytes(b: Uint8Array): this { this.ensure(b.byteLength); this.buf.set(b, this.p); this.p += b.byteLength; return this; }
   str(s: string): this { const b = new TextEncoder().encode(s); return this.u16(b.byteLength).bytes(b); }
   fourcc(s: string): this { for (let i = 0; i < 4; i++) this.u8(s.charCodeAt(i) & 0xff); return this; }
+  /** Unsigned LEB128. */
+  varint(v: number): this {
+    let x = Math.max(0, Math.floor(v));
+    while (x >= 0x80) { this.u8((x % 0x80) | 0x80); x = Math.floor(x / 0x80); }
+    return this.u8(x);
+  }
   /** Patch a u32 at an earlier absolute offset (for back-filling sizes/offsets). */
   patchU32(at: number, v: number): void { this.view.setUint32(at, v, true); }
   patchU64(at: number, v: bigint): void { this.view.setBigUint64(at, v, true); }

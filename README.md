@@ -29,12 +29,13 @@ Two companion documents summarize the project at different depths:
   apps/demo/             Four-tab app: Viewer | Compare | Inspect | Convert (+ mesh editor)
   packages/core/         @ares/core    container demux, geometry decode, WebGPU + WebGL2
                                        renderers, WebCodecs texture, edits, AresPlayer
-  packages/encoder/      @ares/encoder OBJ/PLY importers, temporal GOP builder, meshopt
-                                       encode, VP9/AV1 texture mux, `ares` CLI
+  packages/encoder/      @ares/encoder OBJ/PLY importers, splat importers (SPZ, 3DGS PLY, .splat,
+                                       glTF+KHR_gaussian_splatting, SOG), temporal GOP builder, meshopt
+                                       encode, VP9/AV1 texture mux, exporters, `ares` CLI
   packages/three/        @ares/three   AresObject (THREE.Object3D wrapper)
   packages/react/        @ares/react   <Ares/> for @react-three/fiber
   tools/serve.mjs        Zero-dependency dev server: COOP/COEP headers + local GUI endpoints
-  tools/*.ps1            Workers behind the one-click .vbs launchers
+  tools/launch.mjs       The launcher, any OS: app | probe | bench | sam (ARES.vbs wraps it)
   tools/sam-service/     Local FastAPI SAM segmentation service (editor assist)
   tools/4ds/             .4ds decode host for a locally licensed 4DViews codec DLL (not included)
   tools/coherent/        Coherent-GOP pre-pass: stable-template registration + atlas rebake
@@ -62,8 +63,13 @@ TypeScript 7.x (`tsc -b` project references), Node 18 or newer (tested on 24 LTS
 | SAM 3 segmentation service | Shipped (2026-07-10) | in-app start, SAM 3 bf16 primary + ViT-H fallback, verified on the 6 GB GPU |
 | SAM click-to-select editing | Shipped (2026-07-10) | SAM tool beside Box/Brush; masks become keyframed bitmap regions; preview == bake |
 | Volcap history + Settings tab | Shipped (2026-07-10) | searchable analyse/encode/enhance/inspect history; dependency status with guided installs |
-| P2 temporal geometry | Encoder path built; pulled for this capture class | roadmap below |
-| P3 streaming/ABR, P4 splats, P5 importers, P6 hardening | Not started | spec 14 |
+| Media rail + timeline trim | Shipped (2026-07-15) | clip library rail; NLE-style trim that really cuts (`--trim-in/--trim-out` + edit-list rebase) |
+| Unlit viewport mode | Shipped (2026-07-16) | `litMix` in both renderers; video-textured captures carry baked lighting, lit shading double-lights them |
+| Targeted temporal (P2 for repack captures) | Shipped (2026-07-16) | motion-gated coherent spans + per-span registration; [docs/targeted-temporal.md](docs/targeted-temporal.md) |
+| RGBD rebuild pipeline (2.5D → volumetric) | Hybrid assembly staged (2026-07-17) | mask → upscale → fused depth → normal detail → template back; [docs/rgbd-rebuild-pipeline.md](docs/rgbd-rebuild-pipeline.md) |
+| P4 Gaussian splat profile (intra + dynamic P-frames) | Shipped (2026-09-07) | `SPLT` track, both renderers, SPZ/3DGS PLY/.splat/glTF+KHR_gaussian_splatting/SOG import, `ares export`, P-frames with births/deaths; spec 6.8, 11.6.3 |
+| Audio track (Opus) | Shipped (2026-09-07) | `--audio`, per-chunk audio block, WebCodecs decode, audio-led clock; spec 11.5, 11.6.2a |
+| P3 streaming/ABR, P5 importers (mesh formats), P6 hardening | Not started | spec 14 |
 
 Measured highlights on the real capture (details and provenance in
 [docs/size-comparison.md](docs/size-comparison.md) and the [whitepaper](docs/whitepaper.md)):
@@ -85,28 +91,30 @@ direction. File history for the capture: `daniel.ares` 67.1 MB (first full encod
 after lossless vertex reorder, 49.6 MB after oct16 normals + AV1, and `daniel-s0.ares`
 49.7 MB as the current keeper (smoothing off, per visual evaluation on 2026-07-10).
 
-## Windows launchers
+## Launching it
 
-Each launcher is windowless: it runs `npm install` and the build when stale, reuses a
-running server or starts one, and opens the browser. The Probe launcher additionally
-installs Node via winget when missing; the Bench and Demo launchers expect one prior Probe
-run for that. Logs land in `tools/*.log`;
-`tools/launch-debug.cmd` runs the same flow with a visible console. All four sit at the
-repo root:
+One launcher, four modes. On Windows, double-click **`ARES.vbs`** at the repo root: it finds
+Node (installing the LTS build via winget if the machine has none), installs dependencies and
+builds when they are stale, synthesizes a demo clip if the checkout has no `.ares` file, starts
+the COOP/COEP dev server or reuses a running one, and opens the browser — all windowless.
+Every step is logged to `tools/launch.log`, and `tools\launch-console.cmd` runs the same flow
+with a visible console.
 
-| Launcher | Opens |
+| Command | Opens |
 |---|---|
-| `Launch ARES Probe.vbs` | Phase 0 capability probe |
-| `Run ARES Bench.vbs` | intra benchmark + Pareto report (~1-2 min) |
-| `Play ARES Demo.vbs` | the volumetric player (prefers `daniel-s0.ares`) |
-| `Launch SAM Service.vbs` | optional manual start for the SAM service (the app starts it itself from the Edit panel) |
+| `ARES.vbs` or `npm start` | the app: Viewer, Compare, Inspect, Convert, editor |
+| `ARES.vbs probe` or `npm run probe` | Phase 0 capability probe |
+| `ARES.vbs bench` | intra benchmark + Pareto report (~1-2 min) |
+| `ARES.vbs sam` | optional manual start for the SAM service (the app starts it itself from the Edit panel) |
 
 ## Quick start (any OS, terminal)
 
 ```
 npm install
-npm run build    # tsc -b across packages
-npm start        # tools/serve.mjs -> http://127.0.0.1:8137/apps/phase0-probe/
+npm run build                    # tsc -b across packages
+npm start                        # launcher -> http://127.0.0.1:8137/apps/demo/
+node tools/launch.mjs --help     # modes and flags (--port, --src, --detach, --no-open, ...)
+npm run serve                    # just the dev server: no build, no browser
 ```
 
 The demo lives at `http://127.0.0.1:8137/apps/demo/` (the server walks up to port 8147 if
@@ -144,7 +152,7 @@ render rate, each against a measured Draco-GLB baseline. The source switcher per
 server-side and carries camera pose, timestamp, and pause state across clip switches so
 back-to-back comparisons hold the same viewpoint.
 
-The editor (Edit button) works on world-anchored regions rather than vertex ids, because
+The editor (always-on Edit rail; `E` collapses it) works on world-anchored regions rather than vertex ids, because
 per-frame reconstructed captures have no stable vertex numbering: crop box with live GPU
 preview, box marquee, surface brush, and SAM click-to-select with a Blender-style X-ray
 toggle, wireframe, and timeline ranges whose keyframed regions interpolate over time. The
@@ -153,7 +161,14 @@ SAM tool captures the held frame on click, requests a mask from the local SAM 3 
 bitmap region keyframed into the active range — the same evaluator drives the live preview
 and the bake. Edits persist as a non-destructive `.edits.json` sidecar and bake to a new
 `.ares` through the encoder. The panel's SAM row starts and monitors the service without
-leaving the app.
+leaving the app. Beyond selection: a lasso, a measure tool, grow / shrink / invert / mirror of
+the active range, camera bookmarks, per-range mute, names and keyframe interpolation (linear,
+hold, smooth), a bake-side sculpt action (move, inflate, smooth, flatten, pinch — weld-aware and
+feathered like paint), analysis views (normals, UV checker, depth, point cloud), and an Export
+section (frame to OBJ, still to PNG, turntable to WebM). An FX section applies playback effects to
+meshes and splats alike (clip plane, dissolve, tint, rim, scanlines, wobble, splat jitter and size),
+keyframed on the timeline, saved in the sidecar, and optionally driven by the clip's audio level.
+`?` lists every shortcut.
 
 ![Editor panel with wireframe view](docs/images/editor-wireframe.png)
 
@@ -195,17 +210,39 @@ features that need one warn at the point of use with a pointer to Settings.
 
 ![Phase 0 capability probe](docs/images/phase0-probe.png)
 
+## Embedding the player
+
+```
+npm install @ares/core            # ESM; your bundler resolves meshoptimizer
+import { AresPlayer } from "@ares/core";
+const player = await AresPlayer.create({ canvas, src: "clip.ares" });
+```
+
+`npm run bundle` (esbuild) writes single-file builds to `packages/core/dist/bundle/`:
+`ares-core.esm.js` for `<script type="module">`, `ares-core.iife.js` exposing `window.ARES`,
+and `ares-decode-worker.js`; pass the worker file's URL as `workerUrl` when `useWorker` is on.
+The Three.js wrapper bundles to `packages/three/dist/bundle/ares-three.esm.js` with `three`
+left external. Bundles are also produced by CI (`.github/workflows/ci.yml`) as an artifact.
+
 ## Encoder CLI
 
 ```
-node packages/encoder/dist/cli.js synth  -o demo.ares [--shape object|talk] [--frames 60]
-                                         [--fps 30] [--no-texture]
+node packages/encoder/dist/cli.js synth  -o demo.ares [--shape object|talk|splat] [--frames 60]
+                                         [--fps 30] [--no-texture] [--sh-degree 0|1]
 node packages/encoder/dist/cli.js encode <frames-dir> -o out.ares
                                          [--fps 30] [--max-frames N] [--gop 30]
                                          [--texture-codec vp9|av1] [--tex-size 1024]
-                                         [--crf 32] [--no-texture]
+                                         [--crf 32] [--no-texture] [--no-temporal]
                                          [--edits file.json] [--crop x0,y0,z0,x1,y1,z1]
                                          [--track] [--smooth N] [--smooth-temporal N]
+                                         [--decimate ratio] [--trim-in N] [--trim-out N]
+                                         [--repack-detect topology|image]
+                                         [--up-axis y|z] [--center mode] [--scale s]
+                                         [--rotate ...] [--translate x,y,z]
+                                         [--meta-extra-file f.json]
+                                         splat input: [--sh-degree 0..3] [--splat-min-alpha a]
+                                         [--splat-box-alpha a] [--splat-order morton|none] [--quant-bits 8..16]
+node packages/encoder/dist/cli.js export file.ares -o out.(obj|ply|spz|glb|splat) [--frame N]
 node packages/encoder/dist/cli.js info   file.ares
 ```
 
@@ -215,47 +252,87 @@ into a single frames subfolder when the parent is given), and needs ffmpeg on PA
 automatically; `--track` forces persistent topology via nearest-point surface tracking with
 per-frame UV transfer; everything else falls back to intra frames. `--smooth` applies
 weld-aware Taubin smoothing (safe on atlased meshes; plain per-vertex filters crack UV
-seams). `info` round-trips the file through the runtime demuxer and prints its layout.
+seams). `--repack-detect image` detects atlas repacks by image difference instead of
+topology hash — required for stable-layout content, where the topology heuristic
+false-positives every frame. `--trim-in/--trim-out` cut frames while rebasing the edit
+list; the transform flags (`--up-axis`, `--center`, `--scale`, `--rotate`, `--translate`)
+bake the same evaluator the viewer previews with, so preview and bake cannot drift.
+`--meta-extra-file` merges pipeline provenance into the `.ares.meta.json` sidecar every
+encode writes. `info` round-trips the file through the runtime demuxer and prints its
+layout.
+
+**Audio.** `--audio <file>` muxes an Opus track (any input ffmpeg reads, transcoded to 48 kHz;
+`--audio-offset` shifts it, `--audio-bitrate` sets the rate). The runtime decodes it with
+WebCodecs into Web Audio and lets the audio clock lead the video; the transport gains a mute
+(U) and a volume slider, and the Convert tab has an audio row with a native file picker.
+
+**Gaussian splats.** A folder of one splat file per frame — Niantic SPZ (Scaniverse, World Labs
+Marble), 3DGS PLY (any trainer, Polycam, Luma), `.splat`, glTF/GLB carrying
+`KHR_gaussian_splatting`, or PlayCanvas SOG (`.sog` bundle or directory) — encodes as the splat
+profile automatically; a lone SOG directory is one frame. `--sh-degree` caps the spherical
+harmonic bands carried (0 is the view-independent fast path), `--splat-min-alpha` drops the
+near-transparent outlier haze generated captures carry before the quantization box is fitted,
+and `--quant-bits` sets the fixed-point precision per axis over each chunk's box. `export`
+writes any frame back out as SPZ, 3DGS PLY, glTF/GLB or `.splat` (meshes: OBJ or PLY), so the
+container is no longer write-only.
 
 ## Documentation
 
 | Document | Content |
 |---|---|
+| [AUDIT.md](AUDIT.md) | 2026-09-07 audit: fixes, incomplete features, cutting-edge directions, and the progress tracker |
 | [docs/whitepaper.md](docs/whitepaper.md) | Full technical whitepaper: design, format, runtime, measurements, limitations, roadmap |
 | [docs/briefing.md](docs/briefing.md) | Plain-language briefing for non-specialists |
 | [docs/size-comparison.md](docs/size-comparison.md) | Measured size baselines and the 4DViews teardown |
 | [docs/editor-v2-design.md](docs/editor-v2-design.md) | Editor design: keyframed regions, selection law, SAM assist |
 | [docs/sam3d-body-colab.md](docs/sam3d-body-colab.md) | SAM-3D Body skeleton fitting via the Colab notebook |
+| [docs/targeted-temporal.md](docs/targeted-temporal.md) | Motion-gated coherent spans: the shipped temporal strategy for per-frame-reconstructed captures |
+| [docs/rgbd-rebuild-pipeline.md](docs/rgbd-rebuild-pipeline.md) | 2.5D RGBD (Depthkit-style) captures rebuilt into volumetric clips: masking, fused metric depth, shading detail, hybrid body completion |
 | [bench/README.md](bench/README.md) | Benchmark harness: how to run it, corpus taxonomy, measured results |
 | [ARES-Runtime-Specification.md](ARES-Runtime-Specification.md) | Built master spec (Draft 0.2), the normative document |
 | [spec/](spec/) | Specification source, one file per chapter; rebuild with `python spec/build.py` |
 
+## Capture rebuild pipelines
+
+Beyond encoding well-formed mesh sequences, two pipelines rebuild difficult source
+material into good `.ares` input:
+
+- **Targeted temporal** ([docs/targeted-temporal.md](docs/targeted-temporal.md)) — for
+  per-frame-reconstructed captures whose topology resets every frame: motion-metric span
+  selection, per-span registration (nearest-pull for static spans, ARAP for moving ones),
+  gated boundary transitions, and image-based repack detection so coherent spans
+  inter-code their texture (−28 % texture at identical settings on the reference clip).
+- **RGBD rebuild** ([docs/rgbd-rebuild-pipeline.md](docs/rgbd-rebuild-pipeline.md)) — for
+  legacy 2.5D depth-sensor captures: hue-depth decode, subject masking (black background
+  before any depth estimation), photoreal video upscale, video-consistent depth fused to
+  metric sensor scale by a tiled locally-affine robust fit, shading detail integrated
+  from estimated normal maps (screened Poisson on log-depth), and a fixed-topology
+  parametric body completing the surfaces the camera never saw.
+
 ## Roadmap
 
-The near-term queue:
+The near-term queue (owner-steered):
 
-1. Visual evaluation gate across encode recipes (v1/v2/v3/v4 and the smoothing sweep);
-   `daniel-s0.ares` (smoothing off) is the keeper so far.
-2. SAM toolset follow-ons. The click-to-select tool shipped 2026-07-10 (masks become
-   keyframed bitmap regions; preview and bake share one evaluator); remaining: a per-image
-   feature cache in the service and temporal mask propagation —
-   unresolved on 6 GB hardware, with `Sam3TrackerVideoModel` plus CPU-offloaded frames or
-   SAM 2.1 small as the candidates.
-3. Optional geometry decimation (`--decimate`) via meshopt `simplifyWithAttributes` with
-   locked atlas-seam borders: an estimated 5-10 MB off the ~34 MB geometry without touching
-   UVs. The estimate needs confirming with `tools/measure-baselines.cjs` before any number
-   is quoted.
-4. Temporal denoise via approximate nearest-point correspondence, deliberately last in the
-   queue: it targets the frame-to-frame surface shimmer that per-frame reconstruction
-   causes, and carries a motion-blur risk on fast limbs.
-
-Research directions under evaluation: skin-appropriate texture enhancement (face-restoration
-models such as GFPGAN/CodeFormer, per-chart or screen-space enhancement; the general photo
-upscaler is unusable on UV atlases), and quad-remeshing co-designed with a fresh atlas so
-one topology and one atlas layout persist per GOP. That second direction attacks jitter,
-geometry size, and texture stability at once and would make P2 temporal coding applicable
-to re-atlased captures.
+1. **LOD ladder** — one-command multi-tier export (one source → N tiers via `--decimate`,
+   `--tex-size`, `--crf`) plus a playback tier picker (2-tier minimal version of spec
+   9.3; the container GOP index already supports it).
+2. **SVF/HoloVideo texture passthrough** — a byte-level teardown of a licensed capture
+   showed its texture is standard H.264 with the mesh riding in type-24 NAL units:
+   stripping those yields a pure video track the runtime can carry natively (zero
+   transcode; geometry still goes through the Unity exporter until the mesh NAL format
+   is reversed).
+3. **In-scene sculpt + texture-paint ops** — two new op kinds in the existing edit-op
+   system; world-anchored (never texel-coordinate) so they survive per-frame atlas
+   repacks. First acceptance target: healing residual face defects in registered spans.
+4. **RGBD track continuation** — full first take, then the remaining takes as a batch;
+   a watertight per-take asset (PSHuman-class) to replace the projected back texture;
+   multi-frame UV texture accumulation on takes where the subject rotates.
+5. **Reference-guided texture restoration** — re-unwrap to a stable atlas, then temporal
+   restoration conditioned on reference photos of the subject (the capture textures are
+   irreversibly AI-upscaled; reference photos are obtainable ground truth).
 
 The staged roadmap (spec 14) continues with P3 streaming (range-request seek, prefetch,
-ABR ladder), P4 Gaussian splat profile, P5 importer suite (glTF, Alembic, USD, Depthkit,
-4DViews), and P6 hardening toward a spec freeze.
+ABR ladder), the dynamic splat profile (P-frames with birth/death lists on top of the shipped
+intra splat profile), P5 importer suite for mesh formats (glTF, Alembic, USD, Depthkit,
+4DViews), and P6 hardening toward a spec freeze. [AUDIT.md](AUDIT.md) tracks the 2026-09-07
+audit queue.

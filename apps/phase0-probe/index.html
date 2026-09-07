@@ -4,33 +4,131 @@
 <link rel="icon" type="image/svg+xml" href="favicon.svg">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <style>
-  body { font: 15px/1.5 system-ui, sans-serif; max-width: 60em; margin: 2em auto; padding: 0 1em; color: #1a1a1a; }
-  h1 { border-bottom: 3px solid #7c3a12; padding-bottom: .2em; }
-  table { border-collapse: collapse; width: 100%; margin: 1em 0; }
-  th, td { border: 1px solid #ccc; padding: .45em .7em; text-align: left; }
-  th { background: #efe9e2; }
-  .ok { color: #157347; font-weight: 600; }
-  .no { color: #b02a37; font-weight: 600; }
-  .warn { color: #997404; font-weight: 600; }
-  code { background: #f2efe9; padding: .05em .3em; border-radius: 3px; }
-  small { color: #555; }
+  /* Tokens mirror apps/demo/index.html :root (2026-08-28 UI unification; the app-dock tokens
+     --tl-h/--diag-h are omitted — this page has no docks). Standalone diagnostics page, so it
+     auto-switches: dark default, light via prefers-color-scheme (the app itself never auto-switches). */
+  :root {
+    color-scheme: dark;
+    --bg:        #1b1d20;
+    --bg-panel:  #26282c;
+    --bg-rail:   #1f2125;
+    --surface:   #2c2f34;
+    --surface-h: #373b41;
+    --border:    rgba(255,255,255,0.10);
+    --border-st: rgba(255,255,255,0.16);
+    --text:      #f0efe9;
+    --text-mid:  #cbc9c2;
+    --text-dim:  #a9a7a0;
+    --text-faint:#8e8c85;
+    --accent:    #d98a3a;
+    --accent-h:  #e59a4c;
+    --accent-ink:#1b1d20;
+    --warn: #d9a441; --good: #62b87f; --bad: #d98a8a;
+    --series-a: #d98a3a; --series-b: #8a8f98;
+    --wash:       rgba(255,255,255,.05);
+    --wash-st:    rgba(255,255,255,.09);
+    --accent-dim: rgba(217,138,58,.15);
+    --warn-dim:   rgba(217,164,65,.15);
+    --good-dim:   rgba(98,184,127,.12);
+    --bad-dim:    rgba(217,138,138,.12);
+    --scrim:      rgba(27,29,32,.85);
+    --shadow:     0 6px 20px rgba(0,0,0,.45);
+    --axis-x: #e0605f; --axis-y: #7ec36a; --axis-z: #5f92e0;
+    --pad-1: 2px; --pad-2: 4px; --pad-3: 6px;
+    --ctl: 24px; --ctl-lg: 30px; --r: 4px;
+  }
+  @media (prefers-color-scheme: light) {
+    :root {
+      color-scheme: light;
+      --bg:        #e9e7e2;
+      --bg-panel:  #f3f1ed;
+      --bg-rail:   #eceae5;
+      --surface:   #fbfaf7;
+      --surface-h: #e4e1da;
+      --border:    rgba(0,0,0,0.13);
+      --border-st: rgba(0,0,0,0.22);
+      --text:      #212327;
+      --text-mid:  #474a50;
+      --text-dim:  #61646a;
+      --text-faint:#787b81;
+      --accent:    #c2762a;
+      --accent-h:  #ad6822;
+      --accent-ink:#fbfaf7;
+      --warn: #a8721c; --good: #2f7d4f; --bad: #a84a4a;
+      --series-a: #c2762a; --series-b: #6c7078;
+      --wash:       rgba(0,0,0,.05);
+      --wash-st:    rgba(0,0,0,.08);
+      --accent-dim: rgba(194,118,42,.15);
+      --warn-dim:   rgba(168,114,28,.16);
+      --good-dim:   rgba(47,125,79,.14);
+      --bad-dim:    rgba(168,74,74,.14);
+      --scrim:      rgba(233,231,226,.9);
+      --shadow:     0 6px 20px rgba(0,0,0,.18);
+      --axis-x: #c25453; --axis-y: #588a4a; --axis-z: #4a76c2;
+    }
+  }
+  * { box-sizing: border-box; }
+  html, body { height: 100%; margin: 0; }
+  body { overflow: hidden; background: var(--bg); color: var(--text);
+    font: 13px/1.45 system-ui, -apple-system, "Segoe UI", sans-serif;
+    display: flex; flex-direction: column; gap: 10px; padding: 12px 16px; }
+  header { flex: none; }
+  h1 { margin: 0; padding-bottom: 5px; display: inline-block;
+    font-size: 15px; font-weight: 650; letter-spacing: .2px;
+    border-bottom: 2px solid var(--accent); }
+  .lead { margin: 6px 0 0; font-size: 12px; color: var(--text-mid); }
+  #verdict { display: inline-block; margin: 8px 0 0; padding: 4px 9px; font-size: 11.5px;
+    background: var(--bg-panel); border: 1px solid var(--border); border-radius: var(--r); }
+  #verdict:empty { display: none; }
+  /* Grid of the three probe tables — fits 1280×720 without scrolling; overflow is a safety valve. */
+  main { flex: 1 1 auto; min-height: 0; overflow: auto;
+    display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: 10px;
+    align-content: start; align-items: start; }
+  @media (max-width: 1080px) { main { grid-template-columns: minmax(0, 1fr); } }
+  section { min-width: 0; padding: 8px 10px; background: var(--bg-panel);
+    border: 1px solid var(--border); border-radius: var(--r); }
+  h2 { margin: 0 0 4px; font-size: 10px; font-weight: 600; text-transform: uppercase;
+    letter-spacing: .3px; color: var(--text-dim); }
+  table { border-collapse: collapse; width: 100%; font-size: 11.5px; }
+  th { padding: 3px 8px 3px 0; text-align: left; font-size: 10px; font-weight: 600;
+    text-transform: uppercase; letter-spacing: .3px; color: var(--text-dim);
+    border-bottom: 1px solid var(--border-st); }
+  td { padding: 3px 8px 3px 0; text-align: left; vertical-align: top;
+    border-bottom: 1px solid var(--border); }
+  td:nth-child(n+2) { font: 11px ui-monospace, "Cascadia Mono", Consolas, monospace;
+    font-variant-numeric: tabular-nums; overflow-wrap: anywhere; }
+  table tr:last-child td { border-bottom: 0; }
+  .ok { color: var(--good); font-weight: 600; }
+  .no { color: var(--bad); font-weight: 600; }
+  .warn { color: var(--warn); font-weight: 600; }
+  code { font: 11px ui-monospace, "Cascadia Mono", Consolas, monospace;
+    background: var(--surface); border: 1px solid var(--border);
+    padding: 0 4px; border-radius: var(--r); }
+  small { font-size: 10.5px; font-weight: 400; color: var(--text-dim); }
 </style>
-<h1>ARES Phase 0 — Capability Probe</h1>
-<p>Validates the spec's load-bearing assumptions on <em>this</em> device/browser:
-<strong>A1</strong> = WebGPU available, <strong>A2</strong> = hardware AV1/VP9 decode via WebCodecs.
-Serve via <code>npm start</code> or the repo's <code>Launch ARES Probe.vbs</code> — both send the
-COOP/COEP headers cross-origin isolation needs.</p>
+<header>
+  <h1>ARES Phase 0 — Capability Probe</h1>
+  <p class="lead">Validates the spec's load-bearing assumptions on this device and browser:
+  A1 — WebGPU available; A2 — hardware AV1/VP9 decode via WebCodecs. Serve with
+  <code>npm run probe</code> or the repo's <code>ARES.vbs probe</code> — both send the
+  COOP/COEP headers cross-origin isolation needs.</p>
+  <p id="verdict"></p>
+</header>
 
-<h2>A1 — WebGPU</h2>
-<table id="gpu"><tr><th>Check</th><th>Result</th></tr></table>
-
-<h2>A2 — WebCodecs video decode</h2>
-<table id="codecs"><tr><th>Codec</th><th>Supported</th><th>Hardware accel</th><th>Config</th></tr></table>
-
-<h2>Runtime environment</h2>
-<table id="env"><tr><th>Property</th><th>Value</th></tr></table>
-
-<p id="verdict"></p>
+<main>
+  <section>
+    <h2>A1 — WebGPU</h2>
+    <table id="gpu"><tr><th>Check</th><th>Result</th></tr></table>
+  </section>
+  <section>
+    <h2>A2 — Video decode</h2>
+    <table id="codecs"><tr><th>Codec</th><th>Supported</th><th>Hardware accel</th><th>Config</th></tr></table>
+  </section>
+  <section>
+    <h2>Environment</h2>
+    <table id="env"><tr><th>Property</th><th>Value</th></tr></table>
+  </section>
+</main>
 
 <script type="module">
 const row = (t, cells) => {
@@ -104,7 +202,7 @@ if (!("VideoDecoder" in window)) {
 
 // --- Environment ---
 const coiHint = self.crossOriginIsolated ? "" :
-  ' <small>page not served with COOP/COEP — use <code>npm start</code> / Launch ARES Probe.vbs, not npx serve</small>';
+  ' <small>page not served with COOP/COEP — use <code>npm run probe</code> / ARES.vbs probe, not npx serve</small>';
 row("env", ["crossOriginIsolated (SharedArrayBuffer)", yes(self.crossOriginIsolated) + coiHint]);
 row("env", ["hardwareConcurrency", navigator.hardwareConcurrency ?? "?"]);
 row("env", ["deviceMemory (GB)", navigator.deviceMemory ?? "unknown"]);

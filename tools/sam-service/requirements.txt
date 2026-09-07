@@ -14,3 +14,9 @@ segment-anything==1.0
 safetensors==0.8.0
 huggingface_hub==1.23.0
 hf-xet==1.5.1
+
+# Optional endpoints /upscale (Real-ESRGAN via spandrel) and /detail (SD 1.5 img2img via diffusers).
+# The service imports these lazily; without them the two routes answer 503 and everything else works.
+spandrel==0.4.1
+diffusers==0.36.0
+accelerate==1.12.0

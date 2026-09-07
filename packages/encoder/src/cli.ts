@@ -1,26 +1,39 @@
 #!/usr/bin/env node
 /**
  * `ares` CLI (spec §5.2, §14 P5).
- *   ares synth  [-o out.ares] [--shape object|talk] [--frames 60] [--fps 30] [--no-texture]
+ *   ares synth  [-o out.ares] [--shape object|talk|splat] [--frames 60] [--fps 30] [--no-texture] [--sh-degree 0|1]
  *   ares encode <frames-dir> [-o out.ares] [--fps 30] [--max-frames N] [--gop 30]
+ *               mesh input (OBJ/PLY + atlas PNGs):
  *               [--texture-codec vp9|av1] [--tex-size 1024] [--crf 32] [--no-texture]
- *               [--edits file.json] [--crop x0,y0,z0,x1,y1,z1] [--track]
- *               [--trim-in N] [--trim-out N]              (clip in/out, inclusive source frames)
- *               [--up-axis x|y|z] [--center bottom|mass|none] [--scale N]
- *               [--rotate x,y,z] [--translate x,y,z]      (bake orientation into the model)
- *               [--smooth N] [--smooth-temporal N]        (OBJ/PLY + atlas → .ares)
+ *               [--edits file.json] [--crop x0,y0,z0,x1,y1,z1] [--track] [--no-temporal]
+ *               [--smooth N] [--smooth-temporal N] [--decimate ratio] [--repack-detect topology|image]
+ *               splat input (SPZ / 3DGS PLY / .splat / glTF+KHR_gaussian_splatting / SOG, one file per frame):
+ *               [--sh-degree 0..3] [--splat-min-alpha a] [--splat-box-alpha a] [--splat-order morton|none]
+ *               [--quant-bits 8..16]
+ *               both: [--trim-in N] [--trim-out N] [--up-axis x|y|z] [--center bottom|mass|none]
+ *                     [--scale N] [--rotate x,y,z] [--translate x,y,z] [--meta-extra-file f.json]
+ *               audio (both): [--audio file] [--audio-offset s] [--audio-bitrate kbps]
+ *   ares export <file.ares> -o <out> [--frame N]      (.obj/.ply for meshes; .spz/.ply/.glb/.splat for splats)
  *   ares info   <file.ares>
  */
 import { readdir, readFile, writeFile, stat } from "node:fs/promises";
+import { readFileSync } from "node:fs";
 import { join, extname, basename } from "node:path";
 import { performance } from "node:perf_hooks";
 import { createHash } from "node:crypto";
-import { Demuxer } from "@ares/core";
-import { parsePly } from "./importers/ply.js";
+import { Demuxer, GeometryProfile, BlockType, decodeGeometryBlock, decodePFrameBlock, decodeSplatBlock, decodeSplatPBlock, dequantScale, meshoptReady, transformMatrix, type DecodedGeometry } from "@ares/core";
+import { parsePly, parsePlyHeader, isSplatPlyHeader, parsePlySplat, writeSplatPly } from "./importers/ply.js";
 import { parseObj } from "./importers/obj.js";
+import { parseSpz, writeSpz } from "./importers/spz.js";
+import { parseSplatFile, writeSplatFile } from "./importers/splat-file.js";
+import { parseGltfSplat, writeGlbSplat } from "./importers/gltf-splat.js";
+import { parseSog } from "./importers/sog.js";
+import { filterSplatFrame, transformSplatFrame, decodedSplatToFrame, type SplatFrame } from "./splat-frame.js";
+import { decodedMeshToFrame, writeObj, writeMeshPly } from "./export.js";
+import { transcodeToOpus, type AudioTrackData } from "./audio-mux.js";
 import { filterFrame, parseCropBox } from "./crop.js";
 import { decimateFrame, simplifierReady } from "./decimate.js";
-import { parseEditList, keepPredicateAt, prepareRangeAt, type EditList, type EditRange } from "@ares/core";
+import { parseEditList, keepPredicateAt, prepareRangeAt, prepareRangeSdfAt, isRangeEnabled, type EditList, type EditRange } from "@ares/core";
 import { resolveOffset, applyTransform, applyTransformNormals, transformAabb, type ModelTransform } from "@ares/core";
 import type { Aabb } from "@ares/core";
 import { collectCopyOps, applyGeoCopy, resolveSrcFragment, buildPieceFragment, type CopyOp } from "./frame-copy.js";
@@ -29,18 +42,35 @@ import {
   planRegionRelocation, measureTexelCollateral, identityPlan, type TexelPatchPlan,
 } from "./texel-copy.js";
 import { collectRecolorOps, partitionTrianglesByCentroid, hexOf, parseHexColor, type RecolorPatch } from "./recolor.js";
+import { collectPaintOps, rasterizePaintWeights, dilatePaintWeights, type PaintPatch } from "./paint.js";
+import { collectSculptOps, applySculptToFrame } from "./sculpt.js";
 import { detectHoleLoopsForRange, appendCaps, findFreeTile, HOLE_TILE, type HoleTileFill } from "./hole-patch.js";
 import { muxClip, muxClipWithStats, type MuxClip } from "./muxer.js";
-import { synthClip } from "./synth.js";
+import { synthClip, synthSplatClip } from "./synth.js";
 import { proceduralAtlas } from "./png.js";
-import { encodeTextureVideo, detectPattern, ffmpegAvailable, type TexCodec } from "./texture-video.js";
+import { encodeTextureVideo, detectPattern, ffmpegAvailable, ffmpegPath, type TexCodec } from "./texture-video.js";
 import type { EncodeMeshFrame } from "./geometry-encode.js";
 
 function flag(a: string[], name: string): string | undefined {
   const i = a.indexOf(name);
-  return i >= 0 ? a[i + 1] : undefined;
+  if (i < 0) return undefined;
+  const v = a[i + 1];
+  // A flag that takes a value followed by another flag (or nothing) is a usage error, not a value.
+  if (v === undefined || (v.startsWith("--") && v.length > 2)) throw new Error(`${name}: expected a value`);
+  return v;
 }
 const has = (a: string[], name: string) => a.includes(name);
+/** Numeric flag with range validation; `def` when absent. */
+function numFlag(a: string[], name: string, def: number, opts: { min?: number; max?: number; int?: boolean } = {}): number {
+  const raw = flag(a, name);
+  if (raw === undefined) return def;
+  const v = Number(raw);
+  if (!Number.isFinite(v) || (opts.int && !Number.isInteger(v))) throw new Error(`${name}: expected ${opts.int ? "an integer" : "a number"}, got ${JSON.stringify(raw)}`);
+  if (opts.min !== undefined && v < opts.min) throw new Error(`${name}: ${v} is below the minimum ${opts.min}`);
+  if (opts.max !== undefined && v > opts.max) throw new Error(`${name}: ${v} is above the maximum ${opts.max}`);
+  return v;
+}
+const SPLAT_EXTS = new Set([".spz", ".splat", ".sog", ".glb", ".gltf"]);
 
 /** Provenance sidecar: EVERY setting used to convert/create/import a clip is saved into a metadata
  *  file bound to the clip. Written next to every .ares the
@@ -70,12 +100,52 @@ function hashIndices(indices: Uint32Array): string {
   return createHash("sha1").update(Buffer.from(indices.buffer, indices.byteOffset, indices.byteLength)).digest("hex");
 }
 
+/** --repack-detect image: decode every atlas at 64² gray in ONE ffmpeg pass and mark frames whose
+ *  consecutive mean-abs-diff crosses REPACK_MAD. A true repack measures ~37 luma; a stable layout
+ *  ~4 (2026-07-16 stability probe) — the threshold sits in the empty middle. Needed because the
+ *  topology heuristic wrongly flags stable-layout rebakes whose GEOMETRY changes per frame. */
+const REPACK_MAD = 12;
+async function detectRepackByImage(dir: string, pattern: string, startNumber: number, frameCount: number): Promise<Set<number>> {
+  const { spawn } = await import("node:child_process");
+  const args = ["-v", "error", "-start_number", String(startNumber), "-i", join(dir, pattern),
+    "-frames:v", String(frameCount), "-vf", "scale=64:64", "-f", "rawvideo", "-pix_fmt", "gray", "-"];
+  const buf: Buffer = await new Promise((resolve, reject) => {
+    const p = spawn(ffmpegPath(), args, { stdio: ["ignore", "pipe", "inherit"] });
+    const chunks: Buffer[] = [];
+    p.stdout.on("data", (c: Buffer) => chunks.push(c));
+    p.on("error", reject);
+    p.on("close", (code: number) => (code === 0 ? resolve(Buffer.concat(chunks)) : reject(new Error(`ffmpeg repack-detect exited ${code}`))));
+  });
+  const N = 64 * 64;
+  if (buf.length < frameCount * N) throw new Error(`repack-detect: expected ${frameCount * N} bytes, got ${buf.length}`);
+  const out = new Set<number>();
+  for (let f = 1; f < frameCount; f++) {
+    let sum = 0;
+    const a = (f - 1) * N, b = f * N;
+    for (let i = 0; i < N; i++) sum += Math.abs(buf[b + i]! - buf[a + i]!);
+    if (sum / N > REPACK_MAD) out.add(f);
+  }
+  return out;
+}
+
 async function synth(a: string[]) {
   const out = flag(a, "-o") ?? "demo.ares";
-  const shape = (flag(a, "--shape") ?? "object") as "object" | "talk";
-  const frames = Number(flag(a, "--frames") ?? 60);
-  const fps = Number(flag(a, "--fps") ?? 30);
-  const clip = synthClip(shape, frames, fps);
+  const shape = flag(a, "--shape") ?? "object";
+  if (!["object", "talk", "splat"].includes(shape)) throw new Error(`--shape: expected object|talk|splat, got ${JSON.stringify(shape)}`);
+  const frames = numFlag(a, "--frames", 60, { min: 1, int: true });
+  const fps = numFlag(a, "--fps", 30, { min: 1 });
+  if (shape === "splat") {
+    const shDegree = numFlag(a, "--sh-degree", 0, { min: 0, max: 1, int: true }) as 0 | 1;
+    const sclip = synthSplatClip(frames, fps, shDegree);
+    const t0 = performance.now();
+    const bytes = await muxClip({ fps, splatFrames: sclip.splatFrames, gopLength: numFlag(a, "--gop", 30, { min: 1, int: true }), splatTemporal: { mode: (flag(a, "--splat-temporal") ?? "auto") as "auto" | "index" | "nn" | "off" }, meta: { title: "ARES synth: splat", encoder: "ares-cli/0.2.0", generator: "synth" } });
+    await writeFile(out, bytes);
+    console.log(`[ares] synth splat: ${frames} frames @ ${fps}fps, ${sclip.splatFrames[0]!.count} splats/frame, SH degree ${shDegree}`);
+    console.log(`[ares] wrote ${out} — ${(bytes.length / 1024).toFixed(1)} KB total, ${(bytes.length / frames / 1024).toFixed(1)} KB/frame, encoded in ${(performance.now() - t0).toFixed(0)}ms`);
+    await info(["info", out]);
+    return;
+  }
+  const clip = synthClip(shape as "object" | "talk", frames, fps);
   const texture = has(a, "--no-texture") ? undefined : atlasOf();
   const t0 = performance.now();
   const bytes = await muxClip({
@@ -87,7 +157,7 @@ async function synth(a: string[]) {
   const verts = clip.frames[0]!.positions.length / 3;
   console.log(`[ares] synth ${shape}: ${frames} frames @ ${fps}fps, ~${verts} verts/frame`);
   console.log(`[ares] wrote ${out} — ${(bytes.length / 1024).toFixed(1)} KB total, ${(bytes.length / frames / 1024).toFixed(1)} KB/frame, encoded in ${encMs.toFixed(0)}ms`);
-  await info([out]);
+  await info(["info", out]);
 }
 
 /** Find the single immediate subdirectory of `dir` that holds .obj/.ply frames. Returns null when
@@ -150,39 +220,107 @@ function rebaseEditList(list: EditList, from: number, n: number): EditList {
   return { ...list, ranges };
 }
 
+/** --up-axis / --center / --scale / --rotate / --translate → ModelTransform (null when none given). */
+function parseModelTransform(a: string[]): ModelTransform | null {
+  const up = flag(a, "--up-axis"), ctr = flag(a, "--center"), rot = flag(a, "--rotate");
+  const scl = flag(a, "--scale"), tr = flag(a, "--translate");
+  if (up == null && ctr == null && rot == null && scl == null && tr == null) return null;
+  if (up != null && !["x", "y", "z"].includes(up)) throw new Error(`--up-axis: expected x|y|z, got ${JSON.stringify(up)}`);
+  if (ctr != null && !["bottom", "mass", "none"].includes(ctr)) throw new Error(`--center: expected bottom|mass|none, got ${JSON.stringify(ctr)}`);
+  const triple = (s: string | undefined, what: string): [number, number, number] | undefined => {
+    if (s == null) return undefined;
+    const p = s.split(",").map((v) => Number(v.trim()));
+    if (p.length !== 3 || p.some((v) => !Number.isFinite(v))) throw new Error(`${what}: expected three numbers "x,y,z", got ${JSON.stringify(s)}`);
+    return p as [number, number, number];
+  };
+  let scale: number | undefined;
+  if (scl != null) {
+    scale = Number(scl);
+    if (!Number.isFinite(scale) || scale === 0) throw new Error(`--scale: expected a non-zero number, got ${JSON.stringify(scl)}`);
+  }
+  return {
+    upAxis: (up as ModelTransform["upAxis"]) ?? "y",
+    center: (ctr as ModelTransform["center"]) ?? "bottom",
+    rotate: triple(rot, "--rotate") ?? [0, 0, 0],
+    translate: triple(tr, "--translate") ?? [0, 0, 0],
+    scale: scale ?? 1,
+  };
+}
+
+/** Natural sort so frame-000009 < frame-000010 AND frame9 < frame10 (lexicographic order misaligns unpadded names). */
+function naturalSort(names: string[]): string[] {
+  const key = (n: string) => n.split(/(\d+)/).map((t) => (/^\d+$/.test(t) ? t.padStart(12, "0") : t)).join("");
+  return names.slice().sort((x, y) => (key(x) < key(y) ? -1 : key(x) > key(y) ? 1 : 0));
+}
+
+type SplatKind = "spz" | "splat" | "sog" | "gltf" | "ply";
+
+/** --audio <file>: transcode to Opus (spec §11.5) trimmed to the clip's window; null when absent. */
+async function audioFromFlags(a: string[], fps: number, from: number, frameCount: number): Promise<AudioTrackData | null> {
+  const src = flag(a, "--audio");
+  if (!src) return null;
+  if (!(await ffmpegAvailable())) throw new Error("--audio needs ffmpeg (set FFMPEG or install it)");
+  const offset = numFlag(a, "--audio-offset", 0);
+  const bitrate = numFlag(a, "--audio-bitrate", 96, { min: 6, max: 510, int: true });
+  const t0 = performance.now();
+  // A trimmed clip's frame 0 is source frame `from`: the audio window follows it.
+  const track = await transcodeToOpus(src, { bitrateKbps: bitrate, offsetSec: offset, startSec: from > 0 ? from / fps : undefined, durationSec: frameCount / fps + 0.25 });
+  const bytes = track.packets.reduce((s, p) => s + p.data.byteLength, 0);
+  console.log(`[ares] audio: ${basename(src)} → Opus ${bitrate} kb/s, ${track.channels === 1 ? "mono" : "stereo"}, ${track.packets.length} packets, ${(track.durationUs / 1e6).toFixed(2)}s, ${(bytes / 1024).toFixed(1)} KB in ${((performance.now() - t0) / 1000).toFixed(1)}s` +
+    (offset ? ` (offset ${offset}s)` : ""));
+  if (track.durationUs < (frameCount / fps) * 1e6 * 0.9) console.warn(`[ares] audio is shorter than the clip (${(track.durationUs / 1e6).toFixed(2)}s vs ${(frameCount / fps).toFixed(2)}s) — the tail plays silent`);
+  return track;
+}
+
 async function encode(a: string[]) {
   let dir = a[1]!;
   const out = flag(a, "-o") ?? "out.ares";
-  const fps = Number(flag(a, "--fps") ?? 30);
-  const maxFrames = flag(a, "--max-frames") ? Number(flag(a, "--max-frames")) : Infinity;
-  const gop = Number(flag(a, "--gop") ?? 30);
+  const fps = numFlag(a, "--fps", 30, { min: 0.001 });
+  const maxFrames = flag(a, "--max-frames") ? numFlag(a, "--max-frames", Infinity, { min: 1, int: true }) : Infinity;
+  const gop = numFlag(a, "--gop", 30, { min: 1, max: 65535, int: true });
 
   // Frame discovery. Ease-of-use: if the folder holds no meshes directly but a single subfolder does
   // (e.g. pointing at a parent like Foo/ that contains Foo_Volcap/mesh-*.obj), descend into it.
   const meshesIn = (names: string[]) => ({
-    obj: names.filter((f) => extname(f).toLowerCase() === ".obj").sort(),
-    ply: names.filter((f) => extname(f).toLowerCase() === ".ply").sort(),
+    obj: naturalSort(names.filter((f) => extname(f).toLowerCase() === ".obj")),
+    ply: naturalSort(names.filter((f) => extname(f).toLowerCase() === ".ply")),
+    splat: naturalSort(names.filter((f) => SPLAT_EXTS.has(extname(f).toLowerCase()))),
   });
   let all = await readdir(dir);
-  let { obj: objFiles, ply: plyFiles } = meshesIn(all);
-  if (!objFiles.length && !plyFiles.length) {
+  let { obj: objFiles, ply: plyFiles, splat: splatFiles } = meshesIn(all);
+  if (!objFiles.length && !plyFiles.length && !splatFiles.length) {
     const subdir = await findFramesSubdir(dir, all);
     if (subdir) {
       console.log(`[ares] no meshes in ${dir}; using frames subfolder ${subdir}`);
       dir = subdir;
       all = await readdir(dir);
-      ({ obj: objFiles, ply: plyFiles } = meshesIn(all));
+      ({ obj: objFiles, ply: plyFiles, splat: splatFiles } = meshesIn(all));
     }
   }
+  // A single SOG directory (meta.json + webp images) is one splat frame.
+  const sogDir = !objFiles.length && !plyFiles.length && !splatFiles.length && all.includes("meta.json");
   const isObj = objFiles.length > 0;
-  const discovered = (isObj ? objFiles : plyFiles).slice(0, maxFrames);
-  if (!discovered.length) throw new Error(`no .obj or .ply frames found in ${dir}`);
+  // Splat detection: a PLY folder whose first file carries 3DGS attributes is a splat sequence.
+  let splatKind: SplatKind | null = null;
+  if (!isObj && plyFiles.length) {
+    const head = new Uint8Array(await readFile(join(dir, plyFiles[0]!)));
+    if (isSplatPlyHeader(parsePlyHeader(head))) splatKind = "ply";
+  } else if (!isObj && !plyFiles.length && (splatFiles.length || sogDir)) {
+    const ext = sogDir ? ".sog" : extname(splatFiles[0]!).toLowerCase();
+    splatKind = ext === ".spz" ? "spz" : ext === ".splat" ? "splat" : ext === ".sog" ? "sog" : "gltf";
+  }
+  const discovered = (isObj ? objFiles : splatKind && splatKind !== "ply" ? (sogDir ? ["."] : splatFiles) : plyFiles).slice(0, maxFrames);
+  if (!discovered.length) throw new Error(`no .obj/.ply mesh frames or .spz/.ply/.splat/.glb/.gltf/.sog splat frames found in ${dir}`);
 
   // Mesh-editor bake (docs/editor-v2-design.md §10). Parsed BEFORE the trim window is resolved
   // because the sidecar is where the editor persists its in/out points.
   let editList: EditList | null = null;
   const editsArg = flag(a, "--edits");
-  if (editsArg) editList = parseEditList(JSON.parse(await readFile(editsArg, "utf8")));
+  if (editsArg) {
+    editList = parseEditList(JSON.parse(await readFile(editsArg, "utf8")));
+    const muted = editList.ranges.filter((r) => !isRangeEnabled(r)).length;
+    if (muted) { console.log(`[ares] edits: ${muted} muted range(s) skipped`); editList.ranges = editList.ranges.filter(isRangeEnabled); }
+  }
 
   // Clip trim (NLE in/out, inclusive SOURCE frame indices). Explicit flags beat the sidecar so a
   // scripted re-bake can override what the app authored. Applied HERE, before frames are read: the
@@ -210,6 +348,11 @@ async function encode(a: string[]) {
       `(${files.length} frames, ${(files.length / fps).toFixed(2)}s) — dropping ${from} from the head, ${discovered.length - toExcl} from the tail`);
   }
 
+  if (splatKind) {
+    await encodeSplats(a, dir, files, splatKind, out, fps, gop, from, toExcl, discovered.length);
+    return;
+  }
+
   console.log(`[ares] ${files.length} ${isObj ? "OBJ" : "PLY"} frame(s) @ ${fps}fps, gop=${gop}`);
   const frames: EncodeMeshFrame[] = [];
   const t0 = performance.now();
@@ -219,7 +362,7 @@ async function encode(a: string[]) {
       frames.push({ positions: m.positions, uvs: m.uvs, indices: m.indices });
     } else {
       const m = parsePly(await readFile(join(dir, f)));
-      frames.push({ positions: m.positions, indices: m.indices });
+      frames.push({ positions: m.positions, uvs: m.uvs, normals: m.normals, indices: m.indices });
     }
   }
   const v0 = frames[0]!.positions.length / 3;
@@ -233,31 +376,7 @@ async function encode(a: string[]) {
   // The clip-wide bounds are computed over EVERY frame and the resulting offset reused for all of
   // them. Centring each frame on its own bounds would re-centre the subject every frame — a walk
   // cycle would moonwalk in place instead of crossing the floor.
-  const modelXf: ModelTransform | null = (() => {
-    const up = flag(a, "--up-axis"), ctr = flag(a, "--center"), rot = flag(a, "--rotate");
-    const scl = flag(a, "--scale"), tr = flag(a, "--translate");
-    if (up == null && ctr == null && rot == null && scl == null && tr == null) return null;
-    if (up != null && !["x", "y", "z"].includes(up)) throw new Error(`--up-axis: expected x|y|z, got ${JSON.stringify(up)}`);
-    if (ctr != null && !["bottom", "mass", "none"].includes(ctr)) throw new Error(`--center: expected bottom|mass|none, got ${JSON.stringify(ctr)}`);
-    const triple = (s: string | undefined, what: string): [number, number, number] | undefined => {
-      if (s == null) return undefined;
-      const p = s.split(",").map((v) => Number(v.trim()));
-      if (p.length !== 3 || p.some((v) => !Number.isFinite(v))) throw new Error(`${what}: expected three numbers "x,y,z", got ${JSON.stringify(s)}`);
-      return p as [number, number, number];
-    };
-    let scale: number | undefined;
-    if (scl != null) {
-      scale = Number(scl);
-      if (!Number.isFinite(scale) || scale === 0) throw new Error(`--scale: expected a non-zero number, got ${JSON.stringify(scl)}`);
-    }
-    return {
-      upAxis: (up as ModelTransform["upAxis"]) ?? "y",
-      center: (ctr as ModelTransform["center"]) ?? "bottom",
-      rotate: triple(rot, "--rotate") ?? [0, 0, 0],
-      translate: triple(tr, "--translate") ?? [0, 0, 0],
-      scale: scale ?? 1,
-    };
-  })();
+  const modelXf: ModelTransform | null = parseModelTransform(a);
   if (modelXf) {
     const bounds: Aabb = { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] };
     for (const fr of frames) {
@@ -329,9 +448,10 @@ async function encode(a: string[]) {
   // match what the geo half of the same op pasted.
   // The atlases must take the SAME window as the meshes, or every frame would wear the texture of a
   // frame `from` earlier.
-  const atlasFiles = all.filter((f) => /atlas.*\.png$/i.test(f)).sort().slice(0, maxFrames).slice(from, toExcl);
+  const atlasFiles = naturalSort(all.filter((f) => /atlas.*\.png$/i.test(f))).slice(0, maxFrames).slice(from, toExcl);
   const copyOps: CopyOp[] = editList ? collectCopyOps(editList.ranges, frames.length) : [];
   const recolorOps = editList ? collectRecolorOps(editList.ranges, frames.length) : [];
+  const paintOps = editList ? collectPaintOps(editList.ranges, frames.length) : [];
   const copyPastes = new Map<CopyOp, Map<number, EncodeMeshFrame>>();
   const texelPlans = new Map<CopyOp, Map<number, TexelPatchPlan>>();
   const copyFragments = new Map<CopyOp, EncodeMeshFrame>();
@@ -474,6 +594,61 @@ async function encode(a: string[]) {
     }
   }
 
+  // Texture paint (action:"paint"): texel-granular soft brush over the range's world-anchored
+  // region — sculpt+paint plan §B, build item 1. Same pipeline position as recolor (after copy,
+  // before decimate), same per-frame own-mesh own-atlas resolution; differs only in per-texel
+  // SDF-feathered weights (paint.ts). The complement footprint guards the 2 px edge dilation
+  // exactly as recolor's dilation ring is guarded.
+  const paintPatches = new Map<number, PaintPatch[]>();
+  if (paintOps.length) {
+    if (has(a, "--no-texture")) {
+      console.warn(`[ares] paint: --no-texture set — paint only ever produces atlas-texel patches, skipping ${paintOps.length} range(s)`);
+    } else if (!atlasFiles.length) {
+      console.warn(`[ares] paint: no atlas PNGs found — skipping (paint only ever produces atlas-texel patches)`);
+    } else {
+      const atlasPath = join(dir, atlasFiles[0]!);
+      const { width: rw, height: rh } = pngSize(await readFile(atlasPath));
+      for (const op of paintOps) {
+        const id = op.range.id ?? "?";
+        let framesTouched = 0, totalPx = 0;
+        for (let f = op.startFrame; f <= op.endFrame; f++) {
+          const sdf = prepareRangeSdfAt(op.range, f);
+          if (!sdf) continue; // keyframe-less range — same no-op law as delete preview
+          const weights = rasterizePaintWeights(frames[f]!, sdf, rw, rh, op.feather);
+          if (!weights) continue;
+          // complement occupancy = footprint of triangles fully OUTSIDE the feathered region
+          const { other } = partitionTrianglesByCentroid(frames[f]!, (x, y, z) => sdf(x, y, z) < op.feather);
+          const otherFoot = rasterizeUvFootprint({ positions: frames[f]!.positions, uvs: frames[f]!.uvs, indices: other }, rw, rh);
+          dilatePaintWeights(weights, rw, rh, 2, otherFoot);
+          let px = 0;
+          for (let p = 0; p < weights.length; p++) if (weights[p]! > 0) px++;
+          totalPx += px; framesTouched++;
+          const arr = paintPatches.get(f) ?? [];
+          arr.push({ weights, brush: op.brush, color: op.color, strength: op.strength, rangeId: id });
+          paintPatches.set(f, arr);
+        }
+        console.log(`[ares] paint ${id} (frames ${op.startFrame}-${op.endFrame}, ${op.brush}${op.color ? " " + hexOf(op.color) : ""} strength ${op.strength} feather ${op.feather.toFixed(0)}mm): ` +
+          `${framesTouched} frame(s) touched, ${totalPx} weighted texel(s) total`);
+      }
+    }
+  }
+
+  // Sculpt (action:"sculpt"): world-anchored vertex displacement — after the texel ops (which
+  // rasterize against the un-sculpted UV footprints they were authored on) and BEFORE delete/keep
+  // and decimate, so a sculpted region that is also cropped is shaped first, then cut.
+  const sculptOps = editList ? collectSculptOps(editList.ranges, frames.length) : [];
+  for (const op of sculptOps) {
+    const id = op.range.id ?? "?";
+    let framesTouched = 0, verts = 0, feather = 0;
+    for (let f = op.startFrame; f <= op.endFrame; f++) {
+      const st = applySculptToFrame(frames[f]!, op, f);
+      if (!st) continue;
+      framesTouched++; verts += st.vertices; feather = st.feather;
+    }
+    console.log(`[ares] sculpt ${id} (${op.brush}, frames ${op.startFrame}-${op.endFrame}${op.brush === "move" ? `, offset [${op.offset}]` : `, amount ${op.amount}`}${op.brush === "smooth" ? `, ${op.iterations} it` : ""}): ` +
+      `${framesTouched} frame(s) touched, ${verts} vertex moves total, feather ${feather.toFixed(1)}`);
+  }
+
   if (editList) {
     let before = 0, after = 0;
     for (let f = 0; f < frames.length; f++) {
@@ -589,9 +764,12 @@ async function encode(a: string[]) {
       const pat = detectPattern(atlasFiles);
       if (!pat) console.warn("[ares] could not detect atlas filename pattern — skipping texture.");
       else {
-        const codec = ((flag(a, "--texture-codec") ?? "vp9") as TexCodec);
-        const size = Number(flag(a, "--tex-size") ?? 1024);
-        const crf = Number(flag(a, "--crf") ?? 32);
+        const codecRaw = flag(a, "--texture-codec") ?? "vp9";
+        if (codecRaw !== "vp9" && codecRaw !== "av1") throw new Error(`--texture-codec: expected vp9|av1, got ${JSON.stringify(codecRaw)}`);
+        const codec = codecRaw as TexCodec;
+        const size = numFlag(a, "--tex-size", 1024, { min: 16, max: 8192, int: true });
+        if (size % 2) throw new Error(`--tex-size: ${size} is odd; 4:2:0 video needs even dimensions`);
+        const crf = numFlag(a, "--crf", 32, { min: 0, max: 63, int: true });
 
         // Copy texels (frame-copy "texels"/"both", editor v3 §1): patch a scratch copy of the
         // atlas directory before ffmpeg reads it — encodeTextureVideo reads atlas PNGs straight
@@ -599,18 +777,31 @@ async function encode(a: string[]) {
         let texDir = dir;
         let cleanupTexDir: (() => Promise<void>) | undefined;
         const texelOps = copyOps.filter((o) => o.what !== "geo");
-        if (texelOps.length || recolorPatches.size || holeTileFills.size) {
+        if (texelOps.length || recolorPatches.size || holeTileFills.size || paintPatches.size) {
           const tp = performance.now();
-          const patched = await buildPatchedAtlasDir(dir, atlasFiles, texelOps, texelPlans, recolorPatches, holeTileFills);
+          const patched = await buildPatchedAtlasDir(dir, atlasFiles, texelOps, texelPlans, recolorPatches, holeTileFills, paintPatches);
           texDir = patched.dir;
           cleanupTexDir = patched.cleanup;
-          console.log(`[ares] atlas patch: ${patched.patchedFrames} atlas frame(s) patched (copy + recolor + hole-patch, one decode each) in ${((performance.now() - tp) / 1000).toFixed(1)}s`);
+          console.log(`[ares] atlas patch: ${patched.patchedFrames} atlas frame(s) patched (copy + recolor + paint + hole-patch, one decode each) in ${((performance.now() - tp) / 1000).toFixed(1)}s`);
         }
 
+        // --repack-detect image: measure actual atlas content change instead of inferring a
+        // repack from geometry topology. The topology heuristic is right for raw captures (a
+        // topology reset there always re-packs the atlas), but WRONG for stable-layout rebakes
+        // (v7-style: topology changes every frame while the atlas layout holds still) — it
+        // would force a keyframe per frame and forfeit the entire inter-coding win. Image mode:
+        // one ffmpeg pass decodes every atlas at 64² gray; consecutive mean-abs-diff over ~12
+        // luma (measured: within-run ~4, at a true repack ~37) marks a repack.
+        let texRepack = repackFrames;
+        if (flag(a, "--repack-detect") === "image") {
+          texRepack = await detectRepackByImage(texDir, pat.pattern, pat.startNumber, files.length);
+          console.log(`[ares] image-based repack detection: ${texRepack.size} repack frame(s)` +
+            (texRepack.size ? ` — ${[...texRepack].slice(0, 20).join(", ")}${texRepack.size > 20 ? ", …" : ""}` : ""));
+        }
         console.log(`[ares] encoding texture video (${codec} ${size}²) from ${atlasFiles.length} atlas frames — this runs ffmpeg per GOP…`);
         const tt = performance.now();
         // .finally: the scratch atlas copy can be GBs — reclaim it even when ffmpeg throws.
-        const tv = await encodeTextureVideo({ dir: texDir, pattern: pat.pattern, startNumber: pat.startNumber, frameCount: files.length, gopLength: gop, fps, codec, size, crf, repackFrames })
+        const tv = await encodeTextureVideo({ dir: texDir, pattern: pat.pattern, startNumber: pat.startNumber, frameCount: files.length, gopLength: gop, fps, codec, size, crf, repackFrames: texRepack })
           .finally(() => cleanupTexDir?.());
         const texBytes = tv.gops.reduce((s, g) => s + g.frames.reduce((ss, f) => ss + f.data.byteLength, 0), 0);
         textureVideo = { fourcc: tv.fourcc, width: tv.width, height: tv.height, gops: tv.gops };
@@ -623,13 +814,14 @@ async function encode(a: string[]) {
 
   const temporal = {
     track: has(a, "--track"),
-    smoothSpatial: Number(flag(a, "--smooth") ?? 0),
-    smoothTemporal: Number(flag(a, "--smooth-temporal") ?? 0),
+    smoothSpatial: numFlag(a, "--smooth", 0, { min: 0, int: true }),
+    smoothTemporal: numFlag(a, "--smooth-temporal", 0, { min: 0, int: true }),
     // --no-temporal: force all-intra geometry (proven-safe for multi-topology coherent bakes, whose
     // temporal I+P path shredded geometry across run/topology boundaries).
     forceIntra: has(a, "--no-temporal"),
   };
-  const clip: MuxClip = { fps, frames, gopLength: gop, textureVideo, temporal, meta: { title: dir, encoder: "ares-cli/0.1.0", source: isObj ? "obj" : "ply" } };
+  const audio = await audioFromFlags(a, fps, from, frames.length);
+  const clip: MuxClip = { fps, frames, gopLength: gop, textureVideo, temporal, audio: audio ?? undefined, meta: { title: dir, encoder: "ares-cli/0.2.0", source: isObj ? "obj" : "ply" } };
   const t1 = performance.now();
   const r = await muxClipWithStats(clip);
   await writeFile(out, r.bytes);
@@ -683,31 +875,199 @@ async function encode(a: string[]) {
       texSize: usedTexture ? Number(flag(a, "--tex-size") ?? 1024) : null,
       textureCodec: usedTexture ? (flag(a, "--texture-codec") ?? "vp9") : null,
       crf: usedTexture ? Number(flag(a, "--crf") ?? 32) : null,
-      quantBitsPos: 14, quantBitsUv: 14, // muxer defaults (no CLI override today)
+      quantBitsPos: 14, quantBitsUv: 16, // muxer defaults (UVs are 16-bit; the superblock field used to misreport 14)
       noTexture, forceIntra: temporal.forceIntra, track: temporal.track,
       smoothSpatial: temporal.smoothSpatial, smoothTemporal: temporal.smoothTemporal,
       decimate: decimateArg ? Number(decimateArg) : null,
       crop: cropArg ?? null,
       edits: editsArg ? basename(editsArg) : null,
+      audio: audio ? { source: basename(flag(a, "--audio")!), bitrateKbps: numFlag(a, "--audio-bitrate", 96), offsetSec: numFlag(a, "--audio-offset", 0), packets: audio.packets.length } : null,
     },
     geometry: { mode, temporalFrames: r.temporalFrames, intraFrames: r.intraFrames },
-    tooling: { encoder: "ares-cli/0.1.0", node: process.version, generatedBy: "ares encode" },
+    tooling: { encoder: "ares-cli/0.2.0", node: process.version, generatedBy: "ares encode" },
   });
-  await info([out]);
+  await info(["info", out]);
+}
+
+/**
+ * Splat-profile encode (spec §6.8): one splat file per frame — SPZ (Scaniverse, Marble), 3DGS PLY
+ * (every trainer, Polycam, Luma), .splat, glTF/GLB with KHR_gaussian_splatting, or SOG (SuperSplat).
+ * Positions are taken in the file's own frame; --rotate/--up-axis/--center/--scale bake an
+ * orientation exactly as for meshes (rotations and scales follow the transform).
+ */
+async function encodeSplats(a: string[], dir: string, files: string[], kind: SplatKind, out: string, fps: number, gop: number, from: number, toExcl: number, discoveredCount: number): Promise<void> {
+  console.log(`[ares] ${files.length} ${kind.toUpperCase()} splat frame(s) @ ${fps}fps, gop=${gop}`);
+  const t0 = performance.now();
+  let frames: SplatFrame[] = [];
+  for (const f of files) {
+    const path = f === "." ? dir : join(dir, f);
+    let fr: SplatFrame;
+    if (kind === "sog") fr = await parseSog(path);
+    else {
+      const buf = new Uint8Array(await readFile(path));
+      fr = kind === "spz" ? parseSpz(buf)
+        : kind === "splat" ? parseSplatFile(buf)
+        : kind === "gltf" ? parseGltfSplat(buf, { loadUri: (u) => new Uint8Array(readFileSync(join(dir, u))) })
+        : parsePlySplat(buf);
+    }
+    frames.push(fr);
+  }
+  const n0 = frames[0]!.count;
+  const maxDegree = frames.reduce((m, f) => Math.max(m, f.sh ? f.shDegree : 0), 0);
+  console.log(`[ares] imported ${files.length} splat frame(s) (~${n0} splats, SH degree ${maxDegree}) in ${((performance.now() - t0) / 1000).toFixed(1)}s`);
+
+  const minAlpha = numFlag(a, "--splat-min-alpha", 0, { min: 0, max: 1 });
+  if (minAlpha > 0) {
+    let before = 0, after = 0;
+    frames = frames.map((f) => { before += f.count; const g = filterSplatFrame(f, (i) => f.opacities[i]! >= minAlpha); after += g.count; return g; });
+    console.log(`[ares] --splat-min-alpha ${minAlpha}: ${before} → ${after} splats (${((1 - after / Math.max(1, before)) * 100).toFixed(1)}% dropped)`);
+  }
+
+  const modelXf = parseModelTransform(a);
+  if (modelXf) {
+    const bounds: Aabb = { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] };
+    for (const fr of frames) {
+      const p = fr.positions;
+      for (let i = 0; i < p.length; i += 3) for (let k = 0; k < 3; k++) {
+        const v = p[i + k]!;
+        if (v < bounds.min[k]!) bounds.min[k] = v;
+        if (v > bounds.max[k]!) bounds.max[k] = v;
+      }
+    }
+    const offset = resolveOffset(bounds, modelXf);
+    const m = transformMatrix(modelXf, offset);
+    for (const fr of frames) transformSplatFrame(fr, m);
+    console.log(`[ares] transform: up=${modelXf.upAxis} center=${modelXf.center} scale=${modelXf.scale} rotate=[${modelXf.rotate}] translate=[${modelXf.translate}]`);
+  }
+
+  const shDegree = flag(a, "--sh-degree") !== undefined ? numFlag(a, "--sh-degree", 3, { min: 0, max: 3, int: true }) : undefined;
+  const quantBits = numFlag(a, "--quant-bits", 14, { min: 8, max: 16, int: true });
+  const orderRaw = flag(a, "--splat-order") ?? "morton";
+  if (orderRaw !== "morton" && orderRaw !== "none") throw new Error(`--splat-order: expected morton|none, got ${JSON.stringify(orderRaw)}`);
+  const boxAlpha = numFlag(a, "--splat-box-alpha", 0, { min: 0, max: 1 });
+  const tmodeRaw = flag(a, "--splat-temporal") ?? "auto";
+  if (!["auto", "index", "nn", "off"].includes(tmodeRaw)) throw new Error(`--splat-temporal: expected auto|index|nn|off, got ${JSON.stringify(tmodeRaw)}`);
+  const splatTemporal = { mode: tmodeRaw as "auto" | "index" | "nn" | "off", matchDist: numFlag(a, "--splat-match", 0.01, { min: 0.0001, max: 0.5 }), minSurvive: numFlag(a, "--splat-min-survive", 0.5, { min: 0, max: 1 }) };
+
+  const audio = await audioFromFlags(a, fps, from, frames.length);
+  const t1 = performance.now();
+  const r = await muxClipWithStats({
+    fps, splatFrames: frames, gopLength: gop, quantBitsPos: quantBits, shDegree, splatMorton: orderRaw === "morton", splatBoxMinAlpha: boxAlpha,
+    splatTemporal, audio: audio ?? undefined,
+    meta: { title: dir, encoder: "ares-cli/0.2.0", source: kind, profile: "splat" },
+  });
+  await writeFile(out, r.bytes);
+  console.log(`[ares] splat geometry: ${r.temporalFrames} P + ${r.intraFrames} I frame(s) (${tmodeRaw})`);
+  console.log(`[ares] wrote ${out} — ${(r.bytes.length / 1048576).toFixed(2)} MB, ${(r.bytes.length / files.length / 1024).toFixed(1)} KB/frame, muxed in ${((performance.now() - t1) / 1000).toFixed(1)}s`);
+  let srcBytes = 0;
+  for (const f of files) { try { srcBytes += (await stat(f === "." ? dir : join(dir, f))).size; } catch { /* skip */ } }
+  await writeClipMeta(a, out, {
+    output: { name: basename(out), sizeBytes: r.bytes.length, frames: files.length, fps, durationS: +(files.length / fps).toFixed(2) },
+    source: { dir, kind: `splat-${kind}`, splatFrames: files.length, discoveredFrames: discoveredCount, splatCount: n0, shDegree: maxDegree, totalBytes: srcBytes, fileCount: files.length },
+    encode: {
+      profile: "splat", gop, quantBitsPos: quantBits, shDegree: shDegree ?? maxDegree, splatOrder: orderRaw, splatMinAlpha: minAlpha, splatBoxAlpha: boxAlpha,
+      splatTemporal: tmodeRaw, splatMatch: splatTemporal.matchDist, splatMinSurvive: splatTemporal.minSurvive, temporalFrames: r.temporalFrames, intraFrames: r.intraFrames,
+      trim: { in: from, out: toExcl - 1, sourceFrames: discoveredCount },
+      transform: modelXf,
+    },
+    tooling: { encoder: "ares-cli/0.2.0", node: process.version, generatedBy: "ares encode" },
+  });
+  await info(["info", out]);
+}
+
+/** Locate frame `idx` in a parsed file: its chunk, its block, and the keyframe block(s) leading to it. */
+function locateFrame(file: ReturnType<typeof Demuxer.parse>, idx: number) {
+  for (const gop of file.gopIndex) {
+    if (idx < gop.frameStart || idx >= gop.frameStart + gop.frameCount) continue;
+    const chunk = Demuxer.chunkAt(file, gop);
+    const blocks = Demuxer.geometryBlocks(file, chunk);
+    const local = idx - gop.frameStart;
+    if (local >= blocks.length) break;
+    let kf = local;
+    while (kf > 0 && blocks[kf]!.type !== BlockType.GeometryI) kf--;
+    return { chunk, blocks, local, kf };
+  }
+  throw new Error(`frame ${idx} is out of range (0..${file.header.frameCount - 1})`);
+}
+
+/** `ares export <in.ares> -o <out> [--frame N]` — one frame back to an interchange format. */
+async function exportCmd(a: string[]) {
+  const input = a[1]!;
+  const out = flag(a, "-o");
+  if (!out) throw new Error("export: -o <out.obj|ply|spz|glb|splat> is required");
+  const idx = numFlag(a, "--frame", 0, { min: 0, int: true });
+  const file = Demuxer.parse(new Uint8Array(await readFile(input)));
+  await meshoptReady();
+  const { chunk, blocks, local, kf } = locateFrame(file, idx);
+  const ext = extname(out).toLowerCase();
+  const bits = file.superblock.quantBitsPos;
+  if (file.header.geometryProfile === GeometryProfile.SplatIPB) {
+    let dec = decodeSplatBlock(blocks[kf]!.data);
+    for (let f = kf + 1; f <= local; f++) dec = decodeSplatPBlock(blocks[f]!.data, dec);
+    const frame = decodedSplatToFrame(dec, chunk.gopAabb, dequantScale(bits));
+    const bytes = ext === ".spz" ? writeSpz(frame) : ext === ".ply" ? writeSplatPly(frame) : ext === ".glb" ? writeGlbSplat(frame) : ext === ".splat" ? writeSplatFile(frame) : null;
+    if (!bytes) throw new Error(`export: splat frames export to .spz, .ply, .glb or .splat (got ${ext || "no extension"})`);
+    await writeFile(out, bytes);
+    console.log(`[ares] exported frame ${idx}: ${frame.count} splats, SH degree ${frame.shDegree} → ${out} (${(bytes.length / 1024).toFixed(1)} KB)`);
+    return;
+  }
+  let g: DecodedGeometry = decodeGeometryBlock(blocks[kf]!.data);
+  for (let f = kf + 1; f <= local; f++) {
+    const p = decodePFrameBlock(blocks[f]!.data, g.positionsQ);
+    g = { ...g, positionsQ: p.positionsQ, uvsQ: p.uvsQ ?? g.uvsQ, normalsQ: p.normalsQ ?? g.normalsQ };
+  }
+  const frame = decodedMeshToFrame(g, chunk.gopAabb, bits, file.superblock.normalEncoding);
+  if (ext === ".obj") await writeFile(out, writeObj(frame, basename(input, ".ares")));
+  else if (ext === ".ply") await writeFile(out, writeMeshPly(frame));
+  else throw new Error(`export: mesh frames export to .obj or .ply (got ${ext || "no extension"})`);
+  console.log(`[ares] exported frame ${idx}: ${g.vertexCount} verts, ${g.indexCount / 3} tris → ${out}` + (file.tracks.length > 1 ? " (texture not exported — the atlas is a video track)" : ""));
 }
 
 async function info(a: string[]) {
-  const path = a[a.length - 1]!;
-  const file = Demuxer.parse(await readFile(path));
+  const path = a[1]!;
+  const file = Demuxer.parse(new Uint8Array(await readFile(path)));
   const h = file.header, s = file.superblock;
+  const profile = h.geometryProfile === GeometryProfile.SplatIPB ? "splat" : h.geometryProfile === GeometryProfile.MeshIPB ? "mesh" : `profile ${h.geometryProfile}`;
   console.log(`[ares] ${path}: v${h.versionMajor}.${h.versionMinor}, ${h.frameCount} frames @ ${h.fps}fps, ${(Number(h.durationUs) / 1e6).toFixed(2)}s`);
-  console.log(`       geometry profile=${h.geometryProfile} intra=${h.intraCodec} · quant ${s.quantBitsPos}b pos / ${s.quantBitsUv}b uv · gop=${s.gopLength}`);
+  if (h.geometryProfile === GeometryProfile.SplatIPB) {
+    await meshoptReady();
+    let n = 0;
+    try { const { blocks } = locateFrame(file, 0); n = decodeSplatBlock(blocks[0]!.data).count; } catch { /* leave 0 */ }
+    console.log(`       geometry ${profile} · ${n} splats in frame 0 · SH degree ${s.shDegree} · quant ${s.quantBitsPos}b pos · gop=${s.gopLength}`);
+  } else {
+    console.log(`       geometry ${profile} intra=${h.intraCodec} · quant ${s.quantBitsPos}b pos / ${s.quantBitsUv}b uv · gop=${s.gopLength}`);
+  }
   console.log(`       ${file.gopIndex.length} chunk(s), ${file.tracks.length} track(s): ${file.tracks.map((t) => t.codecFourcc).join(", ")}`);
   const vid = Demuxer.textureVideo(file);
   const tex = Demuxer.textureAtlas(file);
   console.log(`       texture: ${vid ? `${vid.fourcc} video ${vid.width}x${vid.height}` : tex ? `${tex.width}x${tex.height} still atlas, ${(tex.bytes.length / 1024).toFixed(1)} KB` : "none"}`);
+  const at = Demuxer.audioTrack(file);
+  if (at) {
+    let packets = 0, bytes = 0, endUs = 0;
+    for (const gop of file.gopIndex) for (const p of Demuxer.audioPackets(file, Demuxer.chunkAt(file, gop))) { packets++; bytes += p.data.byteLength; endUs = Math.max(endUs, p.ptsUs + p.durationUs); }
+    console.log(`       audio: ${at.fourcc} 48 kHz ${at.channels === 1 ? "mono" : "stereo"}, ${packets} packets, ${(endUs / 1e6).toFixed(2)}s, ${(bytes / 1024).toFixed(1)} KB`);
+  }
   console.log(`       AABB min [${s.aabb.min.map((v) => v.toFixed(2)).join(", ")}] max [${s.aabb.max.map((v) => v.toFixed(2)).join(", ")}]`);
 }
+
+const USAGE = `usage:
+  ares synth  [-o out.ares] [--shape object|talk|splat] [--frames 60] [--fps 30] [--no-texture] [--sh-degree 0|1]
+  ares encode <frames-dir> [-o out.ares] [--fps 30] [--max-frames N] [--gop 30]
+              mesh input (OBJ/PLY + atlas-*.png):
+              [--texture-codec vp9|av1] [--tex-size 1024] [--crf 32] [--no-texture]
+              [--edits file.json] [--crop x0,y0,z0,x1,y1,z1] [--track] [--no-temporal]
+              [--smooth N] [--smooth-temporal N] [--decimate ratio] [--repack-detect topology|image]
+              splat input (one .spz / 3DGS .ply / .splat / .glb|.gltf (KHR_gaussian_splatting) / .sog per frame):
+              [--sh-degree 0..3] [--splat-min-alpha a] [--splat-box-alpha a] [--splat-order morton|none] [--quant-bits 8..16]
+              [--splat-temporal auto|index|nn|off] [--splat-match 0.01] [--splat-min-survive 0.5]   (P-frames: deltas + births/deaths)
+              both:
+              [--trim-in N] [--trim-out N]  (clip in/out, inclusive source frames)
+              [--up-axis x|y|z] [--center bottom|mass|none] [--scale N] [--rotate x,y,z] [--translate x,y,z]
+              [--meta-extra-file f.json]  (merged into the <out>.ares.meta.json provenance sidecar)
+              [--audio file] [--audio-offset seconds] [--audio-bitrate kbps]   (any format ffmpeg reads → Opus 48 kHz)
+  ares export <file.ares> -o <out> [--frame N]
+              mesh → .obj | .ply      splat → .spz | .ply (3DGS) | .glb (KHR_gaussian_splatting) | .splat
+  ares info   <file.ares>`;
 
 async function main() {
   const a = process.argv.slice(2);
@@ -715,10 +1075,11 @@ async function main() {
   try {
     if (cmd === "synth") await synth(a);
     else if (cmd === "encode" && a[1]) await encode(a);
+    else if (cmd === "export" && a[1]) await exportCmd(a);
     else if (cmd === "info" && a[1]) await info(a);
     else {
-      console.error("usage:\n  ares synth [-o out.ares] [--shape object|talk] [--frames 60] [--fps 30] [--no-texture]\n  ares encode <frames-dir> [-o out.ares] [--fps 30] [--max-frames N] [--gop 30]\n              [--texture-codec vp9|av1] [--tex-size 1024] [--crf 32] [--no-texture]\n              [--edits file.json] [--crop x0,y0,z0,x1,y1,z1] [--track] [--no-temporal]\n              [--smooth N] [--smooth-temporal N] [--decimate ratio]\n              [--meta-extra-file f.json]  (merged into the <out>.ares.meta.json provenance sidecar)\n  ares info <file.ares>");
-      process.exit(1);
+      console.error(USAGE);
+      process.exit(cmd === "--help" || cmd === "-h" || cmd === "help" ? 0 : 1);
     }
   } catch (e) {
     console.error("[ares] error:", (e as Error).message);

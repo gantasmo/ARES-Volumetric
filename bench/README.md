@@ -5,8 +5,8 @@ Draco-GLB and meshopt-GLB baselines from the same source, on the same device.
 
 ## Run it
 
-- **Windows, 1-click:** double-click **`Run ARES Bench.vbs`** (repo root). Runs silently
-  (~1–2 min), then opens the report page. Log: `ares/tools/bench.log`.
+- **Windows, 1-click:** **`ARES.vbs bench`** (repo root; `tools\launch-console.cmd bench` to
+  watch it). Runs silently (~1–2 min), then opens the report page. Log: `ares/tools/launch.log`.
 - **Any OS:** `cd ares && npm run build && npm run bench`
   (flags: `--frames N --bits 14 --reps 3 --clips talk,two --skip-draco --skip-sweep`)
 - **Report:** `/bench/report/` on the dev server (`npm start`) — Pareto scatter, quantization

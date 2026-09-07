@@ -20,7 +20,7 @@ const $ = (id) => document.getElementById(id);
  *  "＋ Add…" source-bar picker uses — main.js's openAddPicker), so a new bake shows up here on the
  *  next Compare tab open with no code edit. */
 const CURATED_LABELS = {
-  "daniel-s0.ares": "KEEPER · smooth 0 · oct16+AV1 1024²",
+  "daniel-s0.ares": "reference · smooth 0 · oct16+AV1 1024²",
   "daniel-dec06.ares": "decimate 0.6 · 12k tris · 36.6 MB (eval)",
   "daniel-s0hq.ares": "s0 HQ · 2048² texture (seam-line test)",
   "daniel-s1.ares": "smooth 1 · oct16+AV1 1024²",
@@ -88,7 +88,7 @@ async function createA(src) {
   const scrub = $("cmpScrub");
   scrub.max = String(Math.max(1, frameCount - 1));
   scrub.step = "1";
-  $("cmpLabelA").textContent = "◀ A: " + labelOf(src);
+  $("cmpLabelA").textContent = "◀︎ A: " + labelOf(src);
   fitBoth();
 }
 
@@ -98,8 +98,17 @@ async function createB(src) {
   window.__cmpB = B; // debug handle
   if (A) B.setCamera(A.getCamera());
   applyCmpShade();
-  $("cmpLabelB").textContent = "B: " + labelOf(src) + " ▶";
+  $("cmpLabelB").textContent = "B: " + labelOf(src) + " ▶︎";
   fitBoth();
+}
+
+/** Tab visibility: the shared clock only runs while the Compare tab is up — two extra players
+ *  decoding forever behind the Viewer was the audit's finding. main.js calls this from setTab. */
+let active = false;
+export function setCompareActive(on) {
+  active = !!on;
+  if (!active) { if (raf) cancelAnimationFrame(raf); raf = 0; return; }
+  if (!raf && (A || B)) { lastNow = performance.now(); drive(lastNow); }
 }
 
 /** The shared clock: advance t, mirror the camera, seek BOTH players to the same instant. */
@@ -152,6 +161,14 @@ export async function initCompare() {
   selB.onchange = () => createB(selB.value).catch(showErr);
 
   $("cmpPlay").onclick = () => { playing = !playing; $("cmpPlay").textContent = playing ? "Pause" : "Play"; };
+  // Space plays/pauses the pair (the tooltip promised it; the global handler defers to tool tabs).
+  window.addEventListener("keydown", (e) => {
+    if (e.key !== " " || !$("tab-compare").classList.contains("active")) return;
+    const t = e.target;
+    if (t && (t.tagName === "INPUT" || t.tagName === "SELECT" || t.tagName === "TEXTAREA" || t.tagName === "BUTTON")) return;
+    e.preventDefault(); $("cmpPlay").click();
+  });
+  active = true;
   const orbitBtn = $("cmpOrbit");
   orbitBtn.setAttribute("aria-pressed", "false");
   orbitBtn.onclick = () => { orbitOn = !orbitOn; orbitBtn.setAttribute("aria-pressed", String(orbitOn)); };

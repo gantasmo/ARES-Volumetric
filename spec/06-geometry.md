@@ -214,9 +214,20 @@ Design notes:
   splat *birth/death* must be coded.
 - **Video-packed attributes.** Following PackUV [43], splat attributes can be laid into 2D tiles and
   encoded as a video track ([§8.5](#85-video-assisted-geometry-packing-attributes-into-pixels)),
-  routing splat geometry through the hardware decoder just like texture.
-- **Rendering.** WebGPU instanced billboards with additive/OIT blending and a per-frame compute-shader
-  depth sort ([§12](#12-javascript--webgpu-implementation)).
+  routing splat geometry through the hardware decoder just like texture. The §8.5.1 warning applies
+  in full: only colour is video-shaped. Positions fail exactly as for meshes, and rotations fail
+  worse — a quaternion is not spatially coherent, and a jittered splat has no index buffer holding
+  it in place. The claim that "splats tolerate lossy packing better" holds for colour, not geometry.
+- **Rendering.** Instanced quads per splat, back-to-front through an index indirection from a CPU
+  counting sort (re-sorted only when the view direction moves), EWA covariance projection in the
+  vertex stage, premultiplied "over" compositing. Both backends (WebGPU storage buffers; WebGL2
+  data textures) — [§12](#12-javascript--webgpu-implementation).
+
+**Implementation (2026-09-07).** The intra splat profile ships: block layout in
+[§11.6.3](#1163-geometry-block--splat-profile); importers for Niantic SPZ (v1–v4), 3DGS PLY,
+`.splat`, glTF/GLB with `KHR_gaussian_splatting`, and PlayCanvas SOG; exporters for SPZ, 3DGS PLY,
+glTF/GLB and `.splat` (`ares export`). Degree 0 is the fast path (the common case for generated
+environments); degrees 1–3 are carried as 8-bit bands and evaluated in the vertex shader.
 
 ### 6.9 Hybrid geometry (per-stream representations)
 

@@ -1,5 +1,5 @@
 # ARES SAM service worker. Started from the app (serve.mjs samEnsure / the editor's SAM
-# row) or via "Launch SAM Service.vbs" (hidden) — runs the local segmentation API
+# row) or via `ARES.vbs sam` (hidden) — runs the local segmentation API
 # (FastAPI/uvicorn, http://127.0.0.1:7263). Backend: SAM 3 (transformers, bf16) with a
 # SAM v1 ViT-H fallback — see main.py. Log: tools\sam-service\sam-service.log.
 # Windows PowerShell 5.1 compatible.
@@ -22,7 +22,7 @@ try { Start-Transcript -Path $LogFile -Force | Out-Null } catch {}
 
 function Done { try { Stop-Transcript | Out-Null } catch {} }
 function Fail($msg) {
-    # This script is always launched HIDDEN (serve.mjs -WindowStyle Hidden, and "Launch SAM Service.vbs").
+    # This script is always launched HIDDEN (serve.mjs and the launcher both pass -WindowStyle Hidden).
     # A MessageBox here is therefore invisible AND blocks the process forever — which strands serve.mjs's
     # samChild at exitCode=null so samEnsure never re-spawns (the "SAM keeps failing to start" deadlock,
     # diagnosed + fixed 2026-07-13). Log loudly to the transcript and exit so the parent detects the exit

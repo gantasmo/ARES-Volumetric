@@ -3,7 +3,8 @@
  * Each frame carries full geometry (P1 is intra-only) with a temporally STABLE UV atlas
  * (spec §7.4) so the same still texture samples correctly across the animation.
  */
-import type { EncodeMeshFrame } from "./geometry-encode.js";
+import { computeSmoothNormals, type EncodeMeshFrame } from "./geometry-encode.js";
+import { emptySplatFrame, quatMul, type SplatFrame } from "./splat-frame.js";
 
 export interface SynthClip {
   name: string;
@@ -155,4 +156,61 @@ function talkClip(frames: number, fps: number): SynthClip {
 
 export function synthClip(shape: "object" | "talk", frames: number, fps: number): SynthClip {
   return shape === "talk" ? talkClip(frames, fps) : objectClip(frames, fps);
+}
+
+export interface SynthSplatClip { name: string; fps: number; splatFrames: SplatFrame[]; }
+
+/** Quaternion (xyzw) rotating +Z onto unit vector n. */
+function quatFromZTo(n: Vec3): [number, number, number, number] {
+  const d = n[2];
+  if (d < -0.999999) return [1, 0, 0, 0];             // antiparallel: 180° about X
+  const cx = -n[1], cy = n[0], cz = 0;                 // cross((0,0,1), n)
+  const w = 1 + d;
+  const l = Math.hypot(cx, cy, cz, w) || 1;
+  return [cx / l, cy / l, cz / l, w / l];
+}
+
+/**
+ * Splat-profile stand-in: the torus knot surface sampled as flat oriented discs (the "splats are
+ * discs, not blobs" finding — flattest axis = surface normal), colour from parameter space,
+ * rotating and breathing like the mesh object clip. `shDegree` 1 adds a deterministic
+ * view-dependent tint so the SH path renders something visible.
+ */
+export function synthSplatClip(frames: number, fps: number, shDegree: 0 | 1 = 0): SynthSplatClip {
+  const base = torusKnot(300, 40);
+  const normals = computeSmoothNormals(base.positions, base.indices);
+  const n = base.positions.length / 3;
+  const spacing = (2 * Math.PI * 0.5) / 40;           // tube circumference / segments
+  const out: SplatFrame[] = [];
+  for (let fi = 0; fi < frames; fi++) {
+    const tt = fi / fps;
+    const th = 2 * Math.PI * 0.25 * tt;
+    const c = Math.cos(th), s = Math.sin(th);
+    const breathe = 1 + 0.06 * Math.sin(2 * Math.PI * 0.5 * tt);
+    const qY: [number, number, number, number] = [0, Math.sin(th / 2), 0, Math.cos(th / 2)];
+    const f = emptySplatFrame(n, shDegree);
+    for (let i = 0; i < n; i++) {
+      const x = base.positions[i * 3]! * breathe, y = base.positions[i * 3 + 1]! * breathe, z = base.positions[i * 3 + 2]!;
+      f.positions[i * 3] = x * c - z * s;
+      f.positions[i * 3 + 1] = y;
+      f.positions[i * 3 + 2] = x * s + z * c;
+      const nn: Vec3 = [normals[i * 3]!, normals[i * 3 + 1]!, normals[i * 3 + 2]!];
+      const q = quatMul(qY, quatFromZTo(nn));
+      f.rotations.set(q, i * 4);
+      f.scales[i * 3] = spacing * 0.9; f.scales[i * 3 + 1] = spacing * 0.9; f.scales[i * 3 + 2] = spacing * 0.12;
+      const u = base.uvs[i * 2]! / 4, v = base.uvs[i * 2 + 1]!;
+      f.colors[i * 3] = 0.35 + 0.5 * (0.5 + 0.5 * Math.sin(2 * Math.PI * u));
+      f.colors[i * 3 + 1] = 0.35 + 0.4 * v;
+      f.colors[i * 3 + 2] = 0.45 + 0.35 * (0.5 + 0.5 * Math.cos(2 * Math.PI * u));
+      f.opacities[i] = 0.95;
+      if (shDegree === 1 && f.sh) {
+        // Degree-1 band: tint that leans warm when seen along +Y, cool along −Y.
+        f.sh[i * 9 + 0] = 0.15; f.sh[i * 9 + 1] = 0.05; f.sh[i * 9 + 2] = -0.10;   // coef 0 (y)
+        f.sh[i * 9 + 3] = 0.0; f.sh[i * 9 + 4] = 0.0; f.sh[i * 9 + 5] = 0.0;       // coef 1 (z)
+        f.sh[i * 9 + 6] = -0.05; f.sh[i * 9 + 7] = 0.0; f.sh[i * 9 + 8] = 0.10;    // coef 2 (x)
+      }
+    }
+    out.push(f);
+  }
+  return { name: "splat", fps, splatFrames: out };
 }

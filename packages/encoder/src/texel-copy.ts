@@ -33,6 +33,7 @@ import { ffmpegPath } from "./texture-video.js";
 import type { EncodeMeshFrame } from "./geometry-encode.js";
 import type { CopyOp } from "./frame-copy.js";
 import { applyRecolorToImage, type RecolorPatch } from "./recolor.js";
+import { applyPaintToImage, type PaintPatch } from "./paint.js";
 import { applyHoleFillToImage, type HoleTileFill } from "./hole-patch.js";
 
 const run = promisify(execFile);
@@ -412,11 +413,12 @@ export interface PatchedAtlasDir { dir: string; patchedFrames: number; cleanup()
 export async function buildPatchedAtlasDir(
   dir: string, atlasFiles: string[], ops: CopyOp[], plans: Map<CopyOp, Map<number, TexelPatchPlan>>,
   recolorPatches?: Map<number, RecolorPatch[]>, holeFills?: Map<number, HoleTileFill[]>,
+  paintPatches?: Map<number, PaintPatch[]>,
 ): Promise<PatchedAtlasDir> {
   const texOps = ops.filter((o) => o.what !== "geo");
   const work = await mkdtemp(join(tmpdir(), "ares-texcopy-"));
   const cleanup = () => rm(work, { recursive: true, force: true });
-  if (!texOps.length && !recolorPatches?.size && !holeFills?.size) {
+  if (!texOps.length && !recolorPatches?.size && !holeFills?.size && !paintPatches?.size) {
     for (const name of atlasFiles) await linkOrCopy(join(dir, name), join(work, name));
     return { dir: work, patchedFrames: 0, cleanup };
   }
@@ -434,8 +436,9 @@ export async function buildPatchedAtlasDir(
     const dstPath = join(work, name);
     const patches = patchesByDst.get(i);
     const recolors = recolorPatches?.get(i);
+    const paints = paintPatches?.get(i);
     const holes = holeFills?.get(i);
-    if ((!patches || !patches.length) && (!recolors || !recolors.length) && (!holes || !holes.length)) {
+    if ((!patches || !patches.length) && (!recolors || !recolors.length) && (!paints || !paints.length) && (!holes || !holes.length)) {
       await linkOrCopy(join(dir, name), dstPath);
       continue;
     }
@@ -460,7 +463,8 @@ export async function buildPatchedAtlasDir(
       }
     }
     if (recolors) for (const rp of recolors) applyRecolorToImage(dstImg.data, rp); // over the copy result, in queued order
-    if (holes) for (const hf of holes) applyHoleFillToImage(dstImg.data, dstImg.width, hf); // over copy + recolor, last
+    if (paints) for (const pp of paints) applyPaintToImage(dstImg.data, pp, dstImg.width, dstImg.height); // over copy + recolor
+    if (holes) for (const hf of holes) applyHoleFillToImage(dstImg.data, dstImg.width, hf); // over copy + recolor + paint, last
     await writeFile(dstPath, encodePNG(dstImg.data, dstImg.width, dstImg.height));
     patchedFrames++;
   }

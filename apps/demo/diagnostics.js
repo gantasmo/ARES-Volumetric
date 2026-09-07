@@ -1,6 +1,6 @@
 // Diagnostics status bar — a slim bottom rail (Blender/Apollo-style) that surfaces live system +
 // pipeline telemetry from /diagnostics (SSE, 2s): coherent-bake stage+ETA, GPU util/temp/VRAM, RAM,
-// disk, RunPod on/off. UI law: dark greys (never black), offwhite HIGH-CONTRAST text, compact
+// disk, RunPod on/off. UI law: theme tokens (var(--…)) for every colour so both themes hold, compact
 // monospace readouts, minimal padding, one-click collapse, tooltips on every segment, no glow.
 import { logSubscribe, logMemory, logRestore, logClear, alog } from "./log.js";
 
@@ -44,21 +44,21 @@ function buildLogPanel(toggleBtn) {
   const panel = document.createElement("div");
   panel.id = "diagLogPanel";
   panel.style.cssText = [
-    "position:fixed", "left:0", "right:0", "bottom:22px", "z-index:39",
+    "position:fixed", "left:0", "right:0", "bottom:var(--diag-h)", "z-index:39",
     "height:min(46vh,420px)", "display:none", "flex-direction:column",
-    "background:#1b1b1f", "border-top:1px solid #34343a",
-    "font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace", "color:#cbc8ba",
+    "background:var(--bg-panel)", "border-top:1px solid var(--border)",
+    "font:11px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace", "color:var(--text-mid)",
   ].join(";");
 
   const head = document.createElement("div");
-  head.style.cssText = "display:flex;align-items:center;gap:8px;padding:4px 8px;border-bottom:1px solid #2c2c32;background:#202024;flex:0 0 auto";
+  head.style.cssText = "display:flex;align-items:center;gap:8px;padding:4px 8px;border-bottom:1px solid var(--border);background:var(--bg-rail);flex:0 0 auto";
   const title = document.createElement("span");
   title.textContent = "ACTIVITY";
-  title.style.cssText = "color:#8f8c81;letter-spacing:.1em;font-size:10px";
+  title.style.cssText = "color:var(--text-faint);letter-spacing:.1em;font-size:10px";
 
   // Source filters. Everything on by default — the point is a complete record.
   const show = { app: true, bake: true, claude: true, error: true };
-  const COLOR = { app: "#cbc8ba", bake: "#9ec98f", claude: "#8fa9c9", error: "#d99a9a" };
+  const COLOR = { app: "var(--text-mid)", bake: "var(--good)", claude: "var(--series-b)", error: "var(--bad)" };
   const chips = {};
   const chipRow = document.createElement("span");
   chipRow.style.cssText = "display:flex;gap:4px";
@@ -66,23 +66,23 @@ function buildLogPanel(toggleBtn) {
     const c = document.createElement("button");
     c.textContent = k;
     c.title = `show / hide ${k} lines`;
-    c.style.cssText = `all:unset;cursor:pointer;padding:1px 5px;border:1px solid ${COLOR[k]};border-radius:2px;font-size:10px;color:${COLOR[k]}`;
+    c.style.cssText = `all:unset;cursor:pointer;padding:1px 5px;border:1px solid ${COLOR[k]};border-radius:var(--r);font-size:10px;color:${COLOR[k]}`;
     c.onclick = () => { show[k] = !show[k]; c.style.opacity = show[k] ? "1" : ".32"; render(); };
     chips[k] = c; chipRow.append(c);
   }
 
   const search = document.createElement("input");
-  search.type = "text"; search.placeholder = "filter…";
+  search.type = "text"; search.placeholder = "filter";
   search.id = "diagLogFilter"; search.name = "diagLogFilter";   // a11y: form fields need id+name
-  search.style.cssText = "all:unset;flex:1;min-width:60px;padding:1px 5px;background:#26262b;border:1px solid #34343a;border-radius:2px;color:#e8e6da;font:11px ui-monospace,monospace";
+  search.style.cssText = "all:unset;flex:1;min-width:60px;padding:1px 5px;background:var(--surface);border:1px solid var(--border-st);border-radius:var(--r);color:var(--text);font:11px ui-monospace,monospace";
   search.oninput = render;
 
-  const mkBtn = (txt, title, fn) => { const b = document.createElement("button"); b.textContent = txt; b.title = title; b.style.cssText = "all:unset;cursor:pointer;color:#8f8c81;padding:1px 5px;font-size:10px;border:1px solid #34343a;border-radius:2px"; b.onclick = fn; return b; };
+  const mkBtn = (txt, title, fn) => { const b = document.createElement("button"); b.textContent = txt; b.title = title; b.style.cssText = "all:unset;cursor:pointer;color:var(--text-dim);padding:1px 5px;font-size:10px;border:1px solid var(--border);border-radius:var(--r)"; b.onclick = fn; return b; };
   const copyBtn = mkBtn("copy", "copy the visible log to the clipboard", async () => {
     const txt = visible().map(fmtLine).join("\n");
     try { await navigator.clipboard.writeText(txt); copyBtn.textContent = "copied"; setTimeout(() => (copyBtn.textContent = "copy"), 1200); } catch { /* */ }
   });
-  const clearBtn = mkBtn("clear", "erase the log on the server — this is a permanent audit trail, so it asks first", async () => {
+  const clearBtn = mkBtn("clear", "Erase the server-side log permanently", async () => {
     if (!confirm("Clear the activity log?\n\nThis erases the server-side history permanently.")) return;
     await logClear();
   });
@@ -109,13 +109,13 @@ function buildLogPanel(toggleBtn) {
   function rowEl(e) {
     const r = document.createElement("div");
     r.style.cssText = "display:flex;gap:7px;padding:1px 8px;white-space:pre-wrap;word-break:break-word";
-    if (e.lvl === "error") r.style.background = "rgba(217,154,154,.09)";
-    else if (e.lvl === "act") r.style.background = "rgba(127,143,110,.10)";
-    const a = document.createElement("span"); a.textContent = ts(e.t); a.style.cssText = "color:#6f6d64;flex:0 0 auto";
-    const b = document.createElement("span"); b.textContent = e.src; b.style.cssText = `color:${COLOR[e.src] || "#8f8c81"};flex:0 0 44px`;
+    if (e.lvl === "error") r.style.background = "var(--bad-dim)";
+    else if (e.lvl === "act") r.style.background = "var(--good-dim)";
+    const a = document.createElement("span"); a.textContent = ts(e.t); a.style.cssText = "color:var(--text-faint);flex:0 0 auto";
+    const b = document.createElement("span"); b.textContent = e.src; b.style.cssText = `color:${COLOR[e.src] || "var(--text-dim)"};flex:0 0 44px`;
     const c = document.createElement("span");
     c.textContent = e.msg + (e.data ? "  " + e.data : "");
-    c.style.cssText = `flex:1;color:${e.lvl === "error" ? "#d99a9a" : e.lvl === "warn" ? "#d6bd8a" : "#cbc8ba"}`;
+    c.style.cssText = `flex:1;color:${e.lvl === "error" ? "var(--bad)" : e.lvl === "warn" ? "var(--warn)" : "var(--text-mid)"}`;
     r.append(a, b, c);
     return r;
   }
@@ -126,7 +126,7 @@ function buildLogPanel(toggleBtn) {
     count.textContent = String(rows.length);
   }
   const count = document.createElement("span");
-  count.style.cssText = "color:#6f6d64;font-size:10px;flex:0 0 auto";
+  count.style.cssText = "color:var(--text-faint);font-size:10px;flex:0 0 auto";
   head.append(count);
 
   let open = false;
@@ -135,7 +135,7 @@ function buildLogPanel(toggleBtn) {
     open = v;
     panel.style.display = open ? "flex" : "none";
     toggleBtn.textContent = open ? "▤ log ▾" : "▤ log";
-    toggleBtn.style.color = open ? "#e8e6da" : "#8f8c81";
+    toggleBtn.style.color = open ? "var(--text)" : "var(--text-dim)";
     try { localStorage.setItem(LOGOPEN_KEY, open ? "1" : "0"); } catch { /* */ }
     if (open) { pinned = true; render(); }
   }
@@ -167,22 +167,22 @@ export function initDiagnostics() {
   bar.style.cssText = [
     "position:fixed", "left:0", "right:0", "bottom:0", "z-index:40",
     "display:flex", "align-items:center", "gap:14px",
-    "height:22px", "padding:0 8px", "box-sizing:border-box",
+    "height:var(--diag-h)", "padding:0 8px", "box-sizing:border-box",
     "font:11px/1 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace",
-    "color:#cbc8ba", "background:#202024", "border-top:1px solid #34343a",
+    "color:var(--text-mid)", "background:var(--bg-rail)", "border-top:1px solid var(--border)",
     "user-select:none",
   ].join(";");
 
   const seg = (title) => { const s = document.createElement("span"); s.style.cssText = "display:inline-flex;align-items:center;gap:5px;white-space:nowrap"; if (title) s.title = title; return s; };
   // collapse chevron (uniform small button)
   const chev = document.createElement("button");
-  chev.style.cssText = "all:unset;cursor:pointer;color:#8f8c81;padding:0 4px;font-size:11px";
+  chev.style.cssText = "all:unset;cursor:pointer;color:var(--text-dim);padding:0 4px;font-size:11px";
   chev.title = "Collapse / expand the diagnostics bar";
 
   // The clip actually loaded, live. First segment because it's the thing the bar is most often read
   // for — "what am I looking at". Fed by main.js via setDiagClip() from the player's own stats.
   const clipSeg = seg("The clip currently loaded — name · delivered size · frames · duration. Live, from the player.");
-  const bakeSeg = seg("Coherent bake — stage, frame, and measured ETA (from actual throughput, not a guess). Goes idle shortly after a bake finishes; it is NOT the loaded clip.");
+  const bakeSeg = seg("Coherent bake — stage, frame, and measured ETA. Goes idle shortly after a bake finishes.");
   const gpuSeg = seg("GPU — utilization · temperature · VRAM used / total");
   const ramSeg = seg("System RAM — used / total");
   const diskSeg = seg("Disk (project drive) — free space");
@@ -192,7 +192,7 @@ export function initDiagnostics() {
   // what actually happened lives behind this door.
   const logBtn = document.createElement("button");
   logBtn.id = "diagLogBtn";
-  logBtn.style.cssText = "all:unset;cursor:pointer;color:#8f8c81;padding:0 5px;font-size:11px;white-space:nowrap";
+  logBtn.style.cssText = "all:unset;cursor:pointer;color:var(--text-dim);padding:0 5px;font-size:11px;white-space:nowrap";
   logBtn.title = "Activity log — everything the app, the bakes, and the tooling did. Server-persisted: survives tab changes and reloads.";
 
   const wrap = document.createElement("div");
@@ -201,7 +201,7 @@ export function initDiagnostics() {
   bar.append(chev, wrap, logBtn);
   document.body.append(bar);
   // keep the viewport clear of the bar
-  document.body.style.paddingBottom = "22px";
+  document.body.style.paddingBottom = "var(--diag-h)";
 
   const logPanel = buildLogPanel(logBtn);
 
@@ -217,7 +217,7 @@ export function initDiagnostics() {
   applyCollapse();
 
   const dim = (el, on) => { el.style.opacity = on ? "1" : ".45"; };
-  const barEl = (pct) => `<span style="display:inline-block;width:64px;height:5px;background:#37373d;border-radius:2px;overflow:hidden;vertical-align:middle"><span style="display:block;height:100%;width:${pct}%;background:#7f8f6e"></span></span>`;
+  const barEl = (pct) => `<span style="display:inline-block;width:64px;height:5px;background:var(--surface-h);border-radius:var(--r);overflow:hidden;vertical-align:middle"><span style="display:block;height:100%;width:${pct}%;background:var(--accent)"></span></span>`;
 
   // The server has no timestamp on bake.done, so age it from when it was FIRST SEEN — persisted, or
   // a bake from days ago would re-announce itself for 90s on every single page load. Keyed by the
@@ -259,7 +259,7 @@ export function initDiagnostics() {
       const t = document.createElement("span");
       // "baked" spelled out: this line used to read as the loaded clip's name and size.
       t.textContent = ok ? `✓ baked ${bake.done.name} (${bake.done.sizeMB}MB, ${fmtT(bake.done.totalS)})` : `✗ bake failed`;
-      t.style.color = ok ? "#9ec98f" : "#d99a9a";
+      t.style.color = ok ? "var(--good)" : "var(--bad)";
       bakeSeg.append(t);
       dim(bakeSeg, true);
       // Fire the auto-add exactly once per bake, regardless of the display TTL above.
@@ -271,7 +271,7 @@ export function initDiagnostics() {
       bakeSeg.textContent = "idle"; dim(bakeSeg, false);
     } else if (bake.prog && bake.prog.total) {
       const p = bake.prog;
-      bakeSeg.innerHTML = `<span style="color:#b7b3a4">⏳ ${stageLabel(p.stage)}</span> <span>${p.done}/${p.total}</span> ${barEl(p.pct || 0)} <span>${p.pct || 0}%</span> <span style="color:#8f8c81">ETA ${fmtT(p.etaS)}</span>`;
+      bakeSeg.innerHTML = `<span style="color:var(--text-mid)">${stageLabel(p.stage)}</span> <span>${p.done}/${p.total}</span> ${barEl(p.pct || 0)} <span>${p.pct || 0}%</span> <span style="color:var(--text-dim)">ETA ${fmtT(p.etaS)}</span>`;
       dim(bakeSeg, true);
     } else { bakeSeg.textContent = "idle"; dim(bakeSeg, false); }
 
@@ -292,38 +292,37 @@ export function initDiagnostics() {
     // ---- GPU ----
     if (d.gpu) {
       const g = d.gpu; const hot = g.temp >= 84;
-      gpuSeg.innerHTML = `<span style="color:#8f8c81">GPU</span> <span>${g.util}%</span> <span style="color:${hot ? "#d99a9a" : "#cbc8ba"}">${g.temp}°</span> <span>${gb(g.vramUsedMB)}/${gb(g.vramTotalMB)}G</span>`;
+      gpuSeg.innerHTML = `<span style="color:var(--text-dim)">GPU</span> <span>${g.util}%</span> <span style="color:${hot ? "var(--bad)" : "var(--text-mid)"}">${g.temp}°</span> <span>${gb(g.vramUsedMB)}/${gb(g.vramTotalMB)}G</span>`;
       dim(gpuSeg, true);
-    } else { gpuSeg.innerHTML = `<span style="color:#8f8c81">GPU —</span>`; dim(gpuSeg, false); }
+    } else { gpuSeg.innerHTML = `<span style="color:var(--text-dim)">GPU —</span>`; dim(gpuSeg, false); }
 
     // ---- RAM ----
-    if (d.ram) { ramSeg.innerHTML = `<span style="color:#8f8c81">RAM</span> <span>${gb(d.ram.usedMB)}/${gb(d.ram.totalMB)}G</span>`; }
+    if (d.ram) { ramSeg.innerHTML = `<span style="color:var(--text-dim)">RAM</span> <span>${gb(d.ram.usedMB)}/${gb(d.ram.totalMB)}G</span>`; }
 
     // ---- Disk ----
-    if (d.disk) { const low = d.disk.freeGB < 20; diskSeg.innerHTML = `<span style="color:#8f8c81">DISK</span> <span style="color:${low ? "#d99a9a" : "#cbc8ba"}">${d.disk.freeGB}G free</span>`; }
+    if (d.disk) { const low = d.disk.freeGB < 20; diskSeg.innerHTML = `<span style="color:var(--text-dim)">DISK</span> <span style="color:${low ? "var(--bad)" : "var(--text-mid)"}">${d.disk.freeGB}G free</span>`; }
 
     // ---- RunPod ----
     const rp = d.runpod;
-    if (!rp || rp.error) { rpSeg.innerHTML = `<span style="color:#8f8c81">☁ —</span>`; dim(rpSeg, false); }
+    if (!rp || rp.error) { rpSeg.innerHTML = `<span style="color:var(--text-dim)">RunPod —</span>`; dim(rpSeg, false); }
     else {
       const on = rp.pods && rp.pods.length;
-      const dot = on ? "#9ec98f" : "#6f6d64";
-      rpSeg.innerHTML = `<span style="color:${dot}">●</span> <span>${on ? `${rp.pods[0].gpu || "pod"} $${(rp.pods[0].costPerHr || 0).toFixed(2)}/hr` : "off"}</span> <span style="color:#8f8c81">$${(rp.balance || 0).toFixed(2)}</span>`;
+      rpSeg.innerHTML = `<span style="color:var(--text-dim)">RunPod</span> <span>${on ? `${rp.pods[0].gpu || "pod"} $${(rp.pods[0].costPerHr || 0).toFixed(2)}/hr` : "off"}</span> <span style="color:var(--text-dim)">$${(rp.balance || 0).toFixed(2)}</span>`;
       dim(rpSeg, true);
     }
   };
 
   // ---- Now playing. Pushed by main.js from the player's live stats; nothing here polls.
-  clipSeg.innerHTML = `<span style="color:#8f8c81">▶ —</span>`;
+  clipSeg.innerHTML = `<span style="color:var(--text-dim)">▶︎ —</span>`;
   dim(clipSeg, false);
   setClipSeg = (c) => {
-    if (!c || !c.name) { clipSeg.innerHTML = `<span style="color:#8f8c81">▶ —</span>`; dim(clipSeg, false); return; }
-    const bits = [`<span style="color:#8f8c81">▶</span>`, `<span style="color:#e8e6da">${c.name}</span>`];
+    if (!c || !c.name) { clipSeg.innerHTML = `<span style="color:var(--text-dim)">▶︎ —</span>`; dim(clipSeg, false); return; }
+    const bits = [`<span style="color:var(--text-dim)">▶︎</span>`, `<span style="color:var(--text)">${c.name}</span>`];
     if (c.sizeMB) bits.push(`<span>${c.sizeMB >= 1024 ? (c.sizeMB / 1024).toFixed(2) + "G" : c.sizeMB.toFixed(0) + "M"}</span>`);
-    if (c.frames) bits.push(`<span style="color:#8f8c81">${c.frames}f · ${fmtT(c.durationS)}</span>`);
+    if (c.frames) bits.push(`<span style="color:var(--text-dim)">${c.frames}f · ${fmtT(c.durationS)}</span>`);
     clipSeg.innerHTML = bits.join(" ");
     clipSeg.title = `Loaded clip: ${c.name}\n${c.sizeMB ? c.sizeMB.toFixed(1) + " MB delivered · " : ""}${c.frames || "?"} frames @ ${c.fps || 30}fps · ${(c.durationS || 0).toFixed(1)}s`
-      + `\n\nThis is what's PLAYING. The segment beside it is the last bake, which is a different thing.`;
+      + `\n\nLoaded clip (playing now). The bake segment reports the pipeline, not this clip.`;
     dim(clipSeg, true);
   };
 

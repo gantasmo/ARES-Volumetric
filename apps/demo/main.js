@@ -5,7 +5,7 @@
  */
 // orbitViewProj is the RENDERER's own camera math — the crop guides project through the exact same
 // matrix the pixels do, so a guide can never drift from the geometry it claims to cut.
-import { AresPlayer, rleEncodeMask, keepPredicateAt, orbitViewProj } from "@ares/core";
+import { AresPlayer, rleEncodeMask, keepPredicateAt, orbitViewProj, orbitViewHeight, growKeyframe, mirrorKeyframe } from "@ares/core";
 
 const $ = (id) => document.getElementById(id);
 const canvas = $("view");
@@ -17,7 +17,7 @@ const SRC = new URLSearchParams(location.search).get("src") || "daniel-s0.ares";
 // v1 = untouched original for reference. Switching sources carries your camera + timestamp so the
 // comparison is the same instant from the same angle (auto-orbit + looping made solo A/Bs drift).
 const SOURCES = [
-  { label: "Daniel ✓", src: "daniel-s0.ares" },      // KEEPER: oct16+AV1+reorder, smooth 0 (user verdict)
+  { label: "Daniel", src: "daniel-s0.ares" },        // KEEPER: oct16+AV1+reorder, smooth 0 (user verdict)
   { label: "smooth 1", src: "daniel-s1.ares" },
   { label: "s0 HQ 2048", src: "daniel-s0hq.ares" },  // faint-seam-line test: 2048² texture tier
   { label: "v1 original", src: "daniel.ares" },      // 67 MB baseline (VP9 + i8 normals, no reorder)
@@ -124,7 +124,7 @@ function renderMediaHead() {
   h.append(sort, sp, layout, fav, edit);
   if (showcaseEdit) {
     h.append(mkIconBtn("＋", "add an existing .ares to the library", openAddPicker));
-    h.append(mkIconBtn("🗀", "new folder", () => {
+    h.append(mkIconBtn("❏", "new folder", () => {
       const name = (prompt("New folder name:") || "").trim().slice(0, 40);
       if (!name) return;
       if (!(libView.emptyFolders || []).includes(name)) { (libView.emptyFolders ||= []).push(name); saveLibView(); }
@@ -167,7 +167,7 @@ function renderSourceBar() {
     host.append(hd);
     if (!collapsed && inF.length) { const c = mkContainer(); for (const s of inF) c.append(renderItem(s, cur)); host.append(c); }
   }
-  if (!host.children.length) { const e = document.createElement("div"); e.className = "libEmpty"; e.textContent = libView.favOnly ? "no favorites yet — tap ☆ on a clip" : "no clips — Convert one, or ＋ add"; host.append(e); }
+  if (!host.children.length) { const e = document.createElement("div"); e.className = "libEmpty"; e.textContent = libView.favOnly ? "No favorites. Mark clips with ☆." : "No clips. Convert a capture, or add an existing .ares."; host.append(e); }
 }
 
 const renderItem = (s, cur) => (libView.layout === "grid" ? renderGridItem(s, cur) : renderListItem(s, cur));
@@ -193,10 +193,12 @@ function editControls(s) {
     s.folder = v || null; await saveShowcase(); renderSourceBar();
   };
   wrap.append(fsel);
-  wrap.append(mkIconBtn("🖼", "set thumbnail from an image file", (e) => { e.stopPropagation(); uploadThumb(s.src); }));
+  wrap.append(mkIconBtn("↥", "set thumbnail from an image file", (e) => { e.stopPropagation(); uploadThumb(s.src); }));
   if (clipInfo[s.src] && clipInfo[s.src].thumb) wrap.append(mkIconBtn("⌫", "clear thumbnail", (e) => { e.stopPropagation(); clearThumb(s.src); }));
-  wrap.append(mkIconBtn("✕", "remove from the list (keeps the file on disk)", async (e) => { e.stopPropagation(); showcase = showcase.filter((z) => z !== s); await saveShowcase(); renderSourceBar(); }));
-  wrap.append(mkIconBtn("🗑", "permanently delete this .ares from disk", (e) => { e.stopPropagation(); deleteAres(s.src, s.label); }));
+  wrap.append(mkIconBtn("−", "remove from the list (keeps the file on disk)", async (e) => { e.stopPropagation(); showcase = showcase.filter((z) => z !== s); await saveShowcase(); renderSourceBar(); }));
+  const del = mkIconBtn("✕", "permanently delete this .ares from disk", (e) => { e.stopPropagation(); deleteAres(s.src, s.label); });
+  del.style.color = "var(--bad)";   // destructive action: red text only, no fill
+  wrap.append(del);
   return wrap;
 }
 function renameInline(labelEl, s) {
@@ -335,9 +337,9 @@ function captureThumb() {
     c.width = Math.max(1, Math.round(cw * scale)); c.height = Math.max(1, Math.round(ch * scale));
     c.getContext("2d").drawImage(canvas, 0, 0, c.width, c.height);
     const du = c.toDataURL("image/jpeg", 0.72);
-    if (du.length < 200) { alert("capture came back blank — make sure the clip is visible, or use 🖼 upload in edit mode"); return; }
+    if (du.length < 200) { alert("Thumbnail capture produced an empty image. Use the upload button in edit mode instead."); return; }
     saveThumb(src, du);
-  } catch (e) { alert("capture failed (" + e.message + ") — use 🖼 upload in edit mode instead"); }
+  } catch (e) { alert("Thumbnail capture failed (" + e.message + "). Use the upload button in edit mode instead."); }
 }
 
 async function openAddPicker() {
@@ -349,16 +351,17 @@ async function openAddPicker() {
   const avail = (Array.isArray(list) ? list : []).filter((f) => !shown.has(f.src));
   const row = document.createElement("div");
   row.id = "srcAddRow";
-  row.style.cssText = "display:flex;flex-direction:column;gap:4px;padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.08)";
-  const sel = document.createElement("select"); sel.className = "cvsel"; sel.style.cssText = "width:100%;box-sizing:border-box";
+  row.style.cssText = "display:flex;flex-direction:column;gap:4px;padding:5px 6px;border-bottom:1px solid var(--border)";
+  const sel = document.createElement("select"); sel.className = "inp"; sel.style.cssText = "width:100%;box-sizing:border-box";
   if (!avail.length) { const o = document.createElement("option"); o.value = ""; o.textContent = "(no other .ares — Convert one first)"; sel.append(o); }
   for (const f of avail) { const o = document.createElement("option"); o.value = f.src; o.textContent = `${f.src} (${(f.bytes / 1048576).toFixed(1)} MB)`; sel.append(o); }
   const label = document.createElement("input");
   label.placeholder = "label";
-  label.style.cssText = "width:100%;box-sizing:border-box;padding:3px 6px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:5px;color:var(--text);font:12px system-ui";
+  label.className = "inp";
+  label.style.cssText = "width:100%;box-sizing:border-box";
   const setDefault = () => { label.value = (sel.value || "").replace(/\.ares$/i, ""); };
   sel.onchange = setDefault; setDefault();
-  const go = document.createElement("button"); go.textContent = "Add to library"; go.style.cssText = "padding:3px 8px";
+  const go = document.createElement("button"); go.textContent = "Add to library"; go.className = "u";
   go.onclick = async () => {
     if (!sel.value) return;
     showcase.push({ label: (label.value.trim() || sel.value.replace(/\.ares$/i, "")).slice(0, 80), src: sel.value, fav: false, folder: null, addedAt: Date.now() });
@@ -450,11 +453,12 @@ function setTab(name) {
   $("tab-compute").classList.toggle("active", name === "compute");
   if (name === "convert" && !convertInited) { convertInited = true; import("./convert.js").then((m) => m.initConvert()).catch((e) => console.error(e)); }
   if (name === "compare" && !compareInited) { compareInited = true; import("./compare.js").then((m) => m.initCompare()).catch((e) => console.error(e)); }
+  else if (compareInited) import("./compare.js").then((m) => m.setCompareActive?.(name === "compare")).catch(() => { /* module already failed */ });
   if (name === "settings" && !settingsInited) { settingsInited = true; import("./settings.js").then((m) => m.initSettings()).catch((e) => console.error(e)); }
   if (name === "compute" && !computeInited) { computeInited = true; import("./compute.js").then((m) => m.initCompute()).catch((e) => console.error(e)); }
   // Don't burn decode+render behind the Compare overlay — pause the main viewer there.
   const p = window.__ares;
-  if (p) { if (name === "compare" && p.isPlaying) { p.pause(); $("play").textContent = "▶"; } }
+  if (p) { if (name === "compare" && p.isPlaying) { p.pause(); $("play").textContent = "▶︎"; } }
   // Persist the active tab (tabs must survive a reload) — every switch overwrites it, so
   // the LAST tab the user was on is always what comes back. try/catch: localStorage can throw in
   // rare privacy-mode contexts; a switch must never fail just because persistence did.
@@ -574,7 +578,7 @@ function rawSourceOf(meta) {
     measured: true,
   };
 }
-const BAR_COLORS = { raw: "#8a6d3b", fourdviews: "var(--series-b)", draco: "var(--text-mid)", ares: "var(--accent)" };
+const BAR_COLORS = { raw: "var(--warn)", fourdviews: "var(--series-b)", draco: "var(--text-mid)", ares: "var(--accent)" };
 
 function fit() {
   const dpr = Math.min(2, window.devicePixelRatio || 1);
@@ -712,9 +716,10 @@ function renderHUD(s) {
         rl("size", `<b>${sizeMB(aresTotalMB)}</b> · ${s.frameCount}f · ${(s.frameCount / (s.fps || 30)).toFixed(1)}s`) +
         rl("split", `geom ${aresGeomMB.toFixed(1)} + tex ${aresTexMB.toFixed(1)} MB`) +
         (hasVideo ? rl("texture", `${texShort} · HW`) : "") +
+        (s.audioLabel && s.audioLabel !== "none" ? rl("audio", s.audioLabel) : "") +
         rl("render", `${s.fps.toFixed(0)}fps · ${s.decodeMsPerFrame.toFixed(2)}ms/f · TTFF ${s.ttffMs.toFixed(0)}ms`) +
         rl("frame", `${s.frameIndex + 1} / ${s.frameCount}`) +
-        rl("recipe", `${prov} <button class="rlBtn" id="thumbBtn" title="set this clip's library thumbnail from the current view">📷</button>${m.pipeline ? '<button class="rlBtn" id="recipeBtn" title="copy this clip\'s full conversion recipe to re-use on another clip">⧉</button>' : ""}`);
+        rl("recipe", `${prov} <button class="rlBtn" id="thumbBtn" title="set this clip's library thumbnail from the current view">⊡</button>${m.pipeline ? '<button class="rlBtn" id="recipeBtn" title="copy this clip\'s full conversion recipe to re-use on another clip">⧉</button>' : ""}`);
       const rb = $("recipeBtn"); if (rb) rb.onclick = showRecipe;
       const tb = $("thumbBtn"); if (tb) tb.onclick = captureThumb;
     }
@@ -728,9 +733,12 @@ function renderHUD(s) {
   // The headline: THIS clip vs the raw source THIS clip came from. When we have provenance it names
   // the origin and the ratio is a real measurement ÷ a real measurement; when we don't, it says so
   // rather than quietly borrowing another capture's numbers.
-  const head = `<b>${s.frameCount} frames · ${(s.vertexCount / 1000).toFixed(1)}k verts · ${dur.toFixed(1)}s.</b> `;
+  const isSplatClip = !!(window.__ares && window.__ares.isSplat && window.__ares.isSplat());
+  const head = `<b>${s.frameCount} frames · ${(s.vertexCount / 1000).toFixed(1)}k ${isSplatClip ? "splats" : "verts"} · ${dur.toFixed(1)}s.</b> `;
   const origin = raw.dir ? raw.dir.split(/[\\/]/).filter(Boolean).pop() : "";
-  $("cmp").innerHTML = !hasVideo
+  $("cmp").innerHTML = isSplatClip
+    ? head + `Gaussian splat profile — per-chunk AABB quantization, meshopt-coded attribute streams, sorted and composited on the GPU. Single request.`
+    : !hasVideo
     ? head + `Single request, GPU-side dequant, hardware-ready texture path.`
     : raw.measured
       ? head +
@@ -751,18 +759,18 @@ function initEditor(player) {
 
   // SAM service status + in-app launch (serve.mjs /sam/start streams SSE progress; the
   // service itself is spawned hidden by samEnsure — no terminal, no separate launcher).
-  const samStatus = $("samStatus"), samStart = $("samStart"), samDot = $("samDot");
-  // Muted state colors in the app's own idiom (ui-design-notes.md: no neon, no defaults).
-  const SAM_DOT = { ready: "#8fd694", loading: "#d9a13a", failed: "#d97a6a", off: "#5a5852" };
+  const samStatus = $("samStatus"), samStart = $("samStart");
+  // Status is text only (no indicator lights): the words carry the state; failure tints the text.
   let samPoll = 0;
   async function samRefresh() {
     clearTimeout(samPoll);
     let h = null;
     try { h = await fetch("/sam/health").then((r) => r.json()); } catch {}
-    if (h && h.ok) { samDot.style.background = SAM_DOT.ready; samStatus.textContent = `ready · ${h.model} on ${h.device}`; samStart.style.display = "none"; }
-    else if (h && h.loading) { samDot.style.background = SAM_DOT.loading; samStatus.textContent = "model loading…"; samStart.style.display = "none"; }
-    else if (h && h.error) { samDot.style.background = SAM_DOT.failed; samStatus.textContent = "load failed"; samStatus.title = "The SAM service failed to load its model — see tools/sam-service/sam-service.log for the traceback. Press Start SAM to retry."; samStart.style.display = ""; }
-    else { samDot.style.background = SAM_DOT.off; samStatus.textContent = "not running"; samStart.style.display = ""; }
+    samStatus.style.color = h && h.error ? "var(--bad)" : "";
+    if (h && h.ok) { samStatus.textContent = `ready · ${h.model} on ${h.device}`; samStart.style.display = "none"; }
+    else if (h && h.loading) { samStatus.textContent = "model loading…"; samStart.style.display = "none"; }
+    else if (h && h.error) { samStatus.textContent = "load failed"; samStatus.title = "The SAM service failed to load its model — see tools/sam-service/sam-service.log for the traceback. Press Start SAM to retry."; samStart.style.display = ""; }
+    else { samStatus.textContent = "not running"; samStart.style.display = ""; }
     syncSamTextGate(h);
     // Keep polling while EITHER the tracker or the independent, later-loading text/concept model
     // is still coming up — SAM_TEXT's model loads AFTER the tracker, so h.ok can go true first.
@@ -770,7 +778,7 @@ function initEditor(player) {
   }
   samStart.onclick = () => {
     samStart.disabled = true;
-    samDot.style.background = SAM_DOT.loading;
+    samStatus.style.color = "";
     samStatus.textContent = "starting…";
     const es = new EventSource("/sam/start");
     es.addEventListener("log", (e) => { try { samStatus.textContent = JSON.parse(e.data); } catch {} });
@@ -779,18 +787,29 @@ function initEditor(player) {
   };
 
   // Viewport shading — ONE mutually-exclusive segmented control in the header (owner ask #15):
-  // shaded (textured) / clay (untextured, judge FORM) / wire (topology). Replaces the old
-  // Wireframe toggle that lived in the Edit rail. Keys 1/2/3; W still toggles wire<->shaded.
+  // shaded (textured, lit) / unlit (texture verbatim) / clay (untextured, judge FORM) / wire
+  // (topology). Replaces the old Wireframe toggle that lived in the Edit rail. Z cycles;
+  // W still toggles wire<->shaded.
   const shadeSeg = $("shadeSeg");
   let shadeMode = "shaded";
+  const ANALYSIS = { normals: "normals", uv: "uv", depth: "depth", points: "points" };
   const applyShade = (mode) => {
     shadeMode = mode;
+    player.setShadeMode(ANALYSIS[mode] || "shaded");
     player.setWireframe(mode === "wire");
     player.setTextured(mode !== "clay");
+    player.setLit(mode !== "unlit" && mode !== "points");
     if (shadeSeg) for (const b of shadeSeg.querySelectorAll("button")) {
       b.setAttribute("aria-pressed", String(b.dataset.shade === mode));
     }
   };
+  const pointSizeEl = $("pointSize");
+  if (pointSizeEl) {
+    const savedPs = Number(localStorage.getItem("ares.pointSize") || 2);
+    pointSizeEl.value = String(savedPs);
+    player.setPointSize(savedPs);
+    pointSizeEl.oninput = () => { player.setPointSize(Number(pointSizeEl.value)); localStorage.setItem("ares.pointSize", pointSizeEl.value); };
+  }
   if (shadeSeg) shadeSeg.onclick = (e) => {
     const b = e.target.closest("button[data-shade]");
     if (b) applyShade(b.dataset.shade);
@@ -890,10 +909,15 @@ function initEditor(player) {
     return active ? { min, max } : null;
   };
 
-  // ---- Segmentation palette (SAM-demo idiom): each range/selection gets its own vivid color,
-  // cycling like Meta's SAM object colors. Used by the mask preview tint, the marquee, and the
+  // ---- Segmentation palette: each range/selection gets its own muted hue — data encoding, the
+  // one place multiple hues are allowed. Used by the mask preview tint, the marquee, and the
   // timeline range bars; persisted on the range (cosmetic field) so colors survive reloads.
-  const SEG_PALETTE = ["#1E90FF", "#FF40FF", "#39FF14", "#FFA01E", "#00E5FF", "#AA5AFF"];
+  const SEG_PALETTE = ["#6f8dc0", "#b07aa8", "#7ba374", "#c99a5a", "#6aa3a0", "#9182c4"];
+  // Old sidecars still hold the retired vivid hexes — displayColor() remaps them at every DISPLAY
+  // read site; stored r.color values and already-written bake payloads are never rewritten.
+  const LEGACY_SEG = { "#1e90ff": "#6f8dc0", "#ff40ff": "#b07aa8", "#39ff14": "#7ba374",
+                       "#ffa01e": "#c99a5a", "#00e5ff": "#6aa3a0", "#aa5aff": "#9182c4" };
+  const displayColor = (c) => (c && LEGACY_SEG[String(c).toLowerCase()]) || c;
   const nextSegColor = () => SEG_PALETTE[edits.ranges.length % SEG_PALETTE.length];
   const activeSegColor = () => (activeRange && activeRange.color) || nextSegColor();
   const hexRgb = (hex) => [parseInt(hex.slice(1, 3), 16), parseInt(hex.slice(3, 5), 16), parseInt(hex.slice(5, 7), 16)];
@@ -932,6 +956,7 @@ function initEditor(player) {
    *  handlers, long after the whole of initEditor has run, so in practice they're always defined. */
   const snapshotState = () => JSON.parse(JSON.stringify({
     ranges: edits.ranges,
+    fx: edits.fx ?? null,
     crop: cropPct,
     transform: typeof xf === "undefined" ? null : xf,
     trim: typeof trimIn === "undefined" ? null : { in: trimIn, out: trimOut },
@@ -976,6 +1001,8 @@ function initEditor(player) {
    *  the sidecar can't drift out of agreement with the restored state. */
   function restoreState(snap) {
     edits.ranges = snap.ranges;
+    if (snap.fx) edits.fx = snap.fx; else delete edits.fx;
+    window.__aresFx?.sync();
     if (activeRange) activeRange = edits.ranges.find((r) => r.id === activeRange.id) || null;
     // cropPct is a const array — copy INTO it rather than rebinding, since cropBox()/renderCropUi()
     // and the guide drag all close over this exact array.
@@ -1097,7 +1124,7 @@ function initEditor(player) {
     el.oninput = () => {
       const v = Number(el.value);
       const ok = Number.isFinite(v) && (id !== "xfScale" || v !== 0);
-      el.style.borderColor = ok ? "" : "#f0a3a3";
+      el.style.borderColor = ok ? "" : "var(--bad)";
       if (!ok) return;                    // never write an unusable value through to the transform
       gestureBegin(); write(v); applyXf({ syncInputs: false });
     };
@@ -1441,8 +1468,14 @@ function initEditor(player) {
   // applyDefaultPayload only fills a field the range doesn't already have, so flipping back to a
   // prior action restores it exactly (round-trip through action switches, not just save/reload).
   function applyDefaultPayload(r, action) {
-    if (action === "recolor" && !r.recolor) r.recolor = { color: (r.color || nextSegColor()).toLowerCase(), strength: 0.8, mode: "tint" };
+    // NEW payloads default through displayColor (muted); a payload the range already has is data
+    // the encoder consumes and is never rewritten.
+    if (action === "recolor" && !r.recolor) r.recolor = { color: displayColor(r.color || nextSegColor()).toLowerCase(), strength: 0.8, mode: "tint" };
     if (action === "copy" && !r.copy) r.copy = { srcFrame: curFrame(), dstFrames: [], what: "both" };
+    if (action === "paint" && !r.paint) r.paint = { brush: "tint", color: displayColor(r.color || nextSegColor()).toLowerCase(), strength: 0.8 };
+    // Sculpt amounts are WORLD units (mm on a mm clip, m on a metre clip): 5 mm of inflate is a
+    // visible, recoverable first step on a person-scale capture.
+    if (action === "sculpt" && !r.sculpt) r.sculpt = { brush: "inflate", amount: +(5 * worldPerMm).toFixed(4) };
   }
   function setRangeAction(r, action) {
     if (action === "delete") delete r.action; else r.action = action;
@@ -1499,7 +1532,7 @@ function initEditor(player) {
     let h = "";
     for (let f = 0; f < total; f += (minor || iv)) {
       const major = f % iv === 0;
-      h += `<span style="position:absolute;left:${(f / total) * 100}%;bottom:0;width:1px;height:${major ? 6 : 3}px;background:${major ? "var(--text-dim)" : "#55534d"}"></span>`;
+      h += `<span style="position:absolute;left:${(f / total) * 100}%;bottom:0;width:1px;height:${major ? 6 : 3}px;background:${major ? "var(--text-dim)" : "var(--text-faint)"}"></span>`;
       if (major && pxf * iv >= 30) h += `<span style="position:absolute;left:${(f / total) * 100}%;top:0;transform:translateX(-50%);font:9px ui-monospace,monospace;color:var(--text-faint)">${f}</span>`;
     }
     ruler.innerHTML = h;
@@ -1510,7 +1543,7 @@ function initEditor(player) {
     const total = frameTotal();
     return Math.max(0, Math.min(total - 1, Math.round(((clientX - rect.left) / Math.max(1, rect.width)) * total - 0.5)));
   }
-  const tlSeek = (f) => { player.pause(); $("play").textContent = "▶"; player.seek(f / 30); tlLastF = -1; };
+  const tlSeek = (f) => { player.pause(); $("play").textContent = "▶︎"; player.seek(f / 30); tlLastF = -1; };
   // Playhead follows the presented frame (rAF, cheap: one style write when the frame changes).
   (function tlWatch() {
     requestAnimationFrame(tlWatch);
@@ -1648,16 +1681,16 @@ function initEditor(player) {
     // handles on the active range) + the full-height playhead. All positions are % of the strip.
     $("rangeTrack").innerHTML = `<div id="tlRuler" style="position:relative;height:14px;margin-bottom:1px;cursor:ew-resize;user-select:none;touch-action:none"></div>
       <div id="tlLanes" style="position:relative;min-height:3px;cursor:ew-resize;touch-action:none">` + edits.ranges.map((r, i) => {
-      const col = r.color || "var(--warn)";
+      const col = displayColor(r.color) || SEG_PALETTE[0];   // hex, never a var(): hex-alpha suffixes below
       const act = r === activeRange;
       const l = (r.startFrame / total) * 100, w = Math.max(0.4, ((r.endFrame - r.startFrame + 1) / total) * 100);
       const dias = r.keyframes.map((k) =>
         `<span class="tlKf" data-f="${k.frame}" title="keyframe @ ${k.frame} — click to jump" style="position:absolute;left:${((k.frame - r.startFrame) / Math.max(1, r.endFrame - r.startFrame)) * 100}%;top:-3px;transform:translateX(-50%);font-size:9px;cursor:pointer;color:${k.derived ? "var(--text-faint)" : col}">${k.derived ? "◇" : "◆"}</span>`).join("");
-      const handles = act ? `<span class="tlHandle" data-ridx="${i}" data-edge="start" title="drag to trim the range start (snaps to playhead/edges)" style="position:absolute;left:-3px;top:-2px;width:7px;height:10px;background:${col};border-radius:2px;cursor:ew-resize"></span>
-        <span class="tlHandle" data-ridx="${i}" data-edge="end" title="drag to trim the range end (snaps to playhead/edges)" style="position:absolute;right:-3px;top:-2px;width:7px;height:10px;background:${col};border-radius:2px;cursor:ew-resize"></span>` : "";
-      return `<div style="position:relative;height:12px;margin:2px 0"><div class="tlBar" data-ridx="${i}" title="${act ? "drag to move the range (keyframes ride along)" : "click to select this range"}" style="position:absolute;left:${l}%;width:${w}%;height:6px;top:3px;background:${col}${act ? "BB" : "55"};border-radius:3px;cursor:${act ? "grab" : "pointer"}">${dias}${handles}</div></div>`;
+      const handles = act ? `<span class="tlHandle" data-ridx="${i}" data-edge="start" title="drag to trim the range start (snaps to playhead/edges)" style="position:absolute;left:-3px;top:-2px;width:7px;height:10px;background:${col};border-radius:var(--r);cursor:ew-resize"></span>
+        <span class="tlHandle" data-ridx="${i}" data-edge="end" title="drag to trim the range end (snaps to playhead/edges)" style="position:absolute;right:-3px;top:-2px;width:7px;height:10px;background:${col};border-radius:var(--r);cursor:ew-resize"></span>` : "";
+      return `<div style="position:relative;height:12px;margin:2px 0"><div class="tlBar" data-ridx="${i}" title="${act ? "drag to move the range (keyframes ride along)" : "click to select this range"}" style="position:absolute;left:${l}%;width:${w}%;height:6px;top:3px;background:${col}${act ? "BB" : "55"};border-radius:var(--r);cursor:${act ? "grab" : "pointer"}">${dias}${handles}</div></div>`;
     }).join("") + `</div>` + trimHtml +
-      `<div id="tlPlayhead" style="position:absolute;top:0;bottom:0;width:2px;background:#e8e6da;opacity:.85;pointer-events:none;z-index:5;left:0"></div>`;
+      `<div id="tlPlayhead" style="position:absolute;top:0;bottom:0;width:2px;background:var(--text);opacity:.85;pointer-events:none;z-index:5;left:0"></div>`;
     renderRuler();
     tlLastF = -1;                                    // force playhead reposition after re-render
 
@@ -1665,52 +1698,94 @@ function initEditor(player) {
     // (editor v3 UI task §1). recolor/copy sub-rows carry a "bake-only" badge — keepPredicateAt
     // (core) deliberately excludes non-delete ranges from the live preview, so this is the only
     // place their payload is visible before Bake; that intentional gap is called out inline.
-    const inputCss = "padding:2px 3px;background:rgba(0,0,0,.3);border:1px solid rgba(255,255,255,.14);border-radius:4px;color:var(--text);font-size:10.5px";
     $("rangeList").innerHTML = edits.ranges.map((r, i) => {
       const action = r.action || "delete";
-      const col = r.color || "var(--warn)";
-      const mark = r === activeRange ? "▶ " : "";
+      const col = displayColor(r.color) || SEG_PALETTE[0];   // hex, never a var(): hex-alpha suffixes below
+      const mark = r === activeRange ? "▶︎ " : "";
       const optSel = (v) => (v === action ? " selected" : "");
       const bakeTag = `<span class="badge warn" style="margin:0" title="bake-only — the live preview intentionally only shows delete ranges (keepPredicateAt skips copy/recolor); this is exactly what Bake will apply">bake-only</span>`;
       let sub;
       if (action === "recolor") {
         const rc = r.recolor || { color: col, strength: 0.8, mode: "tint" };
-        sub = `<input type="color" class="rcColor" data-ridx="${i}" value="${(rc.color || col).toLowerCase()}" title="recolor target color" style="width:20px;height:18px;padding:0;border:0;background:none;cursor:pointer">
+        sub = `<input type="color" class="rcColor" data-ridx="${i}" value="${(rc.color || col).toLowerCase()}" title="recolor target color" style="width:var(--ctl);height:var(--ctl);padding:0;border:0;background:none;cursor:pointer">
           <input type="range" class="rcStrength" data-ridx="${i}" min="0" max="1" step="0.01" value="${rc.strength}" style="width:52px;accent-color:${col}" title="strength 0-1">
           <span class="rcStrengthVal" style="min-width:24px">${Number(rc.strength).toFixed(2)}</span>
-          <select class="rcMode" data-ridx="${i}" style="${inputCss}" title="tint = preserve texel luma; hue = rotate hue only">
+          <select class="rcMode inp" data-ridx="${i}" title="tint = preserve texel luma; hue = rotate hue only">
             <option value="tint"${rc.mode === "tint" ? " selected" : ""}>tint</option>
             <option value="hue"${rc.mode === "hue" ? " selected" : ""}>hue</option>
           </select>${bakeTag}`;
       } else if (action === "copy") {
         const cp = r.copy || { srcFrame: r.startFrame, dstFrames: [], what: "both" };
         sub = `<span>src</span>
-          <input type="number" class="rcpSrc" data-ridx="${i}" min="0" max="${total - 1}" value="${cp.srcFrame}" style="width:40px;${inputCss}">
+          <input type="number" class="rcpSrc inp" data-ridx="${i}" min="0" max="${total - 1}" value="${cp.srcFrame}" style="width:40px">
           <span>→</span>
-          <input type="text" class="rcpDst" data-ridx="${i}" placeholder="40,41 or 40-45" value="${formatFrameSpec(cp.dstFrames)}" style="width:66px;${inputCss}">
-          <select class="rcpWhat" data-ridx="${i}" style="${inputCss}" title="what to paste: geometry, texels, or both (default)">
+          <input type="text" class="rcpDst inp" data-ridx="${i}" placeholder="40,41 or 40-45" value="${formatFrameSpec(cp.dstFrames)}" style="width:66px">
+          <select class="rcpWhat inp" data-ridx="${i}" title="what to paste: geometry, texels, or both (default)">
             <option value="both"${(cp.what || "both") === "both" ? " selected" : ""}>both</option>
             <option value="geo"${cp.what === "geo" ? " selected" : ""}>geo</option>
             <option value="texels"${cp.what === "texels" ? " selected" : ""}>texels</option>
           </select>${bakeTag}`;
+      } else if (action === "paint") {
+        // Texel-granular soft brush (sculpt+paint plan §B item 1) — the range's volumes are the
+        // brush region (author with Brush/Box/SAM as usual); this sub-row is the effect payload.
+        const pp = r.paint || { brush: "tint", color: col, strength: 0.8 };
+        const isTint = (pp.brush || "tint") === "tint";
+        sub = `<select class="rpBrush inp" data-ridx="${i}" title="tint = luma-preserving color toward target; heal = soft blur sourced from the region's own charts">
+            <option value="tint"${isTint ? " selected" : ""}>tint</option>
+            <option value="heal"${pp.brush === "heal" ? " selected" : ""}>heal</option>
+          </select>${isTint ? `
+          <input type="color" class="rpColor" data-ridx="${i}" value="${(pp.color || col).toLowerCase()}" title="paint color" style="width:var(--ctl);height:var(--ctl);padding:0;border:0;background:none;cursor:pointer">` : ""}
+          <input type="range" class="rpStrength" data-ridx="${i}" min="0" max="1" step="0.01" value="${pp.strength ?? 0.8}" style="width:52px;accent-color:${col}" title="strength 0-1">
+          <span class="rpStrengthVal" style="min-width:24px">${Number(pp.strength ?? 0.8).toFixed(2)}</span>
+          <input type="number" class="rpFeather inp" data-ridx="${i}" min="1" placeholder="auto" value="${pp.feather ?? ""}" style="width:42px" title="falloff feather in mm — blank = auto (half the mean stroke radius)">
+          <span title="soft-brush falloff half-width">mm</span>${bakeTag}`;
+      } else if (action === "sculpt") {
+        // World-anchored vertex displacement (sculpt+paint plan §A) — the range's volumes are the
+        // brush region; this sub-row is the displacement payload. Amounts are world units.
+        const sp = r.sculpt || { brush: "inflate", amount: 5 * worldPerMm };
+        const brush = sp.brush || "move";
+        const unit = worldPerMm === 1 ? "mm" : "m";
+        const off = sp.offset || [0, 0, 0];
+        const opt = (v, lbl) => `<option value="${v}"${brush === v ? " selected" : ""}>${lbl}</option>`;
+        sub = `<select class="rsBrush inp" data-ridx="${i}" title="move = translate by an offset · inflate = push along the surface normal (negative deflates) · smooth = Laplacian relax · flatten = toward the region's best-fit plane · pinch = toward the region's centre">
+            ${opt("move", "move")}${opt("inflate", "inflate")}${opt("smooth", "smooth")}${opt("flatten", "flatten")}${opt("pinch", "pinch")}
+          </select>` +
+          (brush === "move"
+            ? [0, 1, 2].map((ax) => `<input type="number" class="rsOff inp" data-ridx="${i}" data-ax="${ax}" step="1" value="${+Number(off[ax] || 0).toFixed(3)}" style="width:44px" title="offset ${"XYZ"[ax]} (${unit})">`).join("")
+            : `<input type="number" class="rsAmt inp" data-ridx="${i}" step="${brush === "inflate" ? 1 : 0.05}" ${brush === "inflate" ? "" : 'min="0" max="1"'} value="${+Number(sp.amount ?? (brush === "inflate" ? 5 * worldPerMm : brush === "smooth" ? 1 : 0.5)).toFixed(3)}" style="width:52px" title="${brush === "inflate" ? "distance along the normal (" + unit + "); negative deflates" : brush === "smooth" ? "blend of the smoothed result, 0–1" : "fraction of the way, 0–1"}"><span>${brush === "inflate" ? unit : "×"}</span>`) +
+          (brush === "smooth" ? `<input type="number" class="rsIter inp" data-ridx="${i}" min="1" max="50" value="${sp.iterations ?? 3}" style="width:36px" title="Laplacian passes"><span>it</span>` : "") +
+          `<input type="number" class="rsFeather inp" data-ridx="${i}" min="0" placeholder="auto" value="${sp.feather ?? ""}" style="width:42px" title="falloff feather (${unit}) — blank = auto (half the mean brush radius, else 5% of the region)"><span>feather</span>${bakeTag}`;
       } else {
         const ph = r.patchHoles;
         sub = `<label style="display:flex;gap:4px;align-items:center;cursor:pointer">
             <input type="checkbox" class="rphChk" data-ridx="${i}" ${ph ? "checked" : ""} style="margin:0">patch holes
           </label>${ph ? `
-          <input type="color" class="rphColor" data-ridx="${i}" value="${(ph.color || "#888888").toLowerCase()}" title="hole fill color — leave as-is to use the auto rim-average color" style="width:20px;height:18px;padding:0;border:0;background:none;cursor:pointer">
-          <button class="rphAuto" data-ridx="${i}" title="clear the explicit color — use the auto rim-average fill" style="background:none;border:0;color:var(--text-faint);cursor:pointer;font-size:10px;padding:0">auto</button>` : ""}`;
+          <input type="color" class="rphColor" data-ridx="${i}" value="${(ph.color || "#888888").toLowerCase()}" title="hole fill color — leave as-is to use the auto rim-average color" style="width:var(--ctl);height:var(--ctl);padding:0;border:0;background:none;cursor:pointer">
+          <button class="rphAuto u" data-ridx="${i}" title="clear the explicit color — use the auto rim-average fill">auto</button>` : ""}`;
       }
-      return `<div data-ridx="${i}" style="margin-top:${i ? 5 : 0}px;cursor:pointer" title="click to make this range ▶ active (Delete/Backspace then removes it)">
+      // Keyframe interpolation rides every action's sub-row: it is a property of the region's motion.
+      const ip = r.interp || "linear";
+      sub = `<select class="rinterp inp" data-ridx="${i}" title="how the region moves between keyframes: linear = straight blend · hold = keep the previous keyframe until the next · smooth = ease in and out">
+          <option value="linear"${ip === "linear" ? " selected" : ""}>linear</option>
+          <option value="hold"${ip === "hold" ? " selected" : ""}>hold</option>
+          <option value="smooth"${ip === "smooth" ? " selected" : ""}>smooth</option>
+        </select>` + sub;
+      const muted = r.enabled === false;
+      const escA = (t) => String(t).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
+      return `<div data-ridx="${i}" style="margin-top:${i ? 5 : 0}px;cursor:pointer;opacity:${muted ? ".55" : "1"}" title="click to make this range ▶︎ active (Delete/Backspace then removes it)">
         <div style="display:flex;gap:6px;align-items:center;font-size:11px;color:var(--text-mid)">
+          <input type="checkbox" class="renb" data-ridx="${i}" ${muted ? "" : "checked"} style="margin:0" title="on / muted — a muted range stays in the document but preview and bake ignore it">
           <span style="width:8px;height:8px;border-radius:2px;background:${col};flex:none"></span>
+          <input type="text" class="rlabel inp" data-ridx="${i}" value="${escA(r.label || "")}" placeholder="${escA(r.id || "range")}" maxlength="40" style="width:54px;min-width:0" title="name this range">
           <span style="flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${mark}${action} ${r.startFrame}–${r.endFrame} · ${r.keyframes.length} kf</span>
-          <select class="ractsel" name="range-action-${i}" data-ridx="${i}" style="${inputCss}" title="bake action for this range">
+          <select class="ractsel inp" name="range-action-${i}" data-ridx="${i}" title="bake action for this range">
             <option value="delete"${optSel("delete")}>delete</option>
             <option value="recolor"${optSel("recolor")}>recolor</option>
+            <option value="paint"${optSel("paint")}>paint</option>
+            <option value="sculpt"${optSel("sculpt")}>sculpt</option>
             <option value="copy"${optSel("copy")}>copy</option>
           </select>
-          <button data-rrm="${i}" style="background:none;border:0;color:var(--text-faint);cursor:pointer" title="remove this range">✕</button>
+          <button data-rrm="${i}" class="u ico" title="remove this range">✕</button>
         </div>
         <div style="display:flex;gap:5px;align-items:center;flex-wrap:wrap;padding:2px 0 0 14px;font-size:10.5px;color:var(--text-dim)">${sub}</div>
       </div>`;
@@ -1747,6 +1822,59 @@ function initEditor(player) {
       pushUndoIfChanged(before);
       preview();
     };
+    // Mute + interpolation change what the live preview shows → the full preview() path.
+    for (const c of $("rangeList").querySelectorAll(".renb")) c.onchange = () => {
+      gestureCommit();
+      const before = snapshotState();
+      const r = edits.ranges[Number(c.dataset.ridx)];
+      if (c.checked) delete r.enabled; else r.enabled = false;
+      pushUndoIfChanged(before);
+      preview();
+    };
+    for (const sel of $("rangeList").querySelectorAll(".rinterp")) sel.onchange = () => {
+      gestureCommit();
+      const before = snapshotState();
+      const r = edits.ranges[Number(sel.dataset.ridx)];
+      if (sel.value === "linear") delete r.interp; else r.interp = sel.value;
+      pushUndoIfChanged(before);
+      preview();
+    };
+    for (const inp of $("rangeList").querySelectorAll(".rlabel")) {
+      inp.oninput = () => { gestureBegin(); const r = edits.ranges[Number(inp.dataset.ridx)]; if (inp.value.trim()) r.label = inp.value.trim(); else delete r.label; saveEdits(); };
+      inp.onblur = () => gestureCommit();
+      inp.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); inp.blur(); } e.stopPropagation(); };
+    }
+    // sculpt payload controls — same coalescing law as paint's.
+    for (const sel of $("rangeList").querySelectorAll(".rsBrush")) sel.onchange = () => {
+      doMutation(() => {
+        const r = edits.ranges[Number(sel.dataset.ridx)];
+        r.sculpt = r.sculpt || {};
+        r.sculpt.brush = sel.value;
+        if (sel.value === "move" && !r.sculpt.offset) r.sculpt.offset = [0, 0, 0];
+        if (sel.value === "inflate") r.sculpt.amount = r.sculpt.amount && Math.abs(r.sculpt.amount) > 1 ? r.sculpt.amount : 5 * worldPerMm;
+        if (sel.value === "smooth") r.sculpt.amount = 1;
+        if (sel.value === "flatten" || sel.value === "pinch") r.sculpt.amount = Math.min(1, Math.max(0, r.sculpt.amount ?? 0.5)) || 0.5;
+      });
+      saveEdits(); renderRanges();
+    };
+    for (const inp of $("rangeList").querySelectorAll(".rsAmt, .rsOff, .rsIter, .rsFeather")) {
+      inp.oninput = () => {
+        gestureBegin();
+        const r = edits.ranges[Number(inp.dataset.ridx)];
+        r.sculpt = r.sculpt || {};
+        const n = Number(inp.value);
+        const ok = inp.value !== "" && Number.isFinite(n);
+        inp.style.borderColor = ok || (inp.classList.contains("rsFeather") && inp.value === "") ? "" : "var(--bad)";
+        if (inp.classList.contains("rsFeather")) { if (inp.value === "" || !(n >= 0)) delete r.sculpt.feather; else r.sculpt.feather = n; }
+        else if (!ok) return;
+        else if (inp.classList.contains("rsOff")) { r.sculpt.offset = r.sculpt.offset || [0, 0, 0]; r.sculpt.offset[Number(inp.dataset.ax)] = n; }
+        else if (inp.classList.contains("rsIter")) r.sculpt.iterations = Math.max(1, Math.min(50, Math.round(n)));
+        else r.sculpt.amount = n;
+        saveEdits();
+      };
+      inp.onblur = () => gestureCommit();
+      inp.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); inp.blur(); } };
+    }
     // Everything below is bake-only payload (no live-preview effect) — mutate + debounced-save
     // directly, skipping setEditPreview/full-rerender so a continuous drag (strength slider, color
     // picker) or in-progress typing (dst-frames text) never rebuilds the DOM out from under focus.
@@ -1785,13 +1913,44 @@ function initEditor(player) {
       doMutation(() => { edits.ranges[Number(s.dataset.ridx)].recolor.mode = s.value; });
       saveEdits();
     };
+    // paint payload controls — same coalescing law as recolor's (discrete → doMutation,
+    // continuous → gestureBegin/Commit). Brush change re-renders (the color input is tint-only).
+    for (const s of $("rangeList").querySelectorAll(".rpBrush")) s.onchange = () => {
+      doMutation(() => { edits.ranges[Number(s.dataset.ridx)].paint.brush = s.value; });
+      saveEdits(); renderRanges();
+    };
+    for (const c of $("rangeList").querySelectorAll(".rpColor")) {
+      c.oninput = () => { gestureBegin(); edits.ranges[Number(c.dataset.ridx)].paint.color = c.value; saveEdits(); };
+      c.onchange = () => gestureCommit();
+    }
+    for (const c of $("rangeList").querySelectorAll(".rpStrength")) {
+      c.oninput = () => {
+        gestureBegin();
+        const r = edits.ranges[Number(c.dataset.ridx)];
+        r.paint.strength = Number(c.value);
+        c.parentElement.querySelector(".rpStrengthVal").textContent = r.paint.strength.toFixed(2);
+        saveEdits();
+      };
+      c.onchange = () => gestureCommit();
+    }
+    for (const inp of $("rangeList").querySelectorAll(".rpFeather")) {
+      inp.oninput = () => {
+        gestureBegin();
+        const r = edits.ranges[Number(inp.dataset.ridx)];
+        const n = Number(inp.value);
+        if (inp.value === "" || !(n > 0)) delete r.paint.feather; else r.paint.feather = n;
+        saveEdits();
+      };
+      inp.onblur = () => gestureCommit();
+      inp.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); inp.blur(); } };
+    }
     for (const inp of $("rangeList").querySelectorAll(".rcpSrc")) {
       inp.oninput = () => {
         gestureBegin();
         const r = edits.ranges[Number(inp.dataset.ridx)];
         const n = Number(inp.value);
         const ok = Number.isInteger(n) && n >= 0 && n < total;
-        inp.style.borderColor = ok ? "" : "#f0a3a3";
+        inp.style.borderColor = ok ? "" : "var(--bad)";
         if (ok) { r.copy.srcFrame = n; saveEdits(); }
       };
       inp.onblur = () => gestureCommit();
@@ -1802,7 +1961,7 @@ function initEditor(player) {
         gestureBegin();
         const r = edits.ranges[Number(inp.dataset.ridx)];
         const arr = parseFrameSpec(inp.value, total);
-        inp.style.borderColor = arr ? "" : "#f0a3a3";
+        inp.style.borderColor = arr ? "" : "var(--bad)";
         if (arr) { r.copy.dstFrames = arr; saveEdits(); }
       };
       inp.onblur = () => gestureCommit();
@@ -1844,9 +2003,124 @@ function initEditor(player) {
     tool = b.dataset.tool;
     for (const o of document.querySelectorAll("#editPanel .tool")) o.setAttribute("aria-pressed", String(o === b));
     overlay.style.display = tool === "nav" ? "none" : "block";
-    if (tool !== "nav") player.pause(), $("play").textContent = "▶"; // edit on a held frame
+    if (tool !== "nav" && tool !== "measure") player.pause(), $("play").textContent = "▶︎"; // edit on a held frame
     if (tool !== "sam") samSelClear();                                  // pending SAM prompts die with the tool
+    if (tool !== "measure") measureClear();
+    if (tool !== "lasso") lassoClear();
   };
+
+  // ---- Lasso: a free polygon in screen space → the same mask2d/bitmap volume SAM produces, so
+  // the evaluator, X-ray law, depth band and bake path are all shared with it. Drawn as an SVG
+  // polyline while dragging; rasterized once on release at 512 px across.
+  const lassoSvg = document.createElementNS("http://www.w3.org/2000/svg", "svg");
+  lassoSvg.id = "lassoSvg";
+  lassoSvg.style.cssText = "position:fixed;inset:0;width:100%;height:100%;pointer-events:none;z-index:6;display:none";
+  const lassoPoly = document.createElementNS("http://www.w3.org/2000/svg", "polyline");
+  lassoPoly.setAttribute("fill", "none"); lassoPoly.setAttribute("stroke-width", "1.5"); lassoPoly.setAttribute("stroke-dasharray", "4 3");
+  lassoSvg.appendChild(lassoPoly);
+  document.body.appendChild(lassoSvg);
+  let lassoPts = null;
+  function lassoClear() { lassoPts = null; lassoSvg.style.display = "none"; lassoPoly.setAttribute("points", ""); }
+  function lassoDraw() {
+    lassoPoly.setAttribute("stroke", displayColor(activeSegColor()));
+    lassoPoly.setAttribute("points", lassoPts.map((p) => p.join(",")).join(" "));
+    lassoSvg.style.display = "block";
+  }
+  /** Depth band of the mask's covered pixels from a fresh pick raster (solid-mode visible-only law). */
+  function depthBandForBits(bits, w, h) {
+    const pick = player.pickRaster(384, 384);
+    if (!pick) return null;
+    let zmin = Infinity, zmax = -Infinity;
+    const { buf } = pick;
+    for (let y = 0; y < buf.h; y++) for (let x = 0; x < buf.w; x++) {
+      const mx = Math.floor((x / buf.w) * w), my = Math.floor((y / buf.h) * h);
+      if (!bits[my * w + mx]) continue;
+      const d = buf.depth[y * buf.w + x];
+      if (d !== Infinity) { if (d < zmin) zmin = d; if (d > zmax) zmax = d; }
+    }
+    return zmin === Infinity ? null : { zmin: zmin - 0.002, zmax: zmax + 0.002 };
+  }
+  function lassoCommit() {
+    const pts = lassoPts;
+    lassoClear();
+    if (!pts || pts.length < 3) return;
+    const r = canvas.getBoundingClientRect();
+    const W = 512, H = Math.max(16, Math.round((512 * r.height) / Math.max(1, r.width)));
+    const off = document.createElement("canvas");
+    off.width = W; off.height = H;
+    const ctx = off.getContext("2d", { willReadFrequently: true });
+    ctx.fillStyle = "#fff";
+    ctx.beginPath();
+    pts.forEach(([x, y], i) => { const px = ((x - r.left) / r.width) * W, py = ((y - r.top) / r.height) * H; if (i) ctx.lineTo(px, py); else ctx.moveTo(px, py); });
+    ctx.closePath(); ctx.fill();
+    const px = ctx.getImageData(0, 0, W, H).data;
+    const bits = new Uint8Array(W * H);
+    let count = 0;
+    for (let i = 0; i < bits.length; i++) if (px[i * 4 + 3] > 127) { bits[i] = 1; count++; }
+    if (!count) return;
+    const vol = { type: "mask2d", kind: "bitmap", mask: { width: W, height: H, rle: rleEncodeMask(bits) }, camera: { ...player.getCamera(), aspect: player.getViewAspect() } };
+    if (!xrayOn()) {
+      const band = depthBandForBits(bits, W, H);
+      if (!band) return;                       // the loop covers only background
+      vol.depth = band;
+    }
+    doMutation(() => addVolumeAtCurrent(vol));
+  }
+
+  // ---- Measure: two surface picks → world-anchored line + distance, re-projected as the camera
+  // moves. Read in the clip's real units (the same mm/m inference the grid uses).
+  const measureCanvas = document.createElement("canvas");
+  measureCanvas.id = "measureOverlay";
+  measureCanvas.style.cssText = "position:fixed;left:0;top:0;pointer-events:none;z-index:6;display:none";
+  document.body.appendChild(measureCanvas);
+  let measurePts = [], measureRaf = 0, measureSig = "";
+  function measureClear() { measurePts = []; measureCanvas.style.display = "none"; measureSig = ""; }
+  function measureStyle(name) { return getComputedStyle(document.documentElement).getPropertyValue(name).trim() || "#c99a5a"; }
+  function measureDraw() {
+    const r = canvas.getBoundingClientRect();
+    measureCanvas.style.left = r.left + "px"; measureCanvas.style.top = r.top + "px";
+    measureCanvas.width = Math.max(1, Math.round(r.width)); measureCanvas.height = Math.max(1, Math.round(r.height));
+    const ctx = measureCanvas.getContext("2d");
+    ctx.clearRect(0, 0, measureCanvas.width, measureCanvas.height);
+    if (!measurePts.length) { measureCanvas.style.display = "none"; return; }
+    measureCanvas.style.display = "block";
+    const vp = orbitViewProj(player.getCamera(), player.getViewAspect());
+    const sp = measurePts.map((p) => { const n = projPoint(vp, p); return [((n[0] + 1) / 2) * measureCanvas.width, ((1 - n[1]) / 2) * measureCanvas.height]; });
+    const accent = measureStyle("--accent"), text = measureStyle("--text");
+    ctx.lineWidth = 1.5; ctx.strokeStyle = accent; ctx.fillStyle = accent;
+    for (const [x, y] of sp) { ctx.beginPath(); ctx.arc(x, y, 3.5, 0, Math.PI * 2); ctx.fill(); }
+    if (sp.length === 2) {
+      ctx.beginPath(); ctx.moveTo(sp[0][0], sp[0][1]); ctx.lineTo(sp[1][0], sp[1][1]); ctx.stroke();
+      const a = measurePts[0], b = measurePts[1];
+      const d = Math.hypot(a[0] - b[0], a[1] - b[1], a[2] - b[2]);
+      const label = fmtMm(d / worldPerMm);
+      const mx = (sp[0][0] + sp[1][0]) / 2, my = (sp[0][1] + sp[1][1]) / 2;
+      ctx.font = "600 12px ui-monospace, monospace";
+      const tw = ctx.measureText(label).width + 10;
+      ctx.fillStyle = measureStyle("--bg"); ctx.globalAlpha = 0.85; ctx.fillRect(mx - tw / 2, my - 18, tw, 16); ctx.globalAlpha = 1;
+      ctx.fillStyle = text; ctx.textAlign = "center"; ctx.fillText(label, mx, my - 6);
+    }
+  }
+  (function measureWatch() {
+    measureRaf = requestAnimationFrame(measureWatch);
+    if (!measurePts.length) return;
+    const sig = camKeyNow() + "|" + measurePts.length + "|" + innerWidth + "x" + innerHeight;
+    if (sig === measureSig) return;
+    measureSig = sig; measureDraw();
+  })();
+  function measureClick(e) {
+    const pick = player.pickRaster(384, 384);
+    if (!pick) return;
+    const r = canvas.getBoundingClientRect();
+    const bx = Math.round(((e.clientX - r.left) / r.width) * pick.buf.w);
+    const by = Math.round(((e.clientY - r.top) / r.height) * pick.buf.h);
+    if (bx < 0 || by < 0 || bx >= pick.buf.w || by >= pick.buf.h) return;
+    const id = pick.buf.ids[by * pick.buf.w + bx];
+    if (id < 0) return;                          // background
+    if (measurePts.length >= 2) measurePts = [];
+    measurePts.push(pick.triCentroid(id));
+    measureSig = ""; measureDraw();
+  }
 
   const ndcOf = (clientX, clientY) => {
     const c = document.getElementById("view");
@@ -1884,7 +2158,7 @@ function initEditor(player) {
     try { overlay.setPointerCapture(e.pointerId); } catch { /* synthetic events have no active pointer */ }
     if (tool === "sbox") {
       dragStart = [e.clientX, e.clientY];
-      const col = activeSegColor();
+      const col = displayColor(activeSegColor());
       marquee.style.borderColor = col;
       marquee.style.background = col + "1F";
       marquee.style.display = "block";
@@ -1896,6 +2170,11 @@ function initEditor(player) {
       brushSample(e);
     } else if (tool === "sam") {
       samClick(e);
+    } else if (tool === "lasso") {
+      lassoPts = [[e.clientX, e.clientY]];
+      lassoDraw();
+    } else if (tool === "measure") {
+      measureClick(e);
     }
   });
   overlay.addEventListener("pointermove", (e) => {
@@ -1906,6 +2185,10 @@ function initEditor(player) {
       marquee.style.width = Math.abs(e.clientX - dragStart[0]) + "px";
       marquee.style.height = Math.abs(e.clientY - dragStart[1]) + "px";
     } else if (tool === "brush" && brushPts) brushSample(e);
+    else if (tool === "lasso" && lassoPts) {
+      const last = lassoPts[lassoPts.length - 1];
+      if (Math.hypot(e.clientX - last[0], e.clientY - last[1]) > 3) { lassoPts.push([e.clientX, e.clientY]); lassoDraw(); }
+    }
   });
   overlay.addEventListener("pointercancel", (e) => { if (navForward) { navForward = false; fwd(e); } });
   overlay.addEventListener("pointerup", (e) => {
@@ -1943,6 +2226,8 @@ function initEditor(player) {
         doMutation(() => addVolumeAtCurrent({ type: "brushStrokes", strokes: [{ op: "add", radius, points: brushPts }] }));
       }
       brushPts = null; brushPick = null;
+    } else if (tool === "lasso" && lassoPts) {
+      lassoCommit();
     }
   });
   function brushSample(e) {
@@ -2083,7 +2368,7 @@ function initEditor(player) {
   /** Exact-mask paint for the captured viewpoint (full mask resolution). */
   function samPaintDirect() {
     const { bits, maskW: w, maskH: h } = samSel;
-    const [cr, cg, cb] = hexRgb(samSel.color || activeSegColor());
+    const [cr, cg, cb] = hexRgb(displayColor(samSel.color || activeSegColor()));
     const r = canvas.getBoundingClientRect();
     samMaskCanvas.style.left = r.left + "px"; samMaskCanvas.style.top = r.top + "px";
     samMaskCanvas.style.width = r.width + "px"; samMaskCanvas.style.height = r.height + "px";
@@ -2112,7 +2397,7 @@ function initEditor(player) {
     const RW = 320, RH = Math.max(32, Math.round((RW * r.height) / Math.max(1, r.width)));
     const pick = player.pickRaster(RW, RH);
     if (!pick) return;
-    const [cr, cg, cb] = hexRgb(samSel.color || activeSegColor());
+    const [cr, cg, cb] = hexRgb(displayColor(samSel.color || activeSegColor()));
     samMaskCanvas.style.left = r.left + "px"; samMaskCanvas.style.top = r.top + "px";
     samMaskCanvas.style.width = r.width + "px"; samMaskCanvas.style.height = r.height + "px";
     samMaskCanvas.width = RW; samMaskCanvas.height = RH;
@@ -2147,7 +2432,7 @@ function initEditor(player) {
   // Commit button label ALWAYS names the action it performs (Apply/bake means "do it", not "delete
   // it", so a button reading "Apply" over a delete-producing control reads backwards). The select
   // next to it decides Delete/Recolor/Copy…; the button text mirrors whichever is picked.
-  const SAM_COMMIT_LABEL = { delete: "Delete ✂", recolor: "Recolor…", copy: "Copy…" };
+  const SAM_COMMIT_LABEL = { delete: "Delete", recolor: "Recolor…", paint: "Paint…", sculpt: "Sculpt…", copy: "Copy…" };
   const samActSel = $("samActSel"), samApplyBtn = $("samApply");
   function syncSamCommitLabel() { samApplyBtn.textContent = SAM_COMMIT_LABEL[samActSel.value] || "Commit"; }
   samActSel.onchange = syncSamCommitLabel;
@@ -2251,9 +2536,9 @@ function initEditor(player) {
       const b = document.createElement("button");
       b.textContent = label;
       const active = samSel.selected === idx;
-      const col = idx === "all" ? (samSel.color || activeSegColor()) : SEG_PALETTE[idx % SEG_PALETTE.length];
-      b.style.cssText = "margin:0;padding:2px 7px;font-size:10.5px;border-radius:5px;cursor:pointer;" +
-        `border:1px solid ${col};background:${active ? col + "3D" : "rgba(255,255,255,.05)"};color:${active ? "var(--text)" : "var(--text-dim)"}`;
+      const col = idx === "all" ? displayColor(samSel.color || activeSegColor()) : SEG_PALETTE[idx % SEG_PALETTE.length];
+      b.style.cssText = "margin:0;padding:2px 7px;font-size:10.5px;border-radius:var(--r);cursor:pointer;" +
+        `border:1px solid ${col};background:${active ? col + "3D" : "var(--wash)"};color:${active ? "var(--text)" : "var(--text-dim)"}`;
       b.onclick = () => { samSel.selected = idx; renderSamTextChips(); samApplyTextSelection(); };
       return b;
     };
@@ -2337,6 +2622,229 @@ function initEditor(player) {
     else if (e.key === "Escape") { e.preventDefault(); samTextInput.blur(); samSelClear(); }
   });
 
+  // ---- Selection operators: grow / shrink / invert / mirror on the ▶ active range's regions.
+  // One brush radius per step (the slider already states the unit); masks get the matching pixels.
+  const selStatus = (msg) => { const el = $("exportStatus"); if (el) { el.textContent = msg; setTimeout(() => { if (el.textContent === msg) el.textContent = ""; }, 4000); } };
+  function selGrow(steps) {
+    if (!activeRange) { selStatus("grow/shrink: make a range ▶ active first"); return; }
+    const mm = Number($("brushR").value) * steps;
+    const world = mm * worldPerMm;
+    const viewH = orbitViewHeight(player.getCamera().distance) || 1;
+    const ndc = (world / viewH) * 2;
+    const px = Math.round((world / viewH) * 768);
+    doMutation(() => { for (const kf of activeRange.keyframes) growKeyframe(kf, world, ndc, px); });
+    preview();
+  }
+  function selInvert() {
+    if (!activeRange) { selStatus("invert: make a range ▶ active first"); return; }
+    if ((activeRange.action || "delete") !== "delete") { selStatus("invert applies to delete ranges (keep ⇄ delete)"); return; }
+    doMutation(() => { activeRange.mode = activeRange.mode === "keep" ? "delete" : "keep"; });
+    preview();
+  }
+  function selMirror() {
+    if (!activeRange) { selStatus("mirror: make a range ▶ active first"); return; }
+    const b = player.getTransformedAabb();
+    const cx = (b.min[0] + b.max[0]) / 2;
+    let mirrored = 0, skipped = 0;
+    doMutation(() => { for (const kf of activeRange.keyframes) { const r = mirrorKeyframe(kf, 0, cx); mirrored += r.mirrored; skipped += r.skipped; } });
+    preview();
+    if (skipped) selStatus(`mirrored ${mirrored} region(s); ${skipped} screen-space mask(s) cannot be mirrored`);
+  }
+  $("selGrow").onclick = (e) => selGrow(e.shiftKey ? 5 : 1);
+  $("selShrink").onclick = (e) => selGrow(e.shiftKey ? -5 : -1);
+  $("selInvert").onclick = selInvert;
+  $("selMirror").onclick = selMirror;
+  window.__aresSel = { grow: selGrow, invert: selInvert, mirror: selMirror };
+
+  // ---- Camera bookmarks: per clip, on this machine. Camera-only — never touch the sidecar.
+  const CAM_KEY = "ares.cam." + clipBase;
+  let camMarks = [];
+  try { camMarks = JSON.parse(localStorage.getItem(CAM_KEY) || "[]"); if (!Array.isArray(camMarks)) camMarks = []; } catch { camMarks = []; }
+  let camCycle = -1;
+  function camPersist() { localStorage.setItem(CAM_KEY, JSON.stringify(camMarks)); }
+  function camGo(i) {
+    const c = camMarks[i];
+    if (!c) return;
+    player.autoOrbit = false; $("orbit").setAttribute("aria-pressed", "false");
+    player.setCamera(c);
+    player.setOrtho(!!c.ortho);   // also repaints
+    camCycle = i;
+  }
+  function camRender() {
+    const host = $("camChips");
+    if (!host) return;
+    host.replaceChildren(...camMarks.map((_, i) => {
+      const b = document.createElement("button");
+      b.className = "u ico"; b.textContent = String(i + 1);
+      b.title = `camera bookmark ${i + 1} — click to go there, Shift-click to remove`;
+      b.onclick = (e) => { if (e.shiftKey) { camMarks.splice(i, 1); camPersist(); camRender(); } else camGo(i); };
+      return b;
+    }));
+  }
+  $("camSave").onclick = () => { if (camMarks.length >= 9) camMarks.shift(); camMarks.push(player.getCamera()); camPersist(); camRender(); };
+  camRender();
+  window.__aresCam = { cycle: () => { if (camMarks.length) camGo((camCycle + 1) % camMarks.length); }, save: () => $("camSave").click() };
+
+  // ---- Playback FX (core fx.ts): live values → player.setFx; keyframes → edits.fx (sidecar) →
+  // player.setFxTrack; audio-reactive modulation rides the override layer. Sliders are % of
+  // sensible ranges so the same controls make sense on a mm clip and a metre clip.
+  const spanY = Math.max(1e-6, aabb.max[1] - aabb.min[1]);
+  const fxLive = {};                     // the live (non-track) params, as the user set them
+  const hexToRgb01 = (hex) => hexRgb(hex).map((v) => v / 255);
+  const rgb01ToHex = (c) => "#" + c.map((v) => Math.round(Math.max(0, Math.min(1, v)) * 255).toString(16).padStart(2, "0")).join("");
+  let fxClipAxis = 1, fxClipSign = 1;
+  const fxClipParams = () => {
+    const n = [0, 0, 0]; n[fxClipAxis] = fxClipSign;
+    const t = Number($("fxClipOff").value) / 100;
+    const at = aabb.min[fxClipAxis] + t * (aabb.max[fxClipAxis] - aabb.min[fxClipAxis]);
+    return { clipOn: $("fxClipOn").getAttribute("aria-pressed") === "true", clipNormal: n, clipOffset: -fxClipSign * at };
+  };
+  const readFxControls = () => ({
+    ...fxClipParams(),
+    dissolve: Number($("fxDissolve").value) / 100, dissolveScale: Number($("fxDissolveScale").value) || 4, dissolveEdge: hexToRgb01($("fxEdge").value),
+    tint: hexToRgb01($("fxTint").value), tintMix: Number($("fxTintMix").value) / 100,
+    rim: Number($("fxRim").value) / 100, rimColor: hexToRgb01($("fxRimColor").value),
+    scanlines: Number($("fxScan").value) / 100, scanFreq: Number($("fxScanFreq").value) || 40,
+    wobbleAmp: (Number($("fxWobble").value) / 100) * spanY * 0.05, wobbleFreq: Number($("fxWobbleFreq").value) || 2,
+    splatJitter: (Number($("fxJitter").value) / 100) * spanY * 0.01, splatScale: Number($("fxSplatScale").value) / 100, splatOpacity: Number($("fxSplatOpacity").value) / 100,
+  });
+  const applyFxControls = () => { Object.assign(fxLive, readFxControls()); player.setFx(fxLive); };
+  const writeFxControls = (p) => {
+    // Inverse of readFxControls for the params the controls own (used when a keyframe is restored).
+    if (p.dissolve !== undefined) $("fxDissolve").value = String(Math.round(p.dissolve * 100));
+    if (p.dissolveScale !== undefined) $("fxDissolveScale").value = String(p.dissolveScale);
+    if (p.dissolveEdge) $("fxEdge").value = rgb01ToHex(p.dissolveEdge);
+    if (p.tint) $("fxTint").value = rgb01ToHex(p.tint);
+    if (p.tintMix !== undefined) $("fxTintMix").value = String(Math.round(p.tintMix * 100));
+    if (p.rim !== undefined) $("fxRim").value = String(Math.round(p.rim * 100));
+    if (p.rimColor) $("fxRimColor").value = rgb01ToHex(p.rimColor);
+    if (p.scanlines !== undefined) $("fxScan").value = String(Math.round(p.scanlines * 100));
+    if (p.scanFreq !== undefined) $("fxScanFreq").value = String(p.scanFreq);
+    if (p.wobbleAmp !== undefined) $("fxWobble").value = String(Math.round((p.wobbleAmp / (spanY * 0.05)) * 100));
+    if (p.wobbleFreq !== undefined) $("fxWobbleFreq").value = String(p.wobbleFreq);
+    if (p.splatJitter !== undefined) $("fxJitter").value = String(Math.round((p.splatJitter / (spanY * 0.01)) * 100));
+    if (p.splatScale !== undefined) $("fxSplatScale").value = String(Math.round(p.splatScale * 100));
+    if (p.splatOpacity !== undefined) $("fxSplatOpacity").value = String(Math.round(p.splatOpacity * 100));
+    if (p.clipOn !== undefined) $("fxClipOn").setAttribute("aria-pressed", String(!!p.clipOn));
+    if (p.clipNormal) { const ax = p.clipNormal.findIndex((v) => Math.abs(v) > 0.5); if (ax >= 0) { fxClipAxis = ax; fxClipSign = p.clipNormal[ax] < 0 ? -1 : 1; for (const b of $("fxClipAxis").querySelectorAll("button")) b.setAttribute("aria-pressed", String(Number(b.dataset.ax) === ax)); } }
+    if (p.clipOffset !== undefined && p.clipNormal) { const at = -p.clipOffset * fxClipSign; const t = (at - aabb.min[fxClipAxis]) / Math.max(1e-9, aabb.max[fxClipAxis] - aabb.min[fxClipAxis]); $("fxClipOff").value = String(Math.round(Math.max(0, Math.min(1, t)) * 100)); }
+  };
+  for (const id of ["fxDissolve", "fxDissolveScale", "fxEdge", "fxTint", "fxTintMix", "fxRim", "fxRimColor", "fxScan", "fxScanFreq", "fxWobble", "fxWobbleFreq", "fxJitter", "fxSplatScale", "fxSplatOpacity", "fxClipOff"]) {
+    const el = $(id); if (el) el.oninput = applyFxControls;
+  }
+  $("fxClipOn").onclick = () => { $("fxClipOn").setAttribute("aria-pressed", String($("fxClipOn").getAttribute("aria-pressed") !== "true")); applyFxControls(); };
+  $("fxClipAxis").onclick = (e) => { const b = e.target.closest("button[data-ax]"); if (!b) return; fxClipAxis = Number(b.dataset.ax); for (const o of $("fxClipAxis").querySelectorAll("button")) o.setAttribute("aria-pressed", String(o === b)); applyFxControls(); };
+  $("fxClipFlip").onclick = () => { fxClipSign = -fxClipSign; applyFxControls(); };
+  $("fxReset").onclick = () => {
+    for (const [id, v] of [["fxDissolve", "0"], ["fxDissolveScale", "4"], ["fxEdge", "#c99a5a"], ["fxTint", "#ffffff"], ["fxTintMix", "0"], ["fxRim", "0"], ["fxRimColor", "#c99a5a"], ["fxScan", "0"], ["fxScanFreq", "40"], ["fxWobble", "0"], ["fxWobbleFreq", "2"], ["fxJitter", "0"], ["fxSplatScale", "100"], ["fxSplatOpacity", "100"], ["fxClipOff", "50"]]) $(id).value = v;
+    $("fxClipOn").setAttribute("aria-pressed", "false");
+    for (const k of Object.keys(fxLive)) delete fxLive[k];
+    player.resetFx();
+  };
+  // Keyframed track in the sidecar: edits.fx = { keyframes: [{ frame, params }], react?: { param, gain } }.
+  const fxTrack = () => (edits.fx && Array.isArray(edits.fx.keyframes) ? edits.fx : (edits.fx = { keyframes: [] }));
+  function fxSyncTrack() {
+    const t = fxTrack();
+    player.setFxTrack(t.keyframes.length ? { keyframes: t.keyframes } : null);
+    if (!t.keyframes.length && !t.react) delete edits.fx;
+    saveEdits();
+    const host = $("fxKeys");
+    host.replaceChildren(...t.keyframes.slice().sort((a, b) => a.frame - b.frame).map((k) => {
+      const b = document.createElement("button");
+      b.className = "u"; b.textContent = String(k.frame); b.title = `effects keyframe at frame ${k.frame} — click to jump there`;
+      b.onclick = () => { tlSeek(k.frame); writeFxControls(k.params); applyFxControls(); };
+      return b;
+    }));
+  }
+  $("fxKey").onclick = () => {
+    const f = curFrame();
+    doMutation(() => {
+      const t = fxTrack();
+      const params = readFxControls();
+      const existing = t.keyframes.find((k) => k.frame === f);
+      if (existing) existing.params = params; else t.keyframes.push({ frame: f, params });
+    });
+    fxSyncTrack();
+  };
+  $("fxKeyDel").onclick = () => {
+    const f = curFrame();
+    doMutation(() => { const t = fxTrack(); t.keyframes = t.keyframes.filter((k) => k.frame !== f); });
+    fxSyncTrack();
+  };
+  $("fxTrackClear").onclick = () => { doMutation(() => { if (edits.fx) edits.fx.keyframes = []; }); fxSyncTrack(); };
+  // Audio-reactive modulation: loudness × gain added onto one parameter, on the override layer.
+  const fxReactSel = $("fxReact"), fxReactGain = $("fxReactGain");
+  const fxReactState = () => ({ param: fxReactSel.value, gain: Number(fxReactGain.value) / 100 });
+  const fxSaveReact = () => { const t = fxTrack(); const r = fxReactState(); if (r.param) t.react = r; else delete t.react; fxSyncTrack(); };
+  fxReactSel.onchange = fxSaveReact; fxReactGain.oninput = fxSaveReact;
+  (function fxReactWatch() {
+    requestAnimationFrame(fxReactWatch);
+    const r = fxReactState();
+    if (!r.param) { if (window.__aresFxReactOn) { player.setFxOverride(null); window.__aresFxReactOn = false; } return; }
+    const level = player.getAudioLevel ? player.getAudioLevel() : 0;
+    const base = player.currentFx ? player.currentFx()[r.param] : 0;
+    const add = level * r.gain * (r.param === "splatScale" ? 1 : r.param === "wobbleAmp" ? spanY * 0.05 : 1);
+    player.setFxOverride({ [r.param]: (typeof base === "number" ? base : 0) + add });
+    window.__aresFxReactOn = true;
+  })();
+  if (player.isSplat && player.isSplat()) { $("fxRim").disabled = true; $("fxRimColor").disabled = true; }
+  else $("fxSplatRow").style.display = "none";
+  window.__aresFx = { sync: fxSyncTrack, restore: (t) => { if (t && Array.isArray(t.keyframes)) { edits.fx = t; if (t.react) { fxReactSel.value = t.react.param || ""; fxReactGain.value = String(Math.round((t.react.gain ?? 0.8) * 100)); } fxSyncTrack(); } } };
+
+  // ---- Export: the presented frame, a still, a turntable. Everything stays on this machine.
+  const download = (blob, name) => {
+    const a = document.createElement("a");
+    a.href = URL.createObjectURL(blob); a.download = name;
+    document.body.appendChild(a); a.click(); a.remove();
+    setTimeout(() => URL.revokeObjectURL(a.href), 10000);
+  };
+  const exportStatus = (msg) => { const el = $("exportStatus"); if (el) el.textContent = msg; };
+  $("exportObj").onclick = () => {
+    const fr = player.exportFrame();
+    if (!fr) { exportStatus("no mesh frame to export" + (player.isSplat && player.isSplat() ? " — use `ares export` for splat clips" : "")); return; }
+    const n = fr.positions.length / 3;
+    const parts = [`# ARES ${clipBase} frame ${fr.frameIndex}\no ${clipBase}_f${fr.frameIndex}\n`];
+    const p = fr.positions;
+    for (let i = 0; i < n; i++) parts.push(`v ${p[i * 3]} ${p[i * 3 + 1]} ${p[i * 3 + 2]}\n`);
+    if (fr.uvs) for (let i = 0; i < n; i++) parts.push(`vt ${fr.uvs[i * 2]} ${fr.uvs[i * 2 + 1]}\n`);
+    if (fr.normals) for (let i = 0; i < n; i++) parts.push(`vn ${fr.normals[i * 3]} ${fr.normals[i * 3 + 1]} ${fr.normals[i * 3 + 2]}\n`);
+    const fmt = (k) => { k += 1; return fr.uvs && fr.normals ? `${k}/${k}/${k}` : fr.uvs ? `${k}/${k}` : fr.normals ? `${k}//${k}` : `${k}`; };
+    const idx = fr.indices;
+    for (let t = 0; t < idx.length; t += 3) parts.push(`f ${fmt(idx[t])} ${fmt(idx[t + 1])} ${fmt(idx[t + 2])}\n`);
+    download(new Blob(parts, { type: "text/plain" }), `${clipBase}-f${fr.frameIndex}.obj`);
+    exportStatus(`wrote frame ${fr.frameIndex}: ${n} verts, ${idx.length / 3} tris`);
+  };
+  $("exportPng").onclick = async () => {
+    const shot = player.captureFrame(4096);
+    const blob = await (await fetch(shot.dataUrl)).blob();
+    download(blob, `${clipBase}-f${curFrame()}.png`);
+    exportStatus(`still ${shot.width}×${shot.height}`);
+  };
+  $("exportTurn").onclick = async () => {
+    if (!canvas.captureStream || !window.MediaRecorder) { exportStatus("recording is not supported in this browser"); return; }
+    const seconds = 8;
+    const mime = ["video/webm;codecs=vp9", "video/webm;codecs=vp8", "video/webm"].find((m) => MediaRecorder.isTypeSupported(m)) || "";
+    const stream = canvas.captureStream(30);
+    const rec = new MediaRecorder(stream, mime ? { mimeType: mime, videoBitsPerSecond: 12e6 } : undefined);
+    const chunks = [];
+    rec.ondataavailable = (ev) => { if (ev.data && ev.data.size) chunks.push(ev.data); };
+    const prev = { speed: player.orbitSpeed, orbit: player.autoOrbit, playing: player.isPlaying };
+    const btn = $("exportTurn");
+    btn.disabled = true;
+    player.orbitSpeed = (2 * Math.PI) / seconds;
+    player.autoOrbit = true; $("orbit").setAttribute("aria-pressed", "true");
+    if (!prev.playing) { player.play(); $("play").textContent = "⏸︎"; }
+    rec.start(250);
+    for (let t = seconds; t > 0; t--) { exportStatus(`recording turntable… ${t} s`); await new Promise((res) => setTimeout(res, 1000)); }
+    await new Promise((res) => { rec.onstop = res; rec.stop(); });
+    player.orbitSpeed = prev.speed;
+    player.autoOrbit = prev.orbit; $("orbit").setAttribute("aria-pressed", String(prev.orbit));
+    if (!prev.playing) { player.pause(); $("play").textContent = "▶︎"; }
+    btn.disabled = false;
+    download(new Blob(chunks, { type: mime || "video/webm" }), `${clipBase}-turntable.webm`);
+    exportStatus(`turntable saved (${seconds} s, ${mime || "webm"})`);
+  };
+
   $("rangeStart").onclick = () => {
     doMutation(() => {
       ensureRange();
@@ -2376,6 +2884,7 @@ function initEditor(player) {
       tlSeek(trimIn);
     }
     if (j.transform && typeof j.transform === "object") { xf = { ...XF_DEFAULT(), ...j.transform }; applyXf({ save: false }); }
+    if (j.fx && typeof j.fx === "object") window.__aresFx?.restore(j.fx);
     renderRanges();
   }).catch(() => {});
 
@@ -2384,7 +2893,7 @@ function initEditor(player) {
     try {
       const r = await fetch("/pick?type=folder&for=bake").then((r) => r.json());
       if (r && r.path) { $("bakePath").value = r.path; $("bakePath").style.borderColor = ""; }
-    } catch { $("bakeLog").textContent = "⚠ picker needs the ARES dev server running"; }
+    } catch { $("bakeLog").textContent = "picker needs the ARES dev server running"; }
   };
 
   // Bake: re-encode the SOURCE frames with the edit list (+ optional crop) — the .ares is a
@@ -2392,12 +2901,13 @@ function initEditor(player) {
   $("bakeGo").onclick = async () => {
     const dir = $("bakePath").value.trim();
     const log = $("bakeLog");
-    if (!dir) { log.textContent = "⚠ enter the source frames folder (the OBJ/PNG directory this .ares came from)"; return; }
+    if (!dir) { log.textContent = "enter the source frames folder (the OBJ/PNG directory this .ares came from)"; return; }
     const box = activeRange ? null : cropBox();          // the crop belongs to the range while authoring
     const trimmed = !trimIsFull();
     const xformed = !xfIsDefault();
-    if (!box && !edits.ranges.length && !trimmed && !xformed) { log.textContent = "⚠ nothing to bake — transform, crop, trim the clip, or author a range first"; return; }
-    const name = ($("bakeName").value.trim() || "cropped").replace(/[^a-z0-9._-]/gi, "_");
+    if (!box && !edits.ranges.length && !trimmed && !xformed) { log.textContent = "nothing to bake — transform, crop, trim the clip, or author a range first"; return; }
+    // Empty name → derive from the loaded clip: <clip-base>-edit.
+    const name = ($("bakeName").value.trim() || clipBase + "-edit").replace(/[^a-z0-9._-]/gi, "_");
     const q = new URLSearchParams({ dir, name, textureCodec: "av1", texSize: "1024", crf: "30", smooth: "0" });
     if (box) q.set("crop", [...box.min, ...box.max].map((v) => v.toFixed(1)).join(","));
     // The model transform bakes into the geometry (encoder --up-axis/--center/...). Same core
@@ -2414,14 +2924,16 @@ function initEditor(player) {
       await fetch("/edits/" + clipBase, { method: "POST", body: JSON.stringify(edits, null, 1) }).catch(() => {});
       q.set("editsName", clipBase);
     }
-    log.textContent = "▶ baking…\n";
+    log.textContent = "▶︎ baking…\n";
     const es = new EventSource("/encode?" + q.toString());
     es.addEventListener("log", (e) => { log.textContent += JSON.parse(e.data) + "\n"; log.scrollTop = log.scrollHeight; });
     es.addEventListener("done", (e) => {
       es.close();
       log.textContent += "✓ done\n";
+      $("bakeOpenBtn")?.remove();   // one Open button at a time — a re-bake replaces it
       const open = document.createElement("button");
-      open.className = "btn"; open.style.cssText = "margin-top:6px;padding:5px 10px"; open.textContent = "Open " + name + ".ares";
+      open.id = "bakeOpenBtn"; open.className = "u"; open.style.marginTop = "6px";
+      open.textContent = "Open " + name + ".ares";
       open.onclick = () => { location.search = "?src=" + name + ".ares"; };
       log.after(open);
     });
@@ -2457,18 +2969,18 @@ async function main() {
     const q0 = new URLSearchParams(location.search);
     player = await AresPlayer.create({
       canvas, src: SRC, loop: true, autoOrbit: false, onStats: renderHUD,  // orbit is opt-in via the Orbit button
-      onEnded: () => { $("play").textContent = "▶"; },   // "once" mode auto-pauses on the last frame
+      onEnded: () => { $("play").textContent = "▶︎"; },   // "once" mode auto-pauses on the last frame
       useWorker: q0.get("worker") === "1",   // §10.7 worker-thread geometry decode
       forceGL2: q0.get("gl2") === "1",       // §10.4 WebGL2 fallback (testing)
     });
   } catch (e) {
     // The clip failing never takes the app down: tabs are already wired, so Convert/Compare/
-    // Settings all still work. Point at Settings, which can generate the synth clip one-click.
+    // Settings all still work. Point at Settings, which can generate the synth clip.
     const el = $("err");
     el.style.display = "block";
     el.innerHTML = `Failed to load <b>${SRC.split("/").pop()}</b>: ${(e && e.message ? e.message : e)}<br><br>
-      Open <a href="#" id="errSettings">⚙ Settings</a> to check components — the synthetic demo clip
-      can be generated there with one click — or pick another source from the Convert tab's history.`;
+      Open <a href="#" id="errSettings">Settings</a> to check components — the synthetic demo clip
+      can be generated there — or pick another source from the Convert tab's history.`;
     document.getElementById("errSettings").onclick = (ev) => { ev.preventDefault(); setTab("settings"); };
     console.error(e);
     return;
@@ -2476,7 +2988,31 @@ async function main() {
 
   window.__ares = player; // debug handle
   const backend = (new URLSearchParams(location.search).get("gl2") === "1" || !navigator.gpu) ? "WebGL2 fallback" : "WebGPU";
-  $("title").textContent = "playing " + SRC.split("/").pop() + " — meshopt geometry + WebCodecs texture, " + backend;
+  const splatClip = !!(player.isSplat && player.isSplat());
+  $("title").textContent = "playing " + SRC.split("/").pop() + " — " + (splatClip ? "Gaussian splat profile (SPLT), " : "meshopt geometry + WebCodecs texture, ") + backend;
+  if (splatClip) {
+    // Splat clips have no triangles: the surface-selection tools and wireframe/unlit modes are
+    // mesh concepts. Crop, transform, trim and the clay view keep working. Text, not hiding, so
+    // the rail's layout stays put and the reason is readable.
+    document.body.dataset.profile = "splat";
+    for (const b of document.querySelectorAll('#editPanel button.tool[data-tool]')) {
+      if (b.dataset.tool === "nav") continue;
+      b.disabled = true;
+      b.title += " — mesh clips only: a splat clip has no triangles to select.";
+    }
+    for (const mode of ["wire", "unlit", "normals", "uv", "depth", "points"]) {
+      const b = document.querySelector(`#shadeSeg button[data-shade="${mode}"]`);
+      if (b) { b.disabled = true; b.title += " — not applicable to splat clips."; }
+    }
+    for (const id of ["selGrow", "selShrink", "selInvert", "selMirror", "exportObj"]) { const b = $(id); if (b) b.disabled = true; }
+    const rail = document.getElementById("editPanel");
+    const note = document.createElement("div");
+    note.className = "note";
+    note.textContent = "Splat clip: crop, transform and trim apply. Box, brush and SAM selection need mesh triangles and are off for this clip.";
+    const firstTool = rail && rail.querySelector('button.tool[data-tool]');
+    const row = firstTool && firstTool.parentElement;
+    if (row && row.parentElement) row.parentElement.insertBefore(note, row);
+  }
 
   // Restore viewpoint/time carried over from a source switch (fair A/B: same instant, same angle).
   // SCALE GUARD: a carried camera is only meaningful if the new clip lives at a comparable world
@@ -2505,7 +3041,7 @@ async function main() {
   if (qs.get("t")) player.seek(Number(qs.get("t")));
   const startPaused = qs.get("paused") === "1";
   if (!startPaused) player.play();
-  $("play").textContent = startPaused ? "▶" : "⏸";
+  $("play").textContent = startPaused ? "▶︎" : "⏸︎";
   const orbitBtn = $("orbit");
   const syncOrbit = () => orbitBtn.setAttribute("aria-pressed", String(player.autoOrbit));
   syncOrbit();
@@ -2569,9 +3105,29 @@ async function main() {
   };
 
   $("play").onclick = () => {
-    if (player.isPlaying) { player.pause(); $("play").textContent = "▶"; }
-    else { player.play(); $("play").textContent = "⏸"; }
+    if (player.isPlaying) { player.pause(); $("play").textContent = "▶︎"; }
+    else { player.play(); $("play").textContent = "⏸︎"; }
   };
+
+  // Audio transport (Opus track, spec §11.5): shown only when the clip carries one. Mute and
+  // volume persist on this machine; the audio context resumes on the first gesture.
+  const muteBtn = $("mute"), volEl = $("vol");
+  if (player.hasAudio && player.hasAudio()) {
+    muteBtn.style.display = ""; volEl.style.display = "";
+    const savedVol = Number(localStorage.getItem("ares.volume") ?? 100);
+    const savedMute = localStorage.getItem("ares.muted") === "1";
+    volEl.value = String(Number.isFinite(savedVol) ? savedVol : 100);
+    player.setVolume(Number(volEl.value) / 100);
+    player.setMuted(savedMute);
+    muteBtn.setAttribute("aria-pressed", String(savedMute));
+    muteBtn.onclick = () => {
+      const m = !player.isMuted();
+      player.setMuted(m);
+      muteBtn.setAttribute("aria-pressed", String(m));
+      localStorage.setItem("ares.muted", m ? "1" : "0");
+    };
+    volEl.oninput = () => { player.setVolume(Number(volEl.value) / 100); localStorage.setItem("ares.volume", volEl.value); };
+  }
 
   // Loop-mode transport: cycle Loop → Ping-pong → Once (persisted). The player owns the frame math
   // (frameIndexForClock); ping-pong is a triangle wave, once clamps + auto-pauses (flips Play above).
@@ -2595,6 +3151,26 @@ async function main() {
 
   const editorApi = initEditor(player);
 
+  // Shortcut reference: `?` toggles it. One static table — the tooltips carry the same words, this
+  // just puts them in one place. Tokens only, internal scroll, no prose.
+  const KEYS = [
+    ["Space", "play / pause"], ["← →", "step 1 frame (Shift 10)"], ["Home / End", "first / last frame"], ["[ ]", "clip in / out at the playhead"],
+    ["1 3 7", "front / right / top (Ctrl = opposite)"], ["F", "focus the subject"], ["O", "auto-orbit"], ["U", "mute / unmute audio"], ["L", "lock the view"], ["P", "perspective / ortho"], ["G", "ground grid"],
+    ["Z", "cycle shading: shaded · unlit · clay · wire · normals · uv · depth · points"], ["Shift+W", "wireframe"], ["Shift+E", "collapse the Edit rail"], ["Shift+R", "crop guides"],
+    ["V / Q", "navigate"], ["M", "box select"], ["B", "brush"], ["S", "SAM select"], ["A", "lasso"], ["T", "measure"], ["X", "x-ray"],
+    ["W E R", "move / rotate / scale the model"], ["X Y Z (held)", "constrain a transform drag"],
+    ["= / −", "grow / shrink the active range (Shift 5×)"], ["I", "invert the active delete range"], ["C", "cycle camera bookmarks"],
+    ["Ctrl+Z / Ctrl+Y", "undo / redo"], ["Ctrl+S", "save the sidecar now"], ["Delete", "commit a pending SAM selection as delete, else remove the active range"], ["Esc", "back to navigate; close this panel"], ["?", "this panel"],
+  ];
+  const keysPanel = document.createElement("div");
+  keysPanel.id = "keysPanel";
+  keysPanel.className = "panel";
+  keysPanel.style.cssText = "position:fixed;left:50%;top:56px;transform:translateX(-50%);z-index:30;display:none;max-height:calc(100vh - 120px);overflow:auto;padding:10px 14px;min-width:420px";
+  keysPanel.innerHTML = `<div class="cap" style="margin-bottom:6px">Keyboard</div><table style="border-collapse:collapse;font:12px system-ui">` +
+    KEYS.map(([k, d]) => `<tr><td style="padding:2px 14px 2px 0;font:600 11px ui-monospace,monospace;color:var(--text);white-space:nowrap">${k}</td><td style="padding:2px 0;color:var(--text-mid)">${d}</td></tr>`).join("") + `</table>`;
+  document.body.appendChild(keysPanel);
+  window.__aresKeys = { toggle: () => { keysPanel.style.display = keysPanel.style.display === "none" ? "block" : "none"; }, isOpen: () => keysPanel.style.display !== "none" };
+
   // --- Keyboard shortcuts (viewer tab; inactive when a tool tab overlays) ---------------------
   //  Ctrl+S save-flush (always, any focus) · 1/3/7 (+ Ctrl = opposite face) view presets, Digit
   //  or Numpad · Ctrl+Z undo · Ctrl+Shift+Z / Ctrl+Y redo · Space play/pause · arrows step 1 frame
@@ -2602,7 +3178,7 @@ async function main() {
   //  W wireframe · O orbit (no-op while locked) · Esc back to Nav · Delete/Backspace: with a
   //  pending SAM selection, commits it as a delete range; otherwise removes the active (▶) range
   //  row (only when not typing in an input)
-  const holdAt = (sec) => { player.pause(); $("play").textContent = "▶"; player.seek(sec); };
+  const holdAt = (sec) => { player.pause(); $("play").textContent = "▶︎"; player.seek(sec); };
   window.addEventListener("keydown", (e) => {
     const ctrl = e.ctrlKey || e.metaKey;
 
@@ -2664,24 +3240,33 @@ async function main() {
       case "E": $("railCollapse").click(); break;                    // rail collapse
       case "R": expandRail(); $("cropGuidesToggle").click(); break;  // crop guides
       case "o": case "O": $("orbit").click(); break;
+      case "u": case "U": if ($("mute").style.display !== "none") $("mute").click(); break;
       case "l": case "L": $("viewLock").click(); break;
       case "v": case "V": clickTool("nav"); break;
       case "m": case "M": clickTool("sbox"); break;
       case "b": case "B": clickTool("brush"); break;
       case "s": case "S": clickTool("sam"); break;
+      case "a": case "A": clickTool("lasso"); break;
+      case "t": case "T": clickTool("measure"); break;
+      case "i": case "I": window.__aresSel?.invert(); break;
+      case "=": case "+": e.preventDefault(); window.__aresSel?.grow(e.shiftKey ? 5 : 1); break;
+      case "-": case "_": e.preventDefault(); window.__aresSel?.grow(e.shiftKey ? -5 : -1); break;
+      case "c": case "C": window.__aresCam?.cycle(); break;
+      case "?": e.preventDefault(); window.__aresKeys?.toggle(); break;
       case "x": case "X": expandRail(); $("xray").click(); break;
       // Shading is a VIEWPORT mode (header bar), so it works with the Edit rail closed too. Z cycles.
       // NOT 1/2/3 — Digit1/3/7 are the view presets and return earlier in this handler.
       case "z": case "Z": {
-        const order = ["shaded", "clay", "wire"];
+        const order = ["shaded", "unlit", "clay", "wire", "normals", "uv", "depth", "points"];
         window.__aresShade?.set(order[(order.indexOf(window.__aresShade.get()) + 1) % order.length]);
         break;
       }
       // G is a viewport reference now (header bar), like Z/W/P — it must not need the rail open.
       case "g": case "G": $("gridToggle").click(); break;
-      case "r": case "R": expandRail(); $("cropGuidesToggle").click(); break;
       case "p": case "P": window.__aresProj.set(window.__aresProj.get() === "ortho" ? "persp" : "ortho"); break;
-      case "Escape": expandRail(); document.querySelector('#editPanel .tool[data-tool="nav"]')?.click(); break;
+      case "Escape":
+        if (window.__aresKeys?.isOpen()) { window.__aresKeys.toggle(); break; }
+        expandRail(); document.querySelector('#editPanel .tool[data-tool="nav"]')?.click(); break;
       case "Delete": case "Backspace": e.preventDefault(); editorApi.commitPendingSelectionOrRemoveRow(); break;
     }
   });

@@ -10,6 +10,7 @@
  */
 import { execFile } from "node:child_process";
 import { readFile, writeFile, rm, mkdtemp } from "node:fs/promises";
+import { existsSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { promisify } from "node:util";
@@ -17,13 +18,18 @@ import { promisify } from "node:util";
 const run = promisify(execFile);
 
 export function ffmpegPath() {
-  return process.env.FFMPEG || "C:\\FFmpeg\\bin\\ffmpeg.exe";
+  // Same discovery order as the encoder (packages/encoder/src/texture-video.ts): env, the usual
+  // install locations, then PATH — instead of one developer's Windows path as the default.
+  const env = process.env.FFMPEG || process.env.FFMPEG_PATH;
+  if (env && existsSync(env)) return env;
+  for (const c of ["C:\FFmpeg\bin\ffmpeg.exe", "/usr/bin/ffmpeg", "/usr/local/bin/ffmpeg", "/opt/homebrew/bin/ffmpeg"]) if (existsSync(c)) return c;
+  return "ffmpeg";
 }
 
 /* --------------------------- closest-point-on-mesh --------------------------- */
 
 /** Closest point on triangle abc to p (Ericson, Real-Time Collision Detection). */
-function closestOnTriangle(
+export function closestOnTriangle(
   px, py, pz, ax, ay, az, bx, by, bz, cx, cy, cz, out, o,
 ) {
   const abx = bx - ax, aby = by - ay, abz = bz - az;
@@ -60,7 +66,7 @@ function closestOnTriangle(
   return dx * dx + dy * dy + dz * dz;
 }
 
-function barycentric3(px, py, pz, ax, ay, az, bx, by, bz, cx, cy, cz) {
+export function barycentric3(px, py, pz, ax, ay, az, bx, by, bz, cx, cy, cz) {
   const v0x = bx - ax, v0y = by - ay, v0z = bz - az;
   const v1x = cx - ax, v1y = cy - ay, v1z = cz - az;
   const v2x = px - ax, v2y = py - ay, v2z = pz - az;

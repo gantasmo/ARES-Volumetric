@@ -20,17 +20,7 @@ export interface AresHeader {
 }
 
 // The parsed GOP index record lives in container.ts (GopEntry) — the shape actually
-// read from the file. SplatBuffers/DecodedFrame below are spec-shaped types for the
-// P4 splat profile; no decode path consumes them yet.
-
-export interface SplatBuffers {
-  count: number;
-  position: Float32Array; // xyz * count
-  scale: Float32Array;    // xyz * count
-  rotation: Int8Array;    // quat * count
-  opacity: Uint8Array;
-  sh: Float32Array;
-}
+// read from the file. The splat profile's decoded form lives in splat.ts (DecodedSplat).
 
 export interface DecodedFrame {
   pts: number;
@@ -38,6 +28,5 @@ export interface DecodedFrame {
   indices?: Uint32Array;        // present on I-frames only (persistent topology)
   changedIndices?: Uint32Array; // P/B sparse
   residuals?: Int16Array;       // P/B sparse
-  splat?: SplatBuffers;
   texture?: VideoFrame;         // WebCodecs output; close() after GPU import
 }

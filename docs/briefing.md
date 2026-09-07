@@ -41,7 +41,7 @@ smooth.
 ## Current capabilities
 
 A working player, a converter, and an editor, all running locally. On Windows,
-double-clicking `Play ARES Demo.vbs` in the repository opens the player with the test
+double-clicking `ARES.vbs` in the repository opens the player with the test
 recording. The same app has a Convert tab that turns a folder of captured frames into an
 `.ares` file through a normal folder-picker dialog, a Compare tab that shows two encodes
 side by side with a draggable divider, an Inspect tab that reports what is inside a

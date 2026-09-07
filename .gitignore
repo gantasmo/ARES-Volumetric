@@ -57,6 +57,16 @@ tools/bin/
 apps/demo/history.json
 apps/demo/showcase.json
 apps/demo/.thumbs/
+# Rolling activity log (POST /log) — same class as history.json.
+apps/demo/.ares-activity.jsonl
+
+# Downloaded model weights for the SAM service's optional upscale/detail endpoints
+# (Real-ESRGAN etc.) — fetched on demand, never committed (64 MB+ each).
+tools/sam-service/models/
+
+# Launcher / bake logs left beside the tools.
+tools/*.log
+.skel-*.log
 
 # --- Generated data: bake pipeline ----------------------------------------
 # Coherent-GOP intermediates, ~4.3 GB. All regenerate from the source capture
@@ -114,3 +124,12 @@ Thumbs.db
 .idea/
 .claude/
 .playwright-mcp/
+
+# --- RGBD-rebuild pipeline workspaces (NDA capture imagery — NEVER commit) --
+# Depthkit-track intermediates: masks, photoreal atlases, fused depth, body
+# meshes, normals. Regenerable via recipes in DECISIONS.md.
+.dk-work/
+# Daniel targeted-temporal workspace (if regenerated; archived 2026-07-17).
+.v9-work/
+# Owner-tended cold storage of superseded intermediates (see its MANIFEST.md).
+archive/

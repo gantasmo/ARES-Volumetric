@@ -1,44 +1,31 @@
-# ARES 1-click launcher worker. Run via "Launch ARES Probe.vbs" (hidden, no console)
-# or tools\launch-debug.cmd (visible console). Windows PowerShell 5.1 compatible.
+# ARES Windows bootstrap — the only job here is getting Node.js, then handing over to
+# tools\launch.mjs, which is the launcher for every platform. Run via "ARES.vbs" (windowless)
+# or tools\launch-console.cmd (visible console). Windows PowerShell 5.1 compatible.
 #
-# Does, in order: find Node (installs LTS via winget if missing) -> npm install if
-# needed -> tsc build (non-fatal) -> start tools\serve.mjs hidden (COOP/COEP server)
-# unless one is already running -> open the probe in the default browser.
-# Everything is logged to tools\launch.log.
+#   powershell -File tools\launch.ps1 [app|probe|bench|sam] [launcher options]
+#
+# Everything else — dependencies, build, demo clip, dev server, browser — lives in launch.mjs
+# and is logged to tools\launch.log. Failures raise a message box, because the windowless path
+# has nowhere else to report.
+param([Parameter(ValueFromRemainingArguments = $true)] [string[]] $LaunchArgs)
 
 $ErrorActionPreference = "Continue"
 $ToolsDir = Split-Path -Parent $MyInvocation.MyCommand.Path
 $AresDir  = Split-Path -Parent $ToolsDir
 $LogFile  = Join-Path $ToolsDir "launch.log"
-$ServeJs  = Join-Path $ToolsDir "serve.mjs"
-$ProbeUrl = "/apps/phase0-probe/"
-$Ports    = 8137..8147
+$LaunchJs = Join-Path $ToolsDir "launch.mjs"
 
-try { Start-Transcript -Path $LogFile -Force | Out-Null } catch {}
 Add-Type -AssemblyName System.Windows.Forms | Out-Null
-
-function Done { try { Stop-Transcript | Out-Null } catch {} }
 function Fail($msg) {
-    Write-Output "FATAL: $msg"
-    Done
+    Add-Content -Path $LogFile -Value "$(Get-Date -Format o) FATAL: $msg" -ErrorAction SilentlyContinue
     [System.Windows.Forms.MessageBox]::Show(
-        "$msg`n`nLog: $LogFile", "ARES Launcher",
+        "$msg`n`nLog: $LogFile", "ARES",
         [System.Windows.Forms.MessageBoxButtons]::OK,
         [System.Windows.Forms.MessageBoxIcon]::Error) | Out-Null
     exit 1
 }
-function Find-AresServer {
-    foreach ($p in $Ports) {
-        try {
-            $r = Invoke-RestMethod -Uri "http://127.0.0.1:$p/__ares" -TimeoutSec 1
-            if ($r.server -eq "ares-dev") { return $p }
-        } catch {}
-    }
-    return $null
-}
 
-# --- 1. Locate Node.js (>=18 needed; repo is tested on 24 LTS) ---------------
-Write-Output "[1/4] Locating Node.js..."
+# --- Node.js (>= 22.15 per package.json engines; tested on 24 LTS) ------------
 $node = $null
 try { $node = (Get-Command node -ErrorAction Stop).Source } catch {}
 if (-not $node) {
@@ -47,7 +34,6 @@ if (-not $node) {
     }
 }
 if (-not $node) {
-    Write-Output "Node.js not found - attempting silent install via winget (a UAC prompt may appear)..."
     $winget = $null
     try { $winget = (Get-Command winget -ErrorAction Stop).Source } catch {}
     if ($winget) {
@@ -59,54 +45,17 @@ if (-not $node) {
 }
 if (-not $node) {
     Start-Process "https://nodejs.org/en/download"
-    Fail "Node.js is required and could not be installed automatically. The download page has been opened - install the LTS build, then double-click the launcher again."
+    Fail "Node.js is required and could not be installed automatically. The download page has been opened - install the LTS build, then start ARES again."
 }
-$nodeDir = Split-Path -Parent $node
-$npm = Join-Path $nodeDir "npm.cmd"
-if (-not (Test-Path $npm)) { $npm = "npm" }
-Write-Output "node: $node ($(& $node --version))"
+if (-not (Test-Path $LaunchJs)) { Fail "Cannot find $LaunchJs" }
 
-# --- 2. Dependencies ----------------------------------------------------------
-Write-Output "[2/4] Checking dependencies..."
-$stamp = Join-Path $AresDir "node_modules\.package-lock.json"
-$manifest = Join-Path $AresDir "package.json"
-$needInstall = -not (Test-Path $stamp)
-if (-not $needInstall) {
-    if ((Get-Item $manifest).LastWriteTime -gt (Get-Item $stamp).LastWriteTime) { $needInstall = $true }
-}
-if ($needInstall) {
-    Write-Output "Running npm install..."
-    Push-Location $AresDir
-    & $npm install --no-fund --no-audit
-    $code = $LASTEXITCODE
-    Pop-Location
-    if ($code -ne 0) { Fail "npm install failed (exit $code). See the log for output." }
-} else {
-    Write-Output "node_modules up to date."
-}
-
-# --- 3. Build (incremental; probe works even if this fails) -------------------
-Write-Output "[3/4] Building TypeScript packages (tsc -b)..."
+# --- Hand over ----------------------------------------------------------------
+# --detach: the launcher leaves the dev server running and returns, so this window can close.
+$argv = @($LaunchJs, "--detach")
+if ($LaunchArgs) { $argv += $LaunchArgs }
 Push-Location $AresDir
-& $npm run build
-if ($LASTEXITCODE -ne 0) { Write-Output "WARNING: build failed (exit $LASTEXITCODE) - probe still works; see log." }
+& $node $argv
+$code = $LASTEXITCODE
 Pop-Location
-
-# --- 4. Serve + open ----------------------------------------------------------
-Write-Output "[4/4] Starting COOP/COEP dev server..."
-$port = Find-AresServer
-if ($port) {
-    Write-Output "Reusing running server on port $port."
-} else {
-    Start-Process -FilePath $node -ArgumentList "`"$ServeJs`"" -WorkingDirectory $AresDir -WindowStyle Hidden
-    for ($i = 0; $i -lt 40 -and -not $port; $i++) {
-        Start-Sleep -Milliseconds 250
-        $port = Find-AresServer
-    }
-    if (-not $port) { Fail "The dev server did not come up on ports $($Ports[0])-$($Ports[-1])." }
-    Write-Output "Server up on port $port."
-}
-Start-Process "http://127.0.0.1:$port$ProbeUrl"
-Write-Output "Opened http://127.0.0.1:$port$ProbeUrl"
-Done
+if ($code -ne 0) { Fail "ARES could not start (exit $code)." }
 exit 0
