@@ -68,12 +68,13 @@ foreach ($c in $PyCandidates) { if (Test-Path $c) { $Py = $c; break } }
 if (-not $Py) { Fail "WanGP python not found. Looked for:`n$($PyCandidates -join "`n")`nInstall/repair the Pinokio 'wan' app, or edit `$PyCandidates in run-sam-service.ps1." }
 Write-Output "Using python: $Py"
 
-# Weights availability is a warning, not a gate: main.py tries SAM 3 first (repo-root
-# sam3\ snapshot), then the ViT-H fallback, and reports failures via /health.
-$Sam3Dir = Join-Path (Split-Path -Parent (Split-Path -Parent (Split-Path -Parent $SvcDir))) "sam3"
-$Ckpt = "D:\Dev\pinokio\api\wan.git\app\ckpts\mask\sam_vit_h_4b8939_fp16.safetensors"
-if (-not (Test-Path $Sam3Dir)) { Write-Output "note: SAM3 weights dir missing ($Sam3Dir) - vit_h fallback will be used." }
-if (-not (Test-Path $Ckpt))    { Write-Output "note: ViT-H checkpoint missing ($Ckpt) - sam3 must load or the service reports the error via /health." }
+# No weights pre-check here on purpose. main.py resolves SAM 3 from SAM3_DIR, the repo-local
+# sam3\ folder, or the shared Hugging Face cache (where `hf download` puts it), and the old
+# check only knew about the second of those — so it announced "weights missing, vit_h fallback
+# will be used" on starts that loaded SAM 3 perfectly. Re-deriving that here would either repeat
+# the bug or cost a second torch import (~4 s) just to print a note. The service itself logs the
+# exact path it loaded ("[ares-sam] sam3 tracker loaded from ...") a few lines below, and
+# /health reports backend, dtype, and weights once it is up. Those are authoritative; this is not.
 
 # Run uvicorn in the foreground of this (hidden) process so the transcript captures its
 # output. First start loads the model (~40 s for ViT-H, ~30-60 s for SAM 3 on the 3060);

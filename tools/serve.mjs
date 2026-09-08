@@ -19,6 +19,7 @@ import { join, normalize, extname, dirname, basename, sep } from "node:path";
 import zlib from "node:zlib";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { catalog, gpuProbe, installOne, preflight, profiles, recommend, resolve } from "./installer.mjs";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url))); // ares/
 
@@ -100,7 +101,7 @@ async function ensureSshKey() {
   await mkdir(RUNPOD_SSH_DIR, { recursive: true });
   if (!existsSync(RUNPOD_SSH_KEY)) {
     await new Promise((resolve, reject) => {
-      const p = spawn("ssh-keygen", ["-t", "ed25519", "-N", "", "-f", RUNPOD_SSH_KEY, "-C", "ares-runpod"], { stdio: "ignore" });
+      const p = spawn("ssh-keygen", ["-t", "ed25519", "-N", "", "-f", RUNPOD_SSH_KEY, "-C", "ares-runpod"], { stdio: "ignore", windowsHide: true });
       p.on("close", (c) => (c === 0 ? resolve() : reject(new Error("ssh-keygen exited " + c))));
       p.on("error", reject);
     });
@@ -127,7 +128,7 @@ function sshRun(ip, port, command, onLine, onDone) {
   const args = ["-i", RUNPOD_SSH_KEY, "-p", String(port), "-o", "StrictHostKeyChecking=accept-new",
     "-o", `UserKnownHostsFile=${join(RUNPOD_SSH_DIR, "known_hosts")}`, "-o", "ConnectTimeout=12", "-o", "ServerAliveInterval=15",
     "root@" + ip, command];
-  const p = spawn("ssh", args);
+  const p = spawn("ssh", args, { windowsHide: true });
   let buf = "";
   const feed = (chunk) => { buf += chunk; let i; while ((i = buf.indexOf("\n")) >= 0) { onLine(buf.slice(0, i)); buf = buf.slice(i + 1); } };
   p.stdout.on("data", (d) => feed(d.toString()));
@@ -884,6 +885,81 @@ async function handle(req, res) {
     return;
   }
 
+  // Import a pre-existing .ares into the library (apps/demo). The Import button and the library's
+  // drag-drop target both land here. Two shapes, one endpoint:
+  //   POST /import-ares              body {"path":"<abs>"}   copy a file already on this machine
+  //   POST /import-ares?name=x.ares  body = the raw bytes    stream an upload (drag-drop, file input)
+  // The path form is the good one on Windows: the server copies straight from disk, so a 300 MB
+  // capture imports at disk speed instead of round-tripping through the browser. Both verify the
+  // 'ARES' magic BEFORE anything joins the library (a mis-picked .mp4 fails here, not later as an
+  // unplayable row), never overwrite (versionedOutName bumps to -vN), and carry the clip's
+  // <name>.ares.meta.json provenance sidecar across when the source has one.
+  if (path === "/import-ares" && req.method === "POST") {
+    const demoDir = join(ROOT, "apps", "demo");
+    const IMPORT_MAX = 4 * 1024 * 1024 * 1024; // captures run to hundreds of MB; this is just a ceiling
+    const isAres = (b) => b.length >= 4 && b[0] === 0x41 && b[1] === 0x52 && b[2] === 0x45 && b[3] === 0x53;
+    const sameDir = (a, b) => (process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b);
+    const clipName = (n) => basename(String(n)).replace(/\.ares$/i, "").replace(/[^a-z0-9._-]/gi, "_") || "imported";
+    const jsonOut = (o) => { res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" }); res.end(JSON.stringify(o)); };
+    const uploadName = url.searchParams.get("name");
+    try {
+      // --- copy from a path on this machine (what the native picker hands us) ---
+      if (!uploadName) {
+        let body = ""; req.on("data", (d) => { body += d; if (body.length > 10000) req.destroy(); });
+        await new Promise((r) => req.on("end", r));
+        let srcPath = ""; try { srcPath = String(JSON.parse(body || "{}").path || "").trim(); } catch { /* bad JSON → no path */ }
+        if (!srcPath) { jsonOut({ ok: false, error: "no path" }); return; }
+        const abs = normalize(srcPath);
+        let st; try { st = await stat(abs); } catch { jsonOut({ ok: false, error: "not found: " + abs }); return; }
+        if (!st.isFile()) { jsonOut({ ok: false, error: "not a file" }); return; }
+        if (st.size > IMPORT_MAX) { jsonOut({ ok: false, error: "larger than the 4 GB import limit" }); return; }
+        const head = Buffer.alloc(4);
+        const fh = await open(abs, "r");
+        try { await fh.read(head, 0, 4, 0); } finally { await fh.close(); }
+        if (!isAres(head)) { jsonOut({ ok: false, error: "not an .ares file (bad magic)" }); return; }
+        // Already in the library: adopt it where it lies rather than making a second copy of it.
+        if (sameDir(dirname(abs), demoDir)) { jsonOut({ ok: true, src: basename(abs), bytes: st.size, already: true }); return; }
+        const want = clipName(abs);
+        const outName = await versionedOutName(demoDir, want);
+        await copyFile(abs, join(demoDir, outName + ".ares"));
+        try { await copyFile(abs + ".meta.json", join(demoDir, outName + ".ares.meta.json")); } catch { /* no sidecar to carry */ }
+        jsonOut({ ok: true, src: outName + ".ares", bytes: st.size, renamed: outName !== want });
+        return;
+      }
+      // --- streamed upload (drag-drop, the file input, any non-Windows client) ---
+      // Streamed to a .part file rather than buffered: an import is allowed to be bigger than RAM.
+      // .part never matches the /\.ares$/ filter, so a half-written import cannot show up as a clip.
+      const want = clipName(uploadName);
+      await mkdir(demoDir, { recursive: true });
+      const tmpPath = join(demoDir, `.${want}.${Date.now()}.part`);
+      let total = 0, head = Buffer.alloc(0), err = null;
+      const fh = await open(tmpPath, "w");
+      try {
+        for await (const chunk of req) {
+          if (head.length < 4) head = Buffer.concat([head, chunk]).subarray(0, 4);
+          if (head.length >= 4 && !isAres(head)) { err = "not an .ares file (bad magic)"; break; }
+          total += chunk.length;
+          if (total > IMPORT_MAX) { err = "larger than the 4 GB import limit"; break; }
+          await fh.write(chunk);
+        }
+      } finally { await fh.close(); }
+      if (!err && !total) err = "empty upload";
+      if (!err && !isAres(head)) err = "not an .ares file (bad magic)";
+      if (err) {
+        try { await unlink(tmpPath); } catch { /* nothing landed */ }
+        jsonOut({ ok: false, error: err });
+        req.destroy();   // answer first, then stop the rest of a rejected upload from streaming in
+        return;
+      }
+      const outName = await versionedOutName(demoDir, want);
+      await rename(tmpPath, join(demoDir, outName + ".ares"));
+      jsonOut({ ok: true, src: outName + ".ares", bytes: total, renamed: outName !== want });
+    } catch (e) {
+      jsonOut({ ok: false, error: String((e && e.message) || e) });
+    }
+    return;
+  }
+
   // System diagnostics feed for the dashboard rail: GPU (util/temp/VRAM), RAM, disk, the coherent
   // bake stage+ETA, and RunPod on/off — one snapshot every 2s over SSE. RunPod is refreshed on a
   // 15s cadence (cached) so the panel never rate-limits the API; all local reads are cheap.
@@ -894,7 +970,7 @@ async function handle(req, res) {
     let closed = false, timer = null; const rpCache = { at: 0, data: null };
     req.on("close", () => { closed = true; if (timer) clearInterval(timer); });
     const gpuSnap = () => new Promise((resolve) => {
-      const p = spawn("nvidia-smi", ["--query-gpu=name,utilization.gpu,temperature.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"]);
+      const p = spawn("nvidia-smi", ["--query-gpu=name,utilization.gpu,temperature.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"], { windowsHide: true });
       let out = ""; p.stdout.on("data", (d) => (out += d)); p.on("error", () => resolve(null));
       p.on("close", () => {
         const l = out.trim().split("\n")[0];
@@ -936,54 +1012,79 @@ async function handle(req, res) {
   // Dependency status for the Settings tab: what is installed, what each piece enables, and
   // where to get it. Presence checks only (fast stats, no directory walks) — the app must open
   // and switch tabs regardless of what is missing; features warn at the point of use.
+  // Component catalog + hardware-derived recommendations for the Settings tab. tools/installer.mjs
+  // owns the catalog, the GPU probe, and the profile maths; this route only serves it. `deps` keeps
+  // the field names the old route used, so convert.js's depStatus() gate keeps working unchanged.
   if (path === "/deps") {
-    const REPO = dirname(ROOT);
-    const sizeOf = (p) => { try { return Math.round(statSync(p).size / 1048576) || 1; } catch { return null; } };
-    const samPy = join(ROOT, "tools", "sam-service", "env", "Scripts", "python.exe");
-    const sam3W = join(REPO, "sam3", "model.safetensors");
-    const sam31W = join(REPO, "sam3.1", "sam3.1_multiplex.pt");
-    const vitH = process.env.SAM_CKPT || join(ROOT, "tools", "sam-service", "models", "sam_vit_h_4b8939_fp16.safetensors");
-    const keeper = join(ROOT, "apps", "demo", "daniel-s0.ares");
-    const synth = join(ROOT, "apps", "demo", "demo.ares");
-    const capture = join(REPO, "Daniel_Microsoft_Volcap", "Daniel_Volcap");
-    const deps = [
-      { id: "encoder", label: "Encoder build (tsc output)", present: existsSync(join(ROOT, "packages", "encoder", "dist", "cli.js")),
-        enables: "Convert tab encodes, editor Bake", sizeNote: "rebuilds in seconds",
-        action: { kind: "cmd", note: "run: npm install && npx tsc -b (in ares/)" } },
-      { id: "sam3-weights", label: "SAM 3 weights (sam3/model.safetensors)", present: existsSync(sam3W), sizeMB: sizeOf(sam3W), sizeNote: "~3.3 GB",
-        enables: "SAM click-to-select in the editor (primary backend)", path: sam3W,
-        action: { kind: "link", url: "https://huggingface.co/facebook/sam3", note: "gated repo — accept the license, download the transformers snapshot into <repo>/sam3/" } },
-      { id: "sam-env", label: "SAM service Python env", present: existsSync(samPy), sizeNote: "~4.8 GB (torch cu124 + transformers)",
-        enables: "runs the local segmentation service", path: dirname(dirname(samPy)),
-        action: { kind: "sse", route: "/setup/sam-env", label: "Create env", note: "downloads ~2.5 GB of wheels; takes several minutes" } },
-      { id: "vith", label: "SAM ViT-H fallback checkpoint", present: existsSync(vitH), sizeNote: "~1.2 GB", optional: true,
-        enables: "fallback segmentation backend when SAM 3 weights are absent", path: vitH,
-        action: { kind: "link", url: "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth", note: "optional — only used when sam3/ is missing; set SAM_CKPT to its path" } },
-      { id: "sam31", label: "SAM 3.1 multiplex checkpoint", present: existsSync(sam31W), sizeMB: sizeOf(sam31W), sizeNote: "~3.3 GB", optional: true,
-        enables: "nothing yet — held until HF transformers ships SAM 3.1 support", path: sam31W,
-        action: { kind: "link", url: "https://huggingface.co/facebook/sam3.1", note: "no current code path loads it; safe to delete to reclaim 3.3 GB" } },
-      { id: "realesrgan", label: "Real-ESRGAN (ncnn-vulkan)", present: existsSync(REALESRGAN_EXE), sizeNote: "~50 MB",
-        enables: "Convert tab's Fast texture-enhance tier", path: REALESRGAN_DIR,
-        action: { kind: "link", url: "https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan/releases", note: "unzip into ares/tools/bin/realesrgan-ncnn-vulkan/" } },
-      { id: "forge", label: "SD-Forge (generative enhance)", present: existsSync(FORGE_PY), sizeNote: "external install", optional: true,
-        enables: "Convert tab's Generative (img2img) enhance tier", path: FORGE_ROOT,
-        action: { kind: "link", url: "https://github.com/lllyasviel/stable-diffusion-webui-forge", note: "external app; set FORGE_ROOT if installed elsewhere" } },
-      { id: "keeper-clip", label: "Reference clip (daniel-s0.ares)", present: existsSync(keeper), sizeMB: sizeOf(keeper), sizeNote: "~50 MB", optional: true,
-        enables: "the Viewer's default source and Compare presets", path: keeper,
-        action: { kind: "cmd", note: "re-encode from the capture folder via the Convert tab" } },
-      { id: "synth-clip", label: "Synthetic demo clip (demo.ares)", present: existsSync(synth), sizeMB: sizeOf(synth), sizeNote: "~3 MB",
-        enables: "a from-nothing playable clip (no capture data needed)", path: synth,
-        action: { kind: "sse", route: "/setup/demo-clip", label: "Generate", note: "runs the encoder's synth generator locally, ~seconds" } },
-      { id: "capture", label: "Source capture frames (Daniel_Volcap)", present: existsSync(capture), sizeNote: "~1.6 GB", optional: true,
-        enables: "re-encoding, editor Bake, enhance experiments", path: capture,
-        action: { kind: "cmd", note: "local dataset — any per-frame OBJ/PLY + atlas PNG folder works via the Convert tab" } },
-      { id: "4ds-codec", label: "4DViews codec (BridgeCodec4DS.dll)", present: !!fourdsDllPath() && existsSync(FOURDS_PY), optional: true,
-        sizeNote: "your licensed 4DViews SDK install", path: fourdsDllPath() || FOURDS_DLL_LOCAL,
-        enables: "Convert tab's .4ds → .ares conversion (DXT1 desktop captures, ~2 fps decode)",
-        action: { kind: "cmd", note: "not an installer — copy your own licensed DLL from your 4DViews SDK into tools\\4ds\\bin\\ (also needs the SAM-service Python env above, for numpy+Pillow)" } },
-    ];
-    res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
-    res.end(JSON.stringify({ deps }));
+    try {
+      const gpu = await gpuProbe();
+      const items = catalog(ROOT, gpu);
+      const profs = profiles(items, gpu);
+      const deps = items.map((it) => ({
+        ...it,
+        // Back-compat shape: one `action` per row. A gated model points at its licence page, a
+        // plain download at its source, and anything this server can install points at /install.
+        action: it.gated ? { kind: "link", url: it.gated.url, note: it.gated.why }
+          : it.link ? { kind: "link", url: it.link, note: it.why }
+          : it.install && !it.statusOnly ? { kind: "sse", route: "/install?ids=" + it.id, label: "Install", note: it.why }
+          : { kind: "cmd", note: it.why },
+      }));
+      res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
+      res.end(JSON.stringify({ deps, gpu, profiles: profs, recommended: recommend(profs), preflight: await preflight(ROOT) }));
+    } catch (e) {
+      res.writeHead(500, { ...HEADERS, "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: String((e && e.message) || e) }));
+    }
+    return;
+  }
+
+  // Install one or more components: GET /install?ids=a,b,c — SSE, one line at a time.
+  // `resolve` expands each id through its `requires` graph and orders dependencies first, so
+  // asking for a model that needs the Python env installs the env without being told to.
+  // Anything already present is skipped rather than re-fetched, which makes a re-run after a
+  // failure cheap and safe: it picks up exactly where it stopped.
+  if (path === "/install") {
+    res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
+    const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}
+data: ${JSON.stringify(data)}
+
+`); };
+    const line = (t) => send("log", String(t));
+    let cancelled = false;
+    req.on("close", () => { cancelled = true; });
+    try {
+      const gpu = await gpuProbe();
+      const items = catalog(ROOT, gpu);
+      const wanted = (url.searchParams.get("ids") || "").split(",").map((s) => s.trim()).filter(Boolean);
+      if (!wanted.length) { send("error", { message: "no ids given" }); res.end(); return; }
+      const plan = resolve(items, wanted).filter((it) => !it.statusOnly && it.install);
+      const todo = plan.filter((it) => !it.present);
+      const skipped = plan.filter((it) => it.present);
+      for (const it of skipped) line(`✓ ${it.label} — already installed, skipping`);
+      if (!todo.length) { send("done", { message: "everything requested is already installed" }); res.end(); return; }
+      line(`installing ${todo.length} component${todo.length > 1 ? "s" : ""}: ${todo.map((t) => t.label).join(", ")}`);
+      send("plan", { todo: todo.map((t) => ({ id: t.id, label: t.label, sizeMB: t.sizeMB })), skipped: skipped.map((t) => t.id) });
+      let done = 0;
+      for (const it of todo) {
+        if (cancelled) return;
+        send("step", { id: it.id, label: it.label, index: done, total: todo.length });
+        line(`── ${it.label} (${it.sizeMB || "?"} MB) ──`);
+        const r = await installOne(ROOT, it, line);
+        if (!r.ok) {
+          line(`✗ ${it.label}: ${r.error}`);
+          send("error", { message: r.error, id: it.id, gated: !!r.gated, url: it.gated?.url });
+          res.end();
+          return;
+        }
+        done++;
+        line(`✓ ${it.label} ready`);
+        send("stepDone", { id: it.id, index: done, total: todo.length });
+      }
+      send("done", { message: `${done} component${done > 1 ? "s" : ""} installed` });
+    } catch (e) {
+      send("error", { message: String((e && e.message) || e) });
+    }
+    res.end();
     return;
   }
 
@@ -1017,7 +1118,7 @@ async function handle(req, res) {
     if (existsSync(out)) { send("done", { message: "demo.ares already present", out: "/apps/demo/demo.ares" }); res.end(); return; }
     const cli = join(ROOT, "packages", "encoder", "dist", "cli.js");
     if (!existsSync(cli)) { send("error", { message: "encoder not built — run npx tsc -b in ares/ first" }); res.end(); return; }
-    const child = spawn(process.execPath, [cli, "synth", "-o", out], { cwd: ROOT });
+    const child = spawn(process.execPath, [cli, "synth", "-o", out], { cwd: ROOT, windowsHide: true });
     const relay = (d) => String(d).split(/\r?\n/).forEach((l) => l.trim() && send("log", l.trim()));
     child.stdout.on("data", relay);
     child.stderr.on("data", relay);
@@ -1108,7 +1209,7 @@ async function handle(req, res) {
     req.on("close", () => { try { child?.kill(); } catch { /* ignore */ } });
     // One stage = one child process whose output relays to the same SSE stream.
     const runStage = (stageArgs) => new Promise((resolve, reject) => {
-      child = spawn(process.execPath, stageArgs, { cwd: ROOT });
+      child = spawn(process.execPath, stageArgs, { cwd: ROOT, windowsHide: true });
       child.stdout.on("data", relay);
       child.stderr.on("data", relay);
       child.on("error", reject);
@@ -1333,7 +1434,7 @@ async function handle(req, res) {
       // to native texture size + crf 28 (fix 3) instead of the encoder's own generic 1024/crf32.
       const encodeArgs = [encoderCli, "encode", tmpDir, "-o", outAbs, "--fps", String(fps), "--tex-size", String(texSize), "--crf", String(crf)];
       await new Promise((resolve, reject) => {
-        const c = spawn(process.execPath, encodeArgs, { cwd: ROOT });
+        const c = spawn(process.execPath, encodeArgs, { cwd: ROOT, windowsHide: true });
         child = c;
         const relay = (d) => String(d).split(/\r?\n/).forEach((l) => l.trim() && send("log", l));
         c.stdout.on("data", relay);
