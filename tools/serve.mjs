@@ -19,6 +19,7 @@ import { join, normalize, extname, dirname, basename, sep } from "node:path";
 import zlib from "node:zlib";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
+import { catalog, gpuProbe, installOne, preflight, profiles, recommend, resolve } from "./installer.mjs";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url))); // ares/
 
@@ -1011,106 +1012,79 @@ async function handle(req, res) {
   // Dependency status for the Settings tab: what is installed, what each piece enables, and
   // where to get it. Presence checks only (fast stats, no directory walks) — the app must open
   // and switch tabs regardless of what is missing; features warn at the point of use.
-  // System diagnostics feed for the dashboard rail: GPU (util/temp/VRAM), RAM, disk, the coherent
-  // bake stage+ETA, and RunPod on/off — one snapshot every 2s over SSE. RunPod is refreshed on a
-  // 15s cadence (cached) so the panel never rate-limits the API; all local reads are cheap.
-  if (path === "/diagnostics") {
-    res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
-    const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
-    const logPath = join(ROOT, "apps", "demo", ".coherent-bake.log");
-    let closed = false, timer = null; const rpCache = { at: 0, data: null };
-    req.on("close", () => { closed = true; if (timer) clearInterval(timer); });
-    const gpuSnap = () => new Promise((resolve) => {
-      const p = spawn("nvidia-smi", ["--query-gpu=name,utilization.gpu,temperature.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"], { windowsHide: true });
-      let out = ""; p.stdout.on("data", (d) => (out += d)); p.on("error", () => resolve(null));
-      p.on("close", () => {
-        const l = out.trim().split("\n")[0];
-        if (!l) return resolve(null);
-        const [name, util, temp, memU, memT] = l.split(",").map((s) => s.trim());
-        resolve({ name, util: +util, temp: +temp, vramUsedMB: +memU, vramTotalMB: +memT });
-      });
-    });
-    const snap = async () => {
-      if (closed) return;
-      let gpu = null, disk = null, bake = null;
-      try { gpu = await gpuSnap(); } catch { /* no nvidia-smi */ }
-      try { const s = await statfs(ROOT); const totalGB = (s.blocks * s.bsize) / 1073741824, freeGB = (s.bavail * s.bsize) / 1073741824; disk = { totalGB: +totalGB.toFixed(1), freeGB: +freeGB.toFixed(1), usedGB: +(totalGB - freeGB).toFixed(1) }; } catch { /* */ }
-      const ram = { usedMB: Math.round((totalmem() - freemem()) / 1048576), totalMB: Math.round(totalmem() / 1048576) };
-      try {
-        const txt = await readFile(logPath, "utf8");
-        let prog = null, done = null, stage = null;
-        for (const ln of txt.split(/\r?\n/)) {
-          if (ln.startsWith("[PROGRESS] ")) { try { prog = JSON.parse(ln.slice(11)); } catch { /* */ } }
-          else if (ln.startsWith("[DONE] ")) { try { done = JSON.parse(ln.slice(7)); } catch { /* */ } }
-          else if (ln.startsWith("[STAGE] ")) { try { stage = JSON.parse(ln.slice(8)); } catch { /* */ } }
-        }
-        bake = { prog, done, stage };
-      } catch { /* no bake log */ }
-      if (Date.now() - rpCache.at > 15000) {
-        rpCache.at = Date.now();
-        try {
-          const key = await readRunpodKey();
-          if (!key) rpCache.data = { error: "no key" };
-          else { const d = await runpodGraphQL(key, "query{myself{clientBalance pods{desiredStatus costPerHr machine{gpuDisplayName}}}}"); rpCache.data = { balance: d.myself.clientBalance, pods: (d.myself.pods || []).map((p) => ({ status: p.desiredStatus, gpu: p.machine && p.machine.gpuDisplayName, costPerHr: p.costPerHr })) }; }
-        } catch (e) { rpCache.data = { error: String((e && e.message) || e).slice(0, 60) }; }
-      }
-      send("diag", { gpu, ram, disk, bake, runpod: rpCache.data, at: Date.now() });
-    };
-    timer = setInterval(snap, 2000); snap();
+  // Component catalog + hardware-derived recommendations for the Settings tab. tools/installer.mjs
+  // owns the catalog, the GPU probe, and the profile maths; this route only serves it. `deps` keeps
+  // the field names the old route used, so convert.js's depStatus() gate keeps working unchanged.
+  if (path === "/deps") {
+    try {
+      const gpu = await gpuProbe();
+      const items = catalog(ROOT, gpu);
+      const profs = profiles(items, gpu);
+      const deps = items.map((it) => ({
+        ...it,
+        // Back-compat shape: one `action` per row. A gated model points at its licence page, a
+        // plain download at its source, and anything this server can install points at /install.
+        action: it.gated ? { kind: "link", url: it.gated.url, note: it.gated.why }
+          : it.link ? { kind: "link", url: it.link, note: it.why }
+          : it.install && !it.statusOnly ? { kind: "sse", route: "/install?ids=" + it.id, label: "Install", note: it.why }
+          : { kind: "cmd", note: it.why },
+      }));
+      res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
+      res.end(JSON.stringify({ deps, gpu, profiles: profs, recommended: recommend(profs), preflight: await preflight(ROOT) }));
+    } catch (e) {
+      res.writeHead(500, { ...HEADERS, "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: String((e && e.message) || e) }));
+    }
     return;
   }
 
-  // Dependency status for the Settings tab: what is installed, what each piece enables, and
-  // where to get it. Presence checks only (fast stats, no directory walks) — the app must open
-  // and switch tabs regardless of what is missing; features warn at the point of use.
-  if (path === "/deps") {
-    const REPO = dirname(ROOT);
-    const sizeOf = (p) => { try { return Math.round(statSync(p).size / 1048576) || 1; } catch { return null; } };
-    const samPy = join(ROOT, "tools", "sam-service", "env", "Scripts", "python.exe");
-    const sam3W = join(REPO, "sam3", "model.safetensors");
-    const sam31W = join(REPO, "sam3.1", "sam3.1_multiplex.pt");
-    const vitH = process.env.SAM_CKPT || join(ROOT, "tools", "sam-service", "models", "sam_vit_h_4b8939_fp16.safetensors");
-    const keeper = join(ROOT, "apps", "demo", "daniel-s0.ares");
-    const synth = join(ROOT, "apps", "demo", "demo.ares");
-    const capture = join(REPO, "Daniel_Microsoft_Volcap", "Daniel_Volcap");
-    const deps = [
-      { id: "encoder", label: "Encoder build (tsc output)", present: existsSync(join(ROOT, "packages", "encoder", "dist", "cli.js")),
-        enables: "Convert tab encodes, editor Bake", sizeNote: "rebuilds in seconds",
-        action: { kind: "cmd", note: "run: npm install && npx tsc -b (in ares/)" } },
-      { id: "sam3-weights", label: "SAM 3 weights (sam3/model.safetensors)", present: existsSync(sam3W), sizeMB: sizeOf(sam3W), sizeNote: "~3.3 GB",
-        enables: "SAM click-to-select in the editor (primary backend)", path: sam3W,
-        action: { kind: "link", url: "https://huggingface.co/facebook/sam3", note: "gated repo — accept the license, download the transformers snapshot into <repo>/sam3/" } },
-      { id: "sam-env", label: "SAM service Python env", present: existsSync(samPy), sizeNote: "~4.8 GB (torch cu124 + transformers)",
-        enables: "runs the local segmentation service", path: dirname(dirname(samPy)),
-        action: { kind: "sse", route: "/setup/sam-env", label: "Create env", note: "downloads ~2.5 GB of wheels; takes several minutes" } },
-      { id: "vith", label: "SAM ViT-H fallback checkpoint", present: existsSync(vitH), sizeNote: "~1.2 GB", optional: true,
-        enables: "fallback segmentation backend when SAM 3 weights are absent", path: vitH,
-        action: { kind: "link", url: "https://dl.fbaipublicfiles.com/segment_anything/sam_vit_h_4b8939.pth", note: "optional — only used when sam3/ is missing; set SAM_CKPT to its path" } },
-      { id: "sam31", label: "SAM 3.1 multiplex checkpoint", present: existsSync(sam31W), sizeMB: sizeOf(sam31W), sizeNote: "~3.3 GB", optional: true,
-        enables: "nothing yet — held until HF transformers ships SAM 3.1 support", path: sam31W,
-        action: { kind: "link", url: "https://huggingface.co/facebook/sam3.1", note: "no current code path loads it; safe to delete to reclaim 3.3 GB" } },
-      { id: "realesrgan", label: "Real-ESRGAN (ncnn-vulkan)", present: existsSync(REALESRGAN_EXE), sizeNote: "~50 MB",
-        enables: "Convert tab's Fast texture-enhance tier", path: REALESRGAN_DIR,
-        action: { kind: "link", url: "https://github.com/xinntao/Real-ESRGAN-ncnn-vulkan/releases", note: "unzip into ares/tools/bin/realesrgan-ncnn-vulkan/" } },
-      { id: "forge", label: "SD-Forge (generative enhance)", present: existsSync(FORGE_PY), sizeNote: "external install", optional: true,
-        enables: "Convert tab's Generative (img2img) enhance tier", path: FORGE_ROOT,
-        action: { kind: "link", url: "https://github.com/lllyasviel/stable-diffusion-webui-forge", note: "external app; set FORGE_ROOT if installed elsewhere" } },
-      { id: "keeper-clip", label: "Reference clip (daniel-s0.ares)", present: existsSync(keeper), sizeMB: sizeOf(keeper), sizeNote: "~50 MB", optional: true,
-        enables: "the Viewer's default source and Compare presets", path: keeper,
-        action: { kind: "cmd", note: "re-encode from the capture folder via the Convert tab" } },
-      { id: "synth-clip", label: "Synthetic demo clip (demo.ares)", present: existsSync(synth), sizeMB: sizeOf(synth), sizeNote: "~3 MB",
-        enables: "a from-nothing playable clip (no capture data needed)", path: synth,
-        action: { kind: "sse", route: "/setup/demo-clip", label: "Generate", note: "runs the encoder's synth generator locally, ~seconds" } },
-      { id: "capture", label: "Source capture frames (Daniel_Volcap)", present: existsSync(capture), sizeNote: "~1.6 GB", optional: true,
-        enables: "re-encoding, editor Bake, enhance experiments", path: capture,
-        action: { kind: "cmd", note: "local dataset — any per-frame OBJ/PLY + atlas PNG folder works via the Convert tab" } },
-      { id: "4ds-codec", label: "4DViews codec (BridgeCodec4DS.dll)", present: !!fourdsDllPath() && existsSync(FOURDS_PY), optional: true,
-        sizeNote: "your licensed 4DViews SDK install", path: fourdsDllPath() || FOURDS_DLL_LOCAL,
-        enables: "Convert tab's .4ds → .ares conversion (DXT1 desktop captures, ~2 fps decode)",
-        action: { kind: "cmd", note: "not an installer — copy your own licensed DLL from your 4DViews SDK into tools\\4ds\\bin\\ (also needs the SAM-service Python env above, for numpy+Pillow)" } },
-    ];
-    res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
-    res.end(JSON.stringify({ deps }));
+  // Install one or more components: GET /install?ids=a,b,c — SSE, one line at a time.
+  // `resolve` expands each id through its `requires` graph and orders dependencies first, so
+  // asking for a model that needs the Python env installs the env without being told to.
+  // Anything already present is skipped rather than re-fetched, which makes a re-run after a
+  // failure cheap and safe: it picks up exactly where it stopped.
+  if (path === "/install") {
+    res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
+    const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}
+data: ${JSON.stringify(data)}
+
+`); };
+    const line = (t) => send("log", String(t));
+    let cancelled = false;
+    req.on("close", () => { cancelled = true; });
+    try {
+      const gpu = await gpuProbe();
+      const items = catalog(ROOT, gpu);
+      const wanted = (url.searchParams.get("ids") || "").split(",").map((s) => s.trim()).filter(Boolean);
+      if (!wanted.length) { send("error", { message: "no ids given" }); res.end(); return; }
+      const plan = resolve(items, wanted).filter((it) => !it.statusOnly && it.install);
+      const todo = plan.filter((it) => !it.present);
+      const skipped = plan.filter((it) => it.present);
+      for (const it of skipped) line(`✓ ${it.label} — already installed, skipping`);
+      if (!todo.length) { send("done", { message: "everything requested is already installed" }); res.end(); return; }
+      line(`installing ${todo.length} component${todo.length > 1 ? "s" : ""}: ${todo.map((t) => t.label).join(", ")}`);
+      send("plan", { todo: todo.map((t) => ({ id: t.id, label: t.label, sizeMB: t.sizeMB })), skipped: skipped.map((t) => t.id) });
+      let done = 0;
+      for (const it of todo) {
+        if (cancelled) return;
+        send("step", { id: it.id, label: it.label, index: done, total: todo.length });
+        line(`── ${it.label} (${it.sizeMB || "?"} MB) ──`);
+        const r = await installOne(ROOT, it, line);
+        if (!r.ok) {
+          line(`✗ ${it.label}: ${r.error}`);
+          send("error", { message: r.error, id: it.id, gated: !!r.gated, url: it.gated?.url });
+          res.end();
+          return;
+        }
+        done++;
+        line(`✓ ${it.label} ready`);
+        send("stepDone", { id: it.id, index: done, total: todo.length });
+      }
+      send("done", { message: `${done} component${done > 1 ? "s" : ""} installed` });
+    } catch (e) {
+      send("error", { message: String((e && e.message) || e) });
+    }
+    res.end();
     return;
   }
 

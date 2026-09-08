@@ -1,22 +1,30 @@
-# SAM service environment — pinned to the versions verified working on 2026-07-10
-# (RTX 3060 6 GB, CUDA 12.4). Install with the cu124 wheel index:
-#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124
-# The Settings tab's "Create env" button runs exactly that.
-torch==2.6.0+cu124
-torchvision==0.21.0+cu124
-transformers==5.13.0
-fastapi==0.139.0
-uvicorn==0.51.0
-pydantic==2.13.4
+# SAM service environment.
+#
+# Versions checked against PyPI on 2026-09-08. Pins are exact so a rebuilt env matches a working
+# one; re-check them rather than assuming, since a stale pin silently costs performance and fixes.
+#
+# The CUDA wheel index is NOT fixed here — the Settings tab picks it from the detected GPU and
+# passes it as --extra-index-url, because the right one depends on the card:
+#   cu130  compute capability 7.5-12.0 (Turing through Blackwell)   <- the default
+#   cu126  compute capability 5.0-9.0  (anything older; CUDA 13 dropped pre-Turing)
+# Per PyTorch's own build table (.ci/manywheel/build_env_setup.py). Installing by hand:
+#   pip install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu130
+torch==2.14.0
+torchvision==0.29.0
+transformers==5.16.1
+fastapi==0.141.1
+uvicorn==0.52.4
+pydantic==2.13.5
 pillow==12.3.0
-numpy==2.5.1
+numpy==2.5.3
 segment-anything==1.0
 safetensors==0.8.0
-huggingface_hub==1.23.0
-hf-xet==1.5.1
+huggingface_hub==1.30.0
+hf-xet==1.6.0
 
-# Optional endpoints /upscale (Real-ESRGAN via spandrel) and /detail (SD 1.5 img2img via diffusers).
-# The service imports these lazily; without them the two routes answer 503 and everything else works.
-spandrel==0.4.1
-diffusers==0.36.0
-accelerate==1.12.0
+# Optional endpoints /upscale (Real-ESRGAN via spandrel) and /detail (SD 1.5 img2img via
+# diffusers). The service imports these lazily; without them those two routes answer 503 and
+# everything else works.
+spandrel==0.4.2
+diffusers==0.40.0
+accelerate==1.14.0

@@ -40,13 +40,71 @@ from PIL import Image
 from pydantic import BaseModel
 
 _REPO_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", "..", ".."))
-SAM3_DIR = os.environ.get("SAM3_DIR", os.path.join(_REPO_ROOT, "sam3"))
+
+
+def _resolve_sam3_dir():
+    """Where the SAM 3 weights actually are, in the order a user is likely to have put them.
+
+    `hf download facebook/sam3` — the documented way to get this model, and what the Settings
+    tab now runs — puts it in the shared HF cache, NOT in a folder next to the repo. Defaulting
+    to <repo>/sam3 meant a perfectly good multi-gigabyte download sat there unseen while the
+    service reported "weights missing". Checks, in order: an explicit override, the repo-local
+    folder (how this was originally set up), the shared cache, and finally the bare repo id so
+    transformers can fetch it itself.
+    """
+    env = os.environ.get("SAM3_DIR")
+    if env:
+        return env
+    _ARES_ROOT = os.path.normpath(os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".."))
+    for local in (os.path.join(_ARES_ROOT, "sam3"), os.path.join(_REPO_ROOT, "sam3")):
+        if os.path.isfile(os.path.join(local, "config.json")):
+            return local
+    hub = os.environ.get("HUGGINGFACE_HUB_CACHE") or (
+        os.path.join(os.environ["HF_HOME"], "hub") if os.environ.get("HF_HOME")
+        else os.path.join(os.path.expanduser("~"), ".cache", "huggingface", "hub"))
+    repo = os.path.join(hub, "models--facebook--sam3")
+    snaps = os.path.join(repo, "snapshots")
+    if os.path.isdir(snaps):
+        revs = sorted(os.listdir(snaps))
+        try:    # refs/main names the current revision; prefer it when it is there
+            with open(os.path.join(repo, "refs", "main"), encoding="utf-8") as fh:
+                head = fh.read().strip()
+            if head in revs:
+                revs.insert(0, revs.pop(revs.index(head)))
+        except OSError:
+            pass
+        for rev in revs:
+            snap = os.path.join(snaps, rev)
+            if os.path.isfile(os.path.join(snap, "config.json")):
+                return snap
+    return "facebook/sam3"   # let transformers resolve + download it (uses the stored HF token)
+
+
+SAM3_DIR = _resolve_sam3_dir()
 VITH_CHECKPOINT = os.environ.get(
     "SAM_CKPT",
     os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "sam_vit_h_4b8939_fp16.safetensors"),
 )
 BACKEND_PREF = os.environ.get("SAM_BACKEND", "auto")  # auto | sam3 | vit_h
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
+
+
+def _best_dtype():
+    """fp16 or bf16 — decided by the GPU, not by habit.
+
+    Native bf16 tensor cores start at Ampere (sm_80). Below that bf16 drops off the tensor-core
+    path entirely: measured on a 2080 Ti (sm_75) it runs 43.0 TFLOP/s in fp16 against 7.3 in
+    bf16 — slower even than fp32 — while allocating byte-for-byte the same VRAM (1653 MB either
+    way for tracker+concept). So on pre-Ampere cards fp16 is a straight ~6x win for no cost.
+    Ampere and newer keep bf16 for its wider exponent range.
+    """
+    if DEVICE != "cuda":
+        return torch.float32
+    major = torch.cuda.get_device_properties(0).major
+    return torch.bfloat16 if major >= 8 else torch.float16
+
+
+SAM_DTYPE = _best_dtype()
 # Default ON — VRAM bracket measured on an RTX 3060 6 GB:
 # the concept (text) model shares the tracker's vision tower, so it adds only ~+226 MB whole-GPU
 # (peak 3671 MB combined, 2473 MB left free for the viewer — >2× the 1.2 GB floor). Set SAM_TEXT=0
@@ -79,7 +137,7 @@ def _load_sam3():
         raise FileNotFoundError(f"SAM3 weights dir not found: {SAM3_DIR}")
     t0 = time.time()
     _sam3_processor = Sam3TrackerProcessor.from_pretrained(SAM3_DIR)
-    dtype = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+    dtype = SAM_DTYPE
     _sam3_model = Sam3TrackerModel.from_pretrained(SAM3_DIR, dtype=dtype).to(DEVICE).eval()
     print(f"[ares-sam] sam3 tracker loaded from {SAM3_DIR} on {DEVICE} ({dtype}) in {time.time() - t0:.1f}s")
 
@@ -105,7 +163,7 @@ def _load_sam3_concept():
         raise FileNotFoundError(f"SAM3 weights dir not found: {SAM3_DIR}")
     t0 = time.time()
     processor = Sam3Processor.from_pretrained(SAM3_DIR)
-    dtype = torch.bfloat16 if DEVICE == "cuda" else torch.float32
+    dtype = SAM_DTYPE
     concept = Sam3Model.from_pretrained(SAM3_DIR, dtype=dtype)
     # SHARE DIRECTION MATTERS (bug found 2026-07-13): the checkpoint stores exactly ONE tower
     # (detector_model.vision_encoder.*, 538 tensors; NO tracker_model.vision_encoder.*), and
@@ -272,7 +330,10 @@ def health():
         "error": _load_error,
         "device": DEVICE,
         "backend": _backend,
-        "model": {"sam3": "sam3_tracker_bf16", "vit_h": "sam_vit_h_fp16"}.get(_backend or "", "loading"),
+        "model": {"sam3": f"sam3_tracker_{str(SAM_DTYPE).replace('torch.', '')}",
+                  "vit_h": "sam_vit_h_fp16"}.get(_backend or "", "loading"),
+        "dtype": str(SAM_DTYPE).replace("torch.", ""),
+        "weights": SAM3_DIR if _backend == "sam3" else VITH_CHECKPOINT,
         # Text/concept prompts — independent of the tracker above.
         "textEnabled": SAM_TEXT,
         "textReady": _sam3_concept_model is not None,

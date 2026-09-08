@@ -540,8 +540,8 @@ async function runEnhance() {
   if ($("enTier").value === "ncnn") {
     const dep = await depStatus("realesrgan").catch(() => null);
     if (dep && !dep.present) {
-      $("enDone").innerHTML = `<div class="note" style="color:var(--warn);margin-top:8px">The Fast tier needs Real-ESRGAN (~50 MB), which is not installed.
-        <a href="${dep.action.url}" target="_blank" rel="noopener">Download it here</a> and unzip into <code>ares/tools/bin/realesrgan-ncnn-vulkan/</code> — or check Settings.</div>`;
+      $("enDone").innerHTML = `<div class="note" style="color:var(--warn);margin-top:8px">The Fast tier needs Real-ESRGAN (43 MB), which is not installed.
+        Open <b>⚙ Settings</b> and press Install on “Real-ESRGAN ncnn-vulkan” — it downloads and unpacks itself.</div>`;
       return;
     }
   }

@@ -64,6 +64,13 @@ apps/demo/.ares-activity.jsonl
 # (Real-ESRGAN etc.) — fetched on demand, never committed (64 MB+ each).
 tools/sam-service/models/
 
+# A `git clone https://huggingface.co/facebook/sam3` lands here: ~13 GB of LFS weights plus its
+# own nested .git. Downloading the model this way is completely reasonable — but it must never be
+# stageable into this repo. (Prefer the Settings tab, which puts it in the shared HF cache where
+# every other tool can find it too.)
+/sam3/
+/sam3.1/
+
 # Launcher / bake logs left beside the tools.
 tools/*.log
 .skel-*.log
@@ -133,3 +140,8 @@ Thumbs.db
 .v9-work/
 # Owner-tended cold storage of superseded intermediates (see its MANIFEST.md).
 archive/
+
+
+# Ignore vscode AI rules (forward slashes: git reads \ as an escape, so the backslash
+# form of this line silently matched nothing).
+.github/instructions/codacy.instructions.md
