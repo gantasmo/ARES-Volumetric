@@ -100,7 +100,7 @@ async function ensureSshKey() {
   await mkdir(RUNPOD_SSH_DIR, { recursive: true });
   if (!existsSync(RUNPOD_SSH_KEY)) {
     await new Promise((resolve, reject) => {
-      const p = spawn("ssh-keygen", ["-t", "ed25519", "-N", "", "-f", RUNPOD_SSH_KEY, "-C", "ares-runpod"], { stdio: "ignore" });
+      const p = spawn("ssh-keygen", ["-t", "ed25519", "-N", "", "-f", RUNPOD_SSH_KEY, "-C", "ares-runpod"], { stdio: "ignore", windowsHide: true });
       p.on("close", (c) => (c === 0 ? resolve() : reject(new Error("ssh-keygen exited " + c))));
       p.on("error", reject);
     });
@@ -127,7 +127,7 @@ function sshRun(ip, port, command, onLine, onDone) {
   const args = ["-i", RUNPOD_SSH_KEY, "-p", String(port), "-o", "StrictHostKeyChecking=accept-new",
     "-o", `UserKnownHostsFile=${join(RUNPOD_SSH_DIR, "known_hosts")}`, "-o", "ConnectTimeout=12", "-o", "ServerAliveInterval=15",
     "root@" + ip, command];
-  const p = spawn("ssh", args);
+  const p = spawn("ssh", args, { windowsHide: true });
   let buf = "";
   const feed = (chunk) => { buf += chunk; let i; while ((i = buf.indexOf("\n")) >= 0) { onLine(buf.slice(0, i)); buf = buf.slice(i + 1); } };
   p.stdout.on("data", (d) => feed(d.toString()));
@@ -894,7 +894,7 @@ async function handle(req, res) {
     let closed = false, timer = null; const rpCache = { at: 0, data: null };
     req.on("close", () => { closed = true; if (timer) clearInterval(timer); });
     const gpuSnap = () => new Promise((resolve) => {
-      const p = spawn("nvidia-smi", ["--query-gpu=name,utilization.gpu,temperature.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"]);
+      const p = spawn("nvidia-smi", ["--query-gpu=name,utilization.gpu,temperature.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"], { windowsHide: true });
       let out = ""; p.stdout.on("data", (d) => (out += d)); p.on("error", () => resolve(null));
       p.on("close", () => {
         const l = out.trim().split("\n")[0];
@@ -1017,7 +1017,7 @@ async function handle(req, res) {
     if (existsSync(out)) { send("done", { message: "demo.ares already present", out: "/apps/demo/demo.ares" }); res.end(); return; }
     const cli = join(ROOT, "packages", "encoder", "dist", "cli.js");
     if (!existsSync(cli)) { send("error", { message: "encoder not built — run npx tsc -b in ares/ first" }); res.end(); return; }
-    const child = spawn(process.execPath, [cli, "synth", "-o", out], { cwd: ROOT });
+    const child = spawn(process.execPath, [cli, "synth", "-o", out], { cwd: ROOT, windowsHide: true });
     const relay = (d) => String(d).split(/\r?\n/).forEach((l) => l.trim() && send("log", l.trim()));
     child.stdout.on("data", relay);
     child.stderr.on("data", relay);
@@ -1108,7 +1108,7 @@ async function handle(req, res) {
     req.on("close", () => { try { child?.kill(); } catch { /* ignore */ } });
     // One stage = one child process whose output relays to the same SSE stream.
     const runStage = (stageArgs) => new Promise((resolve, reject) => {
-      child = spawn(process.execPath, stageArgs, { cwd: ROOT });
+      child = spawn(process.execPath, stageArgs, { cwd: ROOT, windowsHide: true });
       child.stdout.on("data", relay);
       child.stderr.on("data", relay);
       child.on("error", reject);
@@ -1333,7 +1333,7 @@ async function handle(req, res) {
       // to native texture size + crf 28 (fix 3) instead of the encoder's own generic 1024/crf32.
       const encodeArgs = [encoderCli, "encode", tmpDir, "-o", outAbs, "--fps", String(fps), "--tex-size", String(texSize), "--crf", String(crf)];
       await new Promise((resolve, reject) => {
-        const c = spawn(process.execPath, encodeArgs, { cwd: ROOT });
+        const c = spawn(process.execPath, encodeArgs, { cwd: ROOT, windowsHide: true });
         child = c;
         const relay = (d) => String(d).split(/\r?\n/).forEach((l) => l.trim() && send("log", l));
         c.stdout.on("data", relay);
