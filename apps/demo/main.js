@@ -6,6 +6,7 @@
 // orbitViewProj is the RENDERER's own camera math — the crop guides project through the exact same
 // matrix the pixels do, so a guide can never drift from the geometry it claims to cut.
 import { AresPlayer, rleEncodeMask, keepPredicateAt, orbitViewProj, orbitViewHeight, growKeyframe, mirrorKeyframe } from "@ares/core";
+import { aact } from "./log.js";
 
 const $ = (id) => document.getElementById(id);
 const canvas = $("view");
@@ -43,6 +44,16 @@ function navTo(src) {
   for (const flag of ["gl2", "worker"]) if (cur.get(flag) === "1") q += "&" + flag + "=1";
   location.search = q;
 }
+// Open a clip fresh (t=0, playing), keeping only the backend flags. navTo is the A/B path — it
+// carries camera + timestamp + pause so two clips can be compared at the same instant; a clip you
+// just imported shares no instant with the one on screen, so inheriting its pause state or its
+// playhead would just be a clip that opens stopped partway through for no reason.
+function openClip(src) {
+  let q = "?src=" + src;
+  const cur = new URLSearchParams(location.search);
+  for (const flag of ["gl2", "worker"]) if (cur.get(flag) === "1") q += "&" + flag + "=1";
+  location.search = q;
+}
 const saveShowcase = () => fetch("/showcase", { method: "POST", body: JSON.stringify(showcase) }).catch(() => {});
 
 // Delete a clip's .ares from the library (permanent) — the owner's "delete from library" option.
@@ -59,6 +70,97 @@ async function deleteAres(src, label) {
     renderSourceBar();
     window.dispatchEvent(new CustomEvent("ares:library-changed"));
   } catch (e) { alert("Delete failed: " + e.message); }
+}
+
+// ---- Import a pre-existing .ares ---------------------------------------------------------------
+// Three ways in, one endpoint (/import-ares): the native file dialog, a drag from Explorer onto the
+// library, and the file input the dialog falls back to. The native route sends only the PATH and
+// lets the server copy from disk — a 300 MB capture imports at disk speed instead of being uploaded
+// through the browser — so it is the one the button reaches for first.
+const ARES_FILTER = "ARES clips (*.ares)|*.ares|All files (*.*)|*.*";
+
+/** Shared tail: put the imported clip in the library, refresh, and open it. */
+async function afterImport(r, { open: openIt = true } = {}) {
+  if (!r || !r.ok) { alert("Import failed: " + ((r && r.error) || "unknown")); return false; }
+  if (!showcase.some((z) => z.src === r.src)) {
+    showcase.push({ label: r.src.replace(/\.ares$/i, ""), src: r.src, fav: false, folder: null, addedAt: Date.now() });
+    await saveShowcase();
+  }
+  await refreshLibraryInfo();
+  renderSourceBar();
+  window.dispatchEvent(new CustomEvent("ares:library-changed"));
+  aact(r.already ? `already in the library: ${r.src}` : `imported ${r.src}${r.renamed ? " (renamed — a clip by that name already existed)" : ""}`);
+  if (openIt) openClip(r.src);
+  return true;
+}
+
+/** Native dialog → server-side copy. Falls back to the upload input when there is no picker here
+ *  (non-Windows, or the dev server is not the one serving this page) so Import always does something. */
+async function importAresNative() {
+  let picked = null;
+  try { picked = await fetch("/pick?type=file&for=importares&filter=" + encodeURIComponent(ARES_FILTER)).then((r) => r.json()); }
+  catch { importAresUpload(); return; }
+  if (!picked || picked.error) { importAresUpload(); return; }
+  if (!picked.path) return;   // cancelled
+  await withImportBusy(async () => {
+    const r = await fetch("/import-ares", { method: "POST", body: JSON.stringify({ path: picked.path }) }).then((r) => r.json()).catch((e) => ({ ok: false, error: e.message }));
+    await afterImport(r);
+  });
+}
+
+/** The no-native-dialog path: an ordinary file input, uploaded to the same endpoint. */
+function importAresUpload() {
+  const inp = document.createElement("input");
+  inp.type = "file"; inp.accept = ".ares"; inp.hidden = true;
+  inp.onchange = () => { const f = inp.files && inp.files[0]; inp.remove(); if (f) importAresFile(f); };
+  document.body.append(inp);
+  inp.click();
+}
+
+/** Upload one File (drag-drop or the input) into the library. */
+async function importAresFile(file) {
+  await withImportBusy(async () => {
+    const r = await fetch("/import-ares?name=" + encodeURIComponent(file.name), { method: "POST", body: file })
+      .then((r) => r.json()).catch((e) => ({ ok: false, error: e.message }));
+    await afterImport(r);
+  }, file.name);
+}
+
+// A copy or upload of a few hundred MB is not instant, and a button that looks idle invites a second
+// click (and a second copy). The header shows what is happening and refuses re-entry while it runs.
+let importBusy = false;
+async function withImportBusy(fn, what) {
+  if (importBusy) return;
+  importBusy = true;
+  const btn = $("libImportBtn");
+  if (btn) { btn.disabled = true; btn.textContent = "…"; btn.title = "importing " + (what || "clip") + "…"; }
+  try { await fn(); } finally {
+    importBusy = false;
+    renderMediaHead();   // restores the button's label/title/enabled state
+  }
+}
+
+// Drag a .ares out of Explorer onto the library to import it. dragover must be cancelled or the
+// browser navigates to the dropped file and the app is gone.
+function wireLibraryDrop() {
+  const host = $("hudBody") || $("mediaList");
+  if (!host) return;
+  const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
+  const hasFiles = (dt) => !!dt && Array.from(dt.types || []).includes("Files");
+  ["dragenter", "dragover"].forEach((ev) => host.addEventListener(ev, (e) => {
+    if (!hasFiles(e.dataTransfer)) return;
+    stop(e); e.dataTransfer.dropEffect = "copy"; host.classList.add("libDrop");
+  }));
+  ["dragleave", "dragend"].forEach((ev) => host.addEventListener(ev, (e) => { if (e.target === host) host.classList.remove("libDrop"); }));
+  host.addEventListener("drop", (e) => {
+    if (!hasFiles(e.dataTransfer)) return;
+    stop(e); host.classList.remove("libDrop");
+    const files = Array.from(e.dataTransfer.files || []);
+    const ares = files.filter((f) => /\.ares$/i.test(f.name));
+    if (!ares.length) { alert(files.length ? "Drop a .ares clip — that was " + files[0].name : "Drop a .ares clip here."); return; }
+    // One at a time: importing opens the clip, and opening navigates away.
+    importAresFile(ares[0]);
+  });
 }
 
 // ---- Library model -----------------------------------------------------------------------------
@@ -121,9 +223,13 @@ function renderMediaHead() {
   fav.classList.toggle("on", libView.favOnly);
   const edit = mkIconBtn(showcaseEdit ? "Done" : "✎", showcaseEdit ? "finish editing" : "rename, favorite, group, delete", () => { showcaseEdit = !showcaseEdit; renderSourceBar(); });
   edit.classList.toggle("on", showcaseEdit);
-  h.append(sort, sp, layout, fav, edit);
+  // Import is a primary action (open a clip you already have), not library maintenance, so unlike
+  // the ＋ picker below it is NOT hidden behind edit mode.
+  const imp = mkIconBtn("⤓", "Import a .ares from anywhere on disk (or drag one onto this panel)", importAresNative);
+  imp.id = "libImportBtn";
+  h.append(sort, sp, imp, layout, fav, edit);
   if (showcaseEdit) {
-    h.append(mkIconBtn("＋", "add an existing .ares to the library", openAddPicker));
+    h.append(mkIconBtn("＋", "add an .ares already in apps/demo to the library", openAddPicker));
     h.append(mkIconBtn("❏", "new folder", () => {
       const name = (prompt("New folder name:") || "").trim().slice(0, 40);
       if (!name) return;
@@ -399,6 +505,7 @@ async function showRecipe() {
   } catch { /* offline: keep in-memory defaults */ }
   await Promise.all([refreshLibraryInfo(), refreshClipMeta()]);
   renderSourceBar();
+  wireLibraryDrop();
 })();
 // convert.js dispatches this after "Add to source bar" so the (possibly hidden) viewer bar refreshes.
 window.addEventListener("ares:showcase-changed", async () => {

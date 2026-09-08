@@ -242,6 +242,10 @@
   #clipDetail .cdv { color: var(--text); text-align: right; word-break: break-word; }
   .mediaList { flex: 1 1 auto; overflow-y: auto; overflow-x: hidden; min-height: 46px; padding: 3px; container-type: inline-size; }
   .libEmpty { color: var(--text-faint); font-size: 11px; text-align: center; padding: 14px 6px; }
+  /* Drag a .ares from Explorer onto the Media rail to import it (main.js wireLibraryDrop). The
+     outline is inset so it reads as "this panel accepts the drop" without shifting any layout. */
+  .libDrop { outline: 2px dashed var(--accent); outline-offset: -3px; background: var(--accent-dim); }
+
   .mediaItems.list { display: flex; flex-direction: column; gap: 1px; }
   .mediaItems.grid { display: grid; grid-template-columns: 1fr; gap: 5px; padding: 2px; }
   @container (min-width: 176px) { .mediaItems.grid { grid-template-columns: repeat(2, minmax(0, 1fr)); } }  /* max 2 wide, 1 if narrow */

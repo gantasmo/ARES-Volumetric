@@ -136,7 +136,7 @@ send those headers, so the probe reports `crossOriginIsolated: no` under them. T
 itself does not need isolation: worker decode transfers ArrayBuffers rather than sharing
 memory, so it works on any origin. `serve.mjs`
 sends them on every response and also hosts the local GUI endpoints (`/encode`, `/enhance`,
-`/pick`, `/analyse`, `/edits/*`, `/sam/*`, `/showcase`).
+`/pick`, `/analyse`, `/edits/*`, `/sam/*`, `/showcase`, `/import-ares`).
 
 The probe requests WebGPU adapters for both `high-performance` and `low-power` preferences.
 On dual-GPU machines the discrete GPU should appear for high-performance; if both

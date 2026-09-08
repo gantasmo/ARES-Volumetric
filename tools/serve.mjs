@@ -884,6 +884,133 @@ async function handle(req, res) {
     return;
   }
 
+  // Import a pre-existing .ares into the library (apps/demo). The Import button and the library's
+  // drag-drop target both land here. Two shapes, one endpoint:
+  //   POST /import-ares              body {"path":"<abs>"}   copy a file already on this machine
+  //   POST /import-ares?name=x.ares  body = the raw bytes    stream an upload (drag-drop, file input)
+  // The path form is the good one on Windows: the server copies straight from disk, so a 300 MB
+  // capture imports at disk speed instead of round-tripping through the browser. Both verify the
+  // 'ARES' magic BEFORE anything joins the library (a mis-picked .mp4 fails here, not later as an
+  // unplayable row), never overwrite (versionedOutName bumps to -vN), and carry the clip's
+  // <name>.ares.meta.json provenance sidecar across when the source has one.
+  if (path === "/import-ares" && req.method === "POST") {
+    const demoDir = join(ROOT, "apps", "demo");
+    const IMPORT_MAX = 4 * 1024 * 1024 * 1024; // captures run to hundreds of MB; this is just a ceiling
+    const isAres = (b) => b.length >= 4 && b[0] === 0x41 && b[1] === 0x52 && b[2] === 0x45 && b[3] === 0x53;
+    const sameDir = (a, b) => (process.platform === "win32" ? a.toLowerCase() === b.toLowerCase() : a === b);
+    const clipName = (n) => basename(String(n)).replace(/\.ares$/i, "").replace(/[^a-z0-9._-]/gi, "_") || "imported";
+    const jsonOut = (o) => { res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" }); res.end(JSON.stringify(o)); };
+    const uploadName = url.searchParams.get("name");
+    try {
+      // --- copy from a path on this machine (what the native picker hands us) ---
+      if (!uploadName) {
+        let body = ""; req.on("data", (d) => { body += d; if (body.length > 10000) req.destroy(); });
+        await new Promise((r) => req.on("end", r));
+        let srcPath = ""; try { srcPath = String(JSON.parse(body || "{}").path || "").trim(); } catch { /* bad JSON → no path */ }
+        if (!srcPath) { jsonOut({ ok: false, error: "no path" }); return; }
+        const abs = normalize(srcPath);
+        let st; try { st = await stat(abs); } catch { jsonOut({ ok: false, error: "not found: " + abs }); return; }
+        if (!st.isFile()) { jsonOut({ ok: false, error: "not a file" }); return; }
+        if (st.size > IMPORT_MAX) { jsonOut({ ok: false, error: "larger than the 4 GB import limit" }); return; }
+        const head = Buffer.alloc(4);
+        const fh = await open(abs, "r");
+        try { await fh.read(head, 0, 4, 0); } finally { await fh.close(); }
+        if (!isAres(head)) { jsonOut({ ok: false, error: "not an .ares file (bad magic)" }); return; }
+        // Already in the library: adopt it where it lies rather than making a second copy of it.
+        if (sameDir(dirname(abs), demoDir)) { jsonOut({ ok: true, src: basename(abs), bytes: st.size, already: true }); return; }
+        const want = clipName(abs);
+        const outName = await versionedOutName(demoDir, want);
+        await copyFile(abs, join(demoDir, outName + ".ares"));
+        try { await copyFile(abs + ".meta.json", join(demoDir, outName + ".ares.meta.json")); } catch { /* no sidecar to carry */ }
+        jsonOut({ ok: true, src: outName + ".ares", bytes: st.size, renamed: outName !== want });
+        return;
+      }
+      // --- streamed upload (drag-drop, the file input, any non-Windows client) ---
+      // Streamed to a .part file rather than buffered: an import is allowed to be bigger than RAM.
+      // .part never matches the /\.ares$/ filter, so a half-written import cannot show up as a clip.
+      const want = clipName(uploadName);
+      await mkdir(demoDir, { recursive: true });
+      const tmpPath = join(demoDir, `.${want}.${Date.now()}.part`);
+      let total = 0, head = Buffer.alloc(0), err = null;
+      const fh = await open(tmpPath, "w");
+      try {
+        for await (const chunk of req) {
+          if (head.length < 4) head = Buffer.concat([head, chunk]).subarray(0, 4);
+          if (head.length >= 4 && !isAres(head)) { err = "not an .ares file (bad magic)"; break; }
+          total += chunk.length;
+          if (total > IMPORT_MAX) { err = "larger than the 4 GB import limit"; break; }
+          await fh.write(chunk);
+        }
+      } finally { await fh.close(); }
+      if (!err && !total) err = "empty upload";
+      if (!err && !isAres(head)) err = "not an .ares file (bad magic)";
+      if (err) {
+        try { await unlink(tmpPath); } catch { /* nothing landed */ }
+        jsonOut({ ok: false, error: err });
+        req.destroy();   // answer first, then stop the rest of a rejected upload from streaming in
+        return;
+      }
+      const outName = await versionedOutName(demoDir, want);
+      await rename(tmpPath, join(demoDir, outName + ".ares"));
+      jsonOut({ ok: true, src: outName + ".ares", bytes: total, renamed: outName !== want });
+    } catch (e) {
+      jsonOut({ ok: false, error: String((e && e.message) || e) });
+    }
+    return;
+  }
+
+  // System diagnostics feed for the dashboard rail: GPU (util/temp/VRAM), RAM, disk, the coherent
+  // bake stage+ETA, and RunPod on/off — one snapshot every 2s over SSE. RunPod is refreshed on a
+  // 15s cadence (cached) so the panel never rate-limits the API; all local reads are cheap.
+  if (path === "/diagnostics") {
+    res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
+    const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
+    const logPath = join(ROOT, "apps", "demo", ".coherent-bake.log");
+    let closed = false, timer = null; const rpCache = { at: 0, data: null };
+    req.on("close", () => { closed = true; if (timer) clearInterval(timer); });
+    const gpuSnap = () => new Promise((resolve) => {
+      const p = spawn("nvidia-smi", ["--query-gpu=name,utilization.gpu,temperature.gpu,memory.used,memory.total", "--format=csv,noheader,nounits"], { windowsHide: true });
+      let out = ""; p.stdout.on("data", (d) => (out += d)); p.on("error", () => resolve(null));
+      p.on("close", () => {
+        const l = out.trim().split("\n")[0];
+        if (!l) return resolve(null);
+        const [name, util, temp, memU, memT] = l.split(",").map((s) => s.trim());
+        resolve({ name, util: +util, temp: +temp, vramUsedMB: +memU, vramTotalMB: +memT });
+      });
+    });
+    const snap = async () => {
+      if (closed) return;
+      let gpu = null, disk = null, bake = null;
+      try { gpu = await gpuSnap(); } catch { /* no nvidia-smi */ }
+      try { const s = await statfs(ROOT); const totalGB = (s.blocks * s.bsize) / 1073741824, freeGB = (s.bavail * s.bsize) / 1073741824; disk = { totalGB: +totalGB.toFixed(1), freeGB: +freeGB.toFixed(1), usedGB: +(totalGB - freeGB).toFixed(1) }; } catch { /* */ }
+      const ram = { usedMB: Math.round((totalmem() - freemem()) / 1048576), totalMB: Math.round(totalmem() / 1048576) };
+      try {
+        const txt = await readFile(logPath, "utf8");
+        let prog = null, done = null, stage = null;
+        for (const ln of txt.split(/\r?\n/)) {
+          if (ln.startsWith("[PROGRESS] ")) { try { prog = JSON.parse(ln.slice(11)); } catch { /* */ } }
+          else if (ln.startsWith("[DONE] ")) { try { done = JSON.parse(ln.slice(7)); } catch { /* */ } }
+          else if (ln.startsWith("[STAGE] ")) { try { stage = JSON.parse(ln.slice(8)); } catch { /* */ } }
+        }
+        bake = { prog, done, stage };
+      } catch { /* no bake log */ }
+      if (Date.now() - rpCache.at > 15000) {
+        rpCache.at = Date.now();
+        try {
+          const key = await readRunpodKey();
+          if (!key) rpCache.data = { error: "no key" };
+          else { const d = await runpodGraphQL(key, "query{myself{clientBalance pods{desiredStatus costPerHr machine{gpuDisplayName}}}}"); rpCache.data = { balance: d.myself.clientBalance, pods: (d.myself.pods || []).map((p) => ({ status: p.desiredStatus, gpu: p.machine && p.machine.gpuDisplayName, costPerHr: p.costPerHr })) }; }
+        } catch (e) { rpCache.data = { error: String((e && e.message) || e).slice(0, 60) }; }
+      }
+      send("diag", { gpu, ram, disk, bake, runpod: rpCache.data, at: Date.now() });
+    };
+    timer = setInterval(snap, 2000); snap();
+    return;
+  }
+
+  // Dependency status for the Settings tab: what is installed, what each piece enables, and
+  // where to get it. Presence checks only (fast stats, no directory walks) — the app must open
+  // and switch tabs regardless of what is missing; features warn at the point of use.
   // System diagnostics feed for the dashboard rail: GPU (util/temp/VRAM), RAM, disk, the coherent
   // bake stage+ETA, and RunPod on/off — one snapshot every 2s over SSE. RunPod is refreshed on a
   // 15s cadence (cached) so the panel never rate-limits the API; all local reads are cheap.
