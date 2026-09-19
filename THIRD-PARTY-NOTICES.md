@@ -41,6 +41,23 @@ Model weights the service loads are downloaded by the user and are governed by t
 - **Lykon/dreamshaper-8** (default checkpoint of the optional `/detail` endpoint):
   CreativeML OpenRAIL-M, a use-restricted license: outputs may not be used for the purposes
   it lists. Anyone deploying that endpoint takes on those terms.
+- **Depth-Anything-V2** weights (`depth-anything/Depth-Anything-V2-*-hf`, fetched into the
+  Hugging Face cache by the 2D video → 2.5D conversion, `tools/sam-service/depth.py`): per the
+  upstream project, the **Small** checkpoints are Apache-2.0 and the **Base** and **Large**
+  checkpoints are **CC-BY-NC-4.0** (non-commercial). On the Hub, `Depth-Anything-V2-Small-hf`
+  and `Depth-Anything-V2-Metric-Outdoor-Large-hf` carry an Apache-2.0 tag, `Base-hf` and
+  `Large-hf` a CC-BY-NC-4.0 tag, and the other metric repos no license tag at all (checked
+  2026-09-18); treat the untagged ones under the upstream rule for their size.
+
+## Browser depth engine (`apps/demo/depth-worker.js`)
+
+`apps/demo/depth-worker.js` and `apps/demo/depth-browser.js` are ported from the author's own
+VJ-9000 application (github.com/gantasmo/VJ-9000, `src/akvj/depthWorker.ts` and
+`src/useDepthCloud.ts`; that repository ships without a license file). At runtime the worker
+loads **@huggingface/transformers** (Apache-2.0) and, through it, **onnxruntime-web** (MIT) from
+the jsDelivr CDN; nothing from either is vendored here. The ONNX checkpoints it downloads into
+the browser cache, `onnx-community/depth-anything-v2-{small,base,large}`, carry the
+Depth-Anything-V2 terms above (Small Apache-2.0; Base and Large CC-BY-NC-4.0).
 
 ## Notebooks and interop tools
 

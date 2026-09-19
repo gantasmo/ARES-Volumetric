@@ -1130,6 +1130,7 @@
       <button class="u primary" id="convertPick" title="Pick a capture folder: per-frame OBJ/PLY meshes plus atlas-*.png textures, or per-frame splats">Folder…</button>
       <label class="u" for="convertProbeFile" title="Pick a single .ares or .4ds container to probe its structure">File…</label>
       <input type="file" id="convertProbeFile" accept=".4ds,.ares" style="display:none">
+      <button class="u" id="convertVideo" title="Pick a 2D video (mp4, webm, mov, mkv): monocular depth estimation per frame, unprojected into a video-textured relief mesh">Video…</button>
       <button class="u ico" id="convertInfo" aria-expanded="false" aria-controls="convertFormats" title="Supported formats">⋯</button>
     </div>
     <div class="pop" id="convertFormats" hidden>
@@ -1138,10 +1139,11 @@
       <div class="fmt"><b>DepthKit</b><span>Textured Geometry Sequence: OBJ/PLY + PNG/JPG</span><span class="good">converts</span></div>
       <div class="fmt"><b>Splat sequence</b><span>SPZ / .splat / SOG / glTF</span><span class="good">converts</span></div>
       <div class="fmt"><b>4DViews .4ds</b><span>DXT1 desktop captures, ~2 fps decode; the licensed codec DLL is located with a file dialog on first use</span><span class="good">converts</span></div>
+      <div class="fmt"><b>2D video</b><span>mp4 / webm / mov / mkv: Depth-Anything V2 depth per frame, pinhole relief mesh, textured by the video (2.5D)</span><span class="good">converts</span></div>
       <div class="fmt"><b>.ares</b><span>container layout only, no mesh or texture content is read</span><span>probes</span></div>
     </div>
     <label class="drop" id="convertDrop">
-      <span class="big">Drop capture folder, .ares / .4ds</span>
+      <span class="big">Drop capture folder, .ares / .4ds, or a 2D video</span>
       <input type="file" id="convertFile" multiple webkitdirectory>
     </label>
     <div id="convertOut"></div>

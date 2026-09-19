@@ -415,6 +415,17 @@ async function ensureOrEnd(ids, send, res) {
   res.end();
   return false;
 }
+/** Depth model key (tools/sam-service/depth.py) -> the catalog component that holds its weights.
+ *  A `subject` prompt adds SAM 3, which produces the subject mask. */
+const DEPTH_MODEL_COMPONENT = {
+  small: "depth-small", base: "depth-base", large: "depth-large",
+  "video-small": "vda-small", "video-base": "vda-base", "video-large": "vda-large",
+};
+function depthComponents(model, subject) {
+  const id = DEPTH_MODEL_COMPONENT[model]
+    || (/^metric-indoor-/.test(model) ? "depth-metric-indoor" : /^metric-outdoor-/.test(model) ? "depth-metric-outdoor" : null);
+  return [...(id ? [id] : []), ...(subject ? ["sam3"] : [])];
+}
 /** Components the /enhance tiers run on. */
 const ENHANCE_COMPONENTS = {
   fast: ["python-env", "esrgan-general"],
@@ -729,6 +740,69 @@ function run4dsInfo(inputPath) {
   });
 }
 
+// ---- 2D video → 2.5D depth conversion: shared pieces for the /depth* routes in handle() ------
+// The model keys the Python engine knows (tools/sam-service/depth.py); the browser engine covers
+// the first three through onnx-community/depth-anything-v2-{small,base,large}.
+const DEPTH_MODELS = ["small", "base", "large",
+  "metric-indoor-small", "metric-indoor-base", "metric-indoor-large",
+  "metric-outdoor-small", "metric-outdoor-base", "metric-outdoor-large",
+  // Video-Depth-Anything (service engine only); weights are the vda-* catalog components.
+  "video-small", "video-base", "video-large"];
+const DEPTH_VIDEO_MIME = {
+  ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
+  ".mkv": "video/x-matroska", ".avi": "video/x-msvideo", ".mpg": "video/mpeg", ".mpeg": "video/mpeg", ".wmv": "video/x-ms-wmv", ".ts": "video/mp2t",
+};
+// Browser-engine uploads in flight or finished-but-unconverted: job id → { dir, meta, fh, … }.
+// A finished upload that never converts is reaped after an hour so temp space cannot leak.
+const DEPTH_RUNS = new Map();
+const depthJobId = () => "d" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+function depthIsVideoPath(p) {
+  if (!p || typeof p !== "string" || p.length > 4096) return false;
+  if (!(extname(p).toLowerCase() in DEPTH_VIDEO_MIME)) return false;
+  try { return statSync(p).isFile(); } catch { return false; }
+}
+setInterval(() => {
+  const cutoff = Date.now() - 3600_000;
+  for (const [job, run] of DEPTH_RUNS) {
+    if (run.createdAt > cutoff) continue;
+    DEPTH_RUNS.delete(job);
+    (async () => { try { if (run.fh) await run.fh.close(); } catch { /* closed */ } rm(run.dir, { recursive: true, force: true }).catch(() => {}); })();
+  }
+}, 300_000).unref();
+
+/** Stream facts the Convert card and the depth engines need: size, frame rate, frame count,
+ *  duration, whether there is audio to carry into the clip. ffprobe comes from ffTools(); the
+ *  caller ensures the `ffmpeg` component first, so a miss here is a real fault. */
+function probeVideo(p) {
+  return new Promise((resolve, reject) => {
+    const FFPROBE = ffTools()?.ffprobe;
+    if (!FFPROBE) { reject(new Error("ffprobe unresolved")); return; }
+    const args = ["-v", "error", "-show_entries", "stream=index,codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,nb_frames,duration",
+      "-show_entries", "format=duration,size", "-of", "json", p];
+    const c = spawn(FFPROBE, args, { windowsHide: true });
+    let out = "", err = "";
+    c.stdout.on("data", (d) => { out += d; });
+    c.stderr.on("data", (d) => { err = (err + d).slice(-2000); });
+    c.on("error", (e) => reject(new Error(`ffprobe failed to start (${FFPROBE}): ${e.message}`)));
+    c.on("close", (code) => {
+      if (code !== 0) { reject(new Error(err.trim() || `ffprobe exited ${code}`)); return; }
+      let j; try { j = JSON.parse(out); } catch { reject(new Error("ffprobe returned non-JSON")); return; }
+      const streams = j.streams || [];
+      const v = streams.find((s) => s.codec_type === "video");
+      if (!v) { reject(new Error("no video stream")); return; }
+      const rate = (s) => { const m = /^(\d+)\/(\d+)$/.exec(s || ""); return m && Number(m[2]) ? Number(m[1]) / Number(m[2]) : Number(s) || 0; };
+      const fps = rate(v.avg_frame_rate) || rate(v.r_frame_rate) || 30;
+      const durationS = Number(v.duration) || Number(j.format?.duration) || 0;
+      const frames = Number(v.nb_frames) || (durationS ? Math.round(durationS * fps) : 0);
+      resolve({
+        path: p, width: v.width, height: v.height, fps: +fps.toFixed(3), frames, durationS: +durationS.toFixed(3),
+        codec: v.codec_name, hasAudio: streams.some((s) => s.codec_type === "audio"), sizeBytes: Number(j.format?.size) || 0,
+      });
+    });
+  });
+}
+/** JSON round trip to the local SAM/depth service (same process as /sam/*). Resolves null when it
+ *  is not reachable; `{ status, json | text }` otherwise. */
 /**
  * Stream one file, honouring a single `Range: bytes=` request (206, or 416 when unsatisfiable) and
  * HEAD. Throws when the file cannot be stat'ed, before any header is written.
@@ -754,6 +828,25 @@ async function sendFileRange(req, res, file, type) {
   rs.on("error", () => { try { res.destroy(); } catch { /* gone */ } });
   res.on("close", () => rs.destroy());
   rs.pipe(res);
+}
+
+function samJson(method, pathname, body, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    let u; try { u = new URL(pathname, SAM_URL); } catch { resolve(null); return; }
+    const payload = body == null ? null : Buffer.from(JSON.stringify(body));
+    const rq = httpRequest({
+      hostname: u.hostname, port: u.port || 80, path: u.pathname + u.search, method, timeout: timeoutMs,
+      headers: payload ? { "Content-Type": "application/json", "Content-Length": payload.length } : {},
+    }, (rs) => {
+      let out = "";
+      rs.on("data", (d) => { out += d; });
+      rs.on("end", () => { try { resolve({ status: rs.statusCode, json: JSON.parse(out) }); } catch { resolve({ status: rs.statusCode, json: null, text: out.slice(0, 500) }); } });
+    });
+    rq.on("error", () => resolve(null));
+    rq.on("timeout", () => { rq.destroy(); resolve(null); });
+    if (payload) rq.write(payload);
+    rq.end();
+  });
 }
 
 // Routes that do work, spend money, open dialogs or write files. Browsers stamp Sec-Fetch-Site on
@@ -1722,6 +1815,347 @@ data: ${JSON.stringify(data)}
         if (tmpDir) rm(tmpDir, { recursive: true, force: true }).catch(() => { /* best-effort temp cleanup */ });
       }
     })();
+    return;
+  }
+
+  // ---- 2D video → 2.5D depth conversion (Convert tab "Video…") ----------------------------------
+  // Ported from VJ-9000's "depthcloud" source (github.com/gantasmo/VJ-9000, src/akvj/depthWorker.ts +
+  // src/useDepthCloud.ts) and turned from a live 8 fps preview into an offline conversion. Two depth
+  // ENGINES write the same run directory (depth.json + depth.f32, contract in docs/depth-2d-to-25d.md):
+  //   service  tools/sam-service/depth.py — Depth-Anything-V2 on CUDA, batched, float output
+  //   browser  apps/demo/depth-worker.js  — the VJ-9000 worker (transformers.js, WebGPU/wasm),
+  //            uploading its maps through POST /depth/upload/* below
+  // and ONE consumer, `ares depth` (packages/encoder/src/cli.ts), meshes + textures + muxes it.
+  //   GET  /probe-video?path=<abs>                 → { width, height, fps, frames, durationS, hasAudio, … }
+  //   GET  /depth/engines                          → which engine can run here, without starting anything
+  //   GET  /depth/source?path=<abs>                → the video bytes, Range-capable (the browser engine's <video>)
+  //   POST /depth/upload/begin | /depth/upload?job=&index=&count= | /depth/upload/finish | /depth/upload/cancel
+  //   GET  /depth-convert?video=&name=&engine=…    → SSE: depth (service) → encode, like /convert-4ds
+  if (path === "/probe-video") {
+    const p = url.searchParams.get("path") || "";
+    res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
+    if (!depthIsVideoPath(p)) { res.end(JSON.stringify({ error: `not a video file: ${p}` })); return; }
+    // A JSON route cannot stream an install, so it names what it lacks: the client runs
+    // /install?ids=<needs> in its own progress UI and repeats this request (apps/demo/ensure.js).
+    if (!ffTools()) { res.end(JSON.stringify({ error: "ffprobe absent", needs: ["ffmpeg"] })); return; }
+    try { res.end(JSON.stringify(await probeVideo(p))); }
+    catch (e) { res.end(JSON.stringify({ error: String((e && e.message) || e) })); }
+    return;
+  }
+
+  if (path === "/depth/engines") {
+    res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
+    // Passive: a health GET never spawns the service (the /sam proxy has the same rule).
+    const h = await samHealth();
+    const depthHealth = h ? (await samJson("GET", "/depth/health"))?.json ?? null : null;
+    res.end(JSON.stringify({
+      service: { env: existsSync(FOURDS_PY), running: !!h, samReady: !!(h && h.ok), depth: depthHealth },
+      browser: true,
+      // Status only. Nothing here gates a job: /depth-convert installs whatever reads false.
+      ffmpeg: !!ffTools(),
+      models: DEPTH_MODELS,
+      encoder: encoderState(ROOT).built,
+      autoInstall: true,
+    }));
+    return;
+  }
+
+  // The browser engine's <video> loads the picked file from here. Range requests are mandatory:
+  // Chrome seeks a media element with byte ranges, and without 206 answers every seek re-downloads
+  // the file from byte 0 and the frame stepping never converges.
+  if (path === "/depth/source") {
+    const p = url.searchParams.get("path") || "";
+    let st = null;
+    try { st = depthIsVideoPath(p) ? await stat(p) : null; } catch { st = null; }
+    if (!st || !st.isFile()) { res.writeHead(404, { ...HEADERS, "Content-Type": "text/plain" }); res.end(`not a video file: ${p}`); return; }
+    await sendFileRange(req, res, p, DEPTH_VIDEO_MIME[extname(p).toLowerCase()] || "application/octet-stream");
+    return;
+  }
+
+  // Browser engine upload. The worker's float32 maps arrive in index order and are appended to
+  // depth.f32 in an OS temp dir; depth.json is rewritten after every batch so a run that dies
+  // mid-way is still a valid (partial) run for the encoder.
+  if (path === "/depth/upload/begin" && req.method === "POST") {
+    let body = ""; req.on("data", (d) => { body += d; if (body.length > 20000) req.destroy(); });
+    await new Promise((r) => req.on("end", r));
+    let b = null; try { b = JSON.parse(body || "{}"); } catch { b = null; }
+    const out = (code, o) => { res.writeHead(code, { ...HEADERS, "Content-Type": "application/json" }); res.end(JSON.stringify(o)); };
+    if (!b || typeof b !== "object") { out(400, { error: "bad JSON" }); return; }
+    const width = Number(b.width), height = Number(b.height);
+    if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || width > 4096 || height > 4096) { out(400, { error: "bad width/height" }); return; }
+    if (!depthIsVideoPath(String(b.video || ""))) { out(400, { error: "video must be the picked video's path" }); return; }
+    try {
+      const dir = await mkdtemp(join(tmpdir(), "ares-depth-"));
+      const job = depthJobId();
+      const meta = {
+        schema: "ares-depth/1", engine: "browser",
+        model: String(b.model || "onnx-community/depth-anything-v2-small").slice(0, 120),
+        modelKey: DEPTH_MODELS.includes(b.modelKey) ? b.modelKey : "small",
+        kind: String(b.modelKey || "").startsWith("metric") ? "metric-depth" : "relative-disparity",
+        width, height, frames: 0,
+        fps: Number(b.fps) > 0 ? Number(b.fps) : (Number(b.sourceFps) > 0 ? Number(b.sourceFps) : 30),
+        sampling: { fps: Number(b.sampling?.fps) > 0 ? Number(b.sampling.fps) : null, maxFrames: Number.isInteger(b.sampling?.maxFrames) ? b.sampling.maxFrames : null },
+        video: String(b.video),
+        sourceFps: Number(b.sourceFps) > 0 ? Number(b.sourceFps) : null,
+        sourceWidth: Number.isInteger(b.sourceWidth) ? b.sourceWidth : null,
+        sourceHeight: Number.isInteger(b.sourceHeight) ? b.sourceHeight : null,
+        sourceFrames: Number.isInteger(b.sourceFrames) ? b.sourceFrames : null,
+        sourceDurationS: Number(b.sourceDurationS) > 0 ? Number(b.sourceDurationS) : null,
+        msPerFrame: null, device: String(b.device || "webgpu").slice(0, 16), dtype: String(b.dtype || "fp16").slice(0, 8),
+        done: false,
+      };
+      const fh = await open(join(dir, "depth.f32"), "w");
+      const run = { job, dir, meta, fh, bytesPerFrame: width * height * 4, createdAt: Date.now(), busy: false };
+      DEPTH_RUNS.set(job, run);
+      await writeFile(join(dir, "depth.json"), JSON.stringify(meta, null, 1));
+      out(200, { job, dir });
+    } catch (e) { out(500, { error: String((e && e.message) || e) }); }
+    return;
+  }
+
+  if (path === "/depth/upload" && req.method === "POST") {
+    const out = (code, o) => { res.writeHead(code, { ...HEADERS, "Content-Type": "application/json" }); res.end(JSON.stringify(o)); };
+    const run = DEPTH_RUNS.get(url.searchParams.get("job") || "");
+    const index = Number(url.searchParams.get("index")), count = Number(url.searchParams.get("count") || 1);
+    if (!run || !run.fh) { out(404, { error: "unknown or finished upload job" }); req.destroy(); return; }
+    if (run.busy) { out(409, { error: "one upload at a time per job" }); req.destroy(); return; }
+    if (!Number.isInteger(index) || index !== run.meta.frames) { out(409, { error: `expected index ${run.meta.frames}, got ${index}` }); req.destroy(); return; }
+    if (!Number.isInteger(count) || count < 1 || count > 64) { out(400, { error: "count must be 1..64" }); req.destroy(); return; }
+    const want = count * run.bytesPerFrame;
+    run.busy = true;
+    // Every write lands at an explicit offset from the committed frame count: the handle's own
+    // position is never trusted, so a rejected body (truncated below) cannot leave a hole in front
+    // of the next good frame.
+    const committed = run.meta.frames * run.bytesPerFrame;
+    let got = 0, over = false;
+    try {
+      for await (const chunk of req) {
+        if (got + chunk.length > want) { over = true; break; }
+        await run.fh.write(chunk, 0, chunk.length, committed + got);
+        got += chunk.length;
+      }
+      if (over || got !== want) {
+        // A short or long body would desynchronise every later frame: rewind to the last good frame.
+        await run.fh.truncate(committed);
+        out(400, { error: `expected ${want} bytes for ${count} frame(s), got ${over ? "more" : got}` });
+        if (over) req.destroy();
+        return;
+      }
+      run.meta.frames += count;
+      await writeFile(join(run.dir, "depth.json"), JSON.stringify(run.meta, null, 1));
+      out(200, { ok: true, frames: run.meta.frames });
+    } catch (e) { out(500, { error: String((e && e.message) || e) }); }
+    finally { run.busy = false; }
+    return;
+  }
+
+  if ((path === "/depth/upload/finish" || path === "/depth/upload/cancel") && req.method === "POST") {
+    let body = ""; req.on("data", (d) => { body += d; if (body.length > 10000) req.destroy(); });
+    await new Promise((r) => req.on("end", r));
+    let b = {}; try { b = JSON.parse(body || "{}"); } catch { b = {}; }
+    const out = (code, o) => { res.writeHead(code, { ...HEADERS, "Content-Type": "application/json" }); res.end(JSON.stringify(o)); };
+    const run = DEPTH_RUNS.get(String(b.job || ""));
+    if (!run) { out(404, { error: "unknown upload job" }); return; }
+    try {
+      if (run.fh) { await run.fh.close(); run.fh = null; }
+      if (path === "/depth/upload/cancel") {
+        DEPTH_RUNS.delete(run.job);
+        await rm(run.dir, { recursive: true, force: true }).catch(() => {});
+        out(200, { ok: true });
+        return;
+      }
+      run.meta.done = true;
+      run.meta.msPerFrame = Number(b.msPerFrame) > 0 ? Number(b.msPerFrame) : null;
+      await writeFile(join(run.dir, "depth.json"), JSON.stringify(run.meta, null, 1));
+      out(200, { ok: true, dir: run.dir, frames: run.meta.frames });
+    } catch (e) { out(500, { error: String((e && e.message) || e) }); }
+    return;
+  }
+
+  if (path === "/depth-convert") {
+    const q = url.searchParams;
+    const video = q.get("video") || "";
+    const rawName = q.get("name") || "";
+    const engine = q.get("engine") === "browser" ? "browser" : "service";
+    const model = q.get("model") || "base";
+    const bad = (msg) => { res.writeHead(400, { ...HEADERS, "Content-Type": "text/plain" }); res.end(msg); };
+    if (!depthIsVideoPath(video)) { bad(`not a video file: ${video}`); return; }
+    if (!/^[a-z0-9_-]+$/i.test(rawName)) { bad(`bad output name (letters/digits/-/_ only): "${rawName}"`); return; }
+    if (!DEPTH_MODELS.includes(model)) { bad(`unknown model "${model}"`); return; }
+    // Every numeric knob is validated up front; a present-but-invalid value refuses the job instead
+    // of silently encoding with some other setting (the /convert-4ds rule).
+    const num = (name, min, max, int = false) => {
+      const raw = q.get(name);
+      if (raw == null || raw === "") return null;
+      const n = Number(raw);
+      if (!Number.isFinite(n) || n < min || n > max || (int && !Number.isInteger(n))) throw new Error(`bad ${name} (${int ? "integer " : ""}${min}-${max}): "${raw}"`);
+      return n;
+    };
+    let knobs;
+    try {
+      knobs = {
+        fps: num("fps", 0.1, 240), maxFrames: num("maxFrames", 1, 100000, true), inferWidth: num("inferWidth", 112, 1400, true),
+        grid: num("grid", 16, 1024, true), fov: num("fov", 10, 150), near: num("near", 0.01, 1000), far: num("far", 0.02, 10000),
+        edge: num("edge", 0, 10), stabilize: num("stabilize", 0, 1), texSize: num("texSize", 64, 4096, true), crf: num("crf", 0, 63, true),
+        gop: num("gop", 1, 600, true), smoothTemporal: num("smoothTemporal", 0, 30, true),
+        decimate: num("decimate", 0.01, 1), inpaintBand: num("inpaintBand", 1, 4096, true), guideSigma: num("guideSigma", 0.5, 255),
+      };
+    } catch (e) { bad(e.message); return; }
+    const textureCodec = q.get("textureCodec") || "vp9";
+    if (!["vp9", "av1"].includes(textureCodec)) { bad(`bad textureCodec: "${textureCodec}"`); return; }
+    const center = q.get("center") || "";
+    if (center && !["bottom", "mass", "none"].includes(center)) { bad(`bad center: "${center}"`); return; }
+    const sheets = q.get("sheets") === "1", inpaint = q.get("inpaint") === "1", guided = q.get("noGuided") !== "1", snapRamps = q.get("snapRamps") === "1";
+    // Letterbox crop: the encoder detects it by default; "none" keeps the full frame.
+    const crop = q.get("crop") || "auto";
+    if (crop !== "auto" && crop !== "none" && !/^\d+:\d+:\d+:\d+$/.test(crop)) { bad(`bad crop (auto, none or W:H:X:Y): "${crop}"`); return; }
+    // The encoder refuses the pair; refusing here keeps a run from spending its depth pass first.
+    if (sheets && knobs.decimate != null && knobs.decimate < 1) { bad("decimate re-triangulates every frame and sheets keeps one topology: use one or the other"); return; }
+    // A text prompt for SAM 3; the service runs the mask pass before depth.
+    const subject = (q.get("subject") || "").trim();
+    if (subject.length > 200 || /[\x00-\x1f]/.test(subject)) { bad("bad subject: at most 200 printable characters"); return; }
+    if (subject && engine !== "service") { bad("subject masks run on the service engine only"); return; }
+    const encoderCli = join(ROOT, "packages", "encoder", "dist", "cli.js");
+    let upload = null;
+    if (engine === "browser") {
+      upload = DEPTH_RUNS.get(q.get("depthJob") || "");
+      if (!upload || !upload.meta.done || !upload.meta.frames) { bad("engine=browser needs a finished /depth/upload job (depthJob=)"); return; }
+    }
+    // Everything this job runs on, installed inside the stream below when absent: the encoder
+    // build and ffmpeg always; for the service engine the Python environment plus the weights of
+    // the chosen model, and SAM 3 when a `subject` prompt asks for a subject mask.
+    const jobComponents = ["encoder", "ffmpeg", ...(engine === "service" ? ["python-env", ...depthComponents(model, subject)] : [])];
+
+    const name = await versionedOutName(join(ROOT, "apps", "demo"), rawName); // auto -vN, never overwrite
+    const outRel = `apps/demo/${name}.ares`;
+    const outAbs = join(ROOT, outRel);
+
+    res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
+    const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
+    let closed = false, child = null, runDir = null, serviceJob = null;
+    req.on("close", () => {
+      closed = true;
+      try { if (child) child.kill(); } catch { /* ignore */ }
+      if (serviceJob) samJson("POST", "/depth/cancel", { job: serviceJob }).catch(() => {});
+    });
+    const t0 = Date.now();
+    try {
+      send("start", { video, name, out: "/" + outRel, engine, model });
+      if (!(await ensureOrEnd(jobComponents, send, res))) return;
+      if (engine === "browser") {
+        runDir = upload.dir;
+        DEPTH_RUNS.delete(upload.job);   // the convert owns the dir from here (removed in finally)
+        send("log", `[server] browser engine: ${upload.meta.frames} depth frames ${upload.meta.width}x${upload.meta.height} (${upload.meta.model}, ${upload.meta.device} ${upload.meta.dtype}${upload.meta.msPerFrame ? `, ${upload.meta.msPerFrame.toFixed(1)} ms/frame` : ""})`);
+      } else {
+        // --- depth phase on the GPU service: start it if needed, submit, poll status → progress.
+        const svc = await samEnsure(send, { purpose: subject ? "sam" : "depth" });
+        if (svc !== true) { sendEnsureFailure(send, svc); res.end(); return; }
+        if (closed) return;
+        runDir = await mkdtemp(join(tmpdir(), "ares-depth-"));
+        const submit = await samJson("POST", "/depth/run", {
+          video, out: runDir, model, fps: knobs.fps, maxFrames: knobs.maxFrames, inferWidth: knobs.inferWidth ?? 518, batch: 8, ffmpeg: ffTools()?.ffmpeg ?? null,
+          subject: subject || null,
+        }, 20000);
+        if (!submit || !submit.json || !submit.json.job) {
+          const why = submit ? (submit.json?.error || submit.json?.detail || submit.text || submit.status) : "no answer";
+          throw new Error(`depth service refused the job: ${typeof why === "string" ? why : JSON.stringify(why)}`);
+        }
+        serviceJob = submit.json.job;
+        send("log", `[server] depth job ${serviceJob}: ${model}${subject ? `, subject mask "${subject}"` : ""} on the service (${basename(video)})`);
+        let lastLogCount = 0, misses = 0, lastState = "";
+        for (;;) {
+          await new Promise((r) => setTimeout(r, 700));
+          if (closed) return;
+          const st = await samJson("GET", `/depth/status?job=${encodeURIComponent(serviceJob)}`);
+          if (!st || !st.json) { if (++misses >= 6) throw new Error("depth service stopped answering"); continue; }
+          misses = 0;
+          const s = st.json;
+          const lines = Array.isArray(s.log) ? s.log : [];
+          // The service keeps a rolling tail; forward only what is new (the tail is at most 20 lines,
+          // so a burst longer than that loses lines: the status numbers below never do).
+          if (lines.length >= lastLogCount) for (const l of lines.slice(lastLogCount)) send("log", `[depth] ${l}`);
+          else for (const l of lines) send("log", `[depth] ${l}`);
+          lastLogCount = lines.length;
+          if (s.state !== lastState) { lastState = s.state; send("log", `[server] depth: ${s.state}${s.state === "loading" ? " (model load/download)" : ""}`); }
+          // A subject run has a mask pass before the depth pass; each reports its own counters.
+          const ph = s.phase === "mask" && s.phases?.mask ? s.phases.mask : null;
+          send("progress", ph
+            ? { stage: "mask", frame: ph.done || 0, of: ph.total || null, msPerFrame: ph.msPerFrame ?? null, state: s.state }
+            : { stage: "depth", frame: s.done || 0, of: s.total || null, msPerFrame: s.msPerFrame ?? null, state: s.state });
+          if (s.state === "done") break;
+          if (s.state === "error") throw new Error(`depth failed: ${s.error || "unknown error"}`);
+          if (s.state === "cancelled") throw new Error("depth cancelled");
+        }
+        serviceJob = null;
+      }
+      if (closed) return;
+
+      // --- encode phase: the encoder CLI meshes the run, extracts the texture frames from the
+      // video with the same sampling, muxes, and writes the provenance sidecar.
+      let metaExtraArgs = [];
+      try {
+        const mePath = join(tmpdir(), `ares-meta-extra-${Date.now()}.json`);
+        await writeFile(mePath, JSON.stringify({ pipeline: "depth", source: { video }, request: { engine, model, ...knobs, textureCodec, center: center || null, sheets, inpaint, guided, snapRamps, crop, subject: subject || null } }));
+        metaExtraArgs = ["--meta-extra-file", mePath];
+      } catch { /* best-effort provenance */ }
+      const args = [encoderCli, "depth", video, "--depth", runDir, "-o", outAbs, "--texture-codec", textureCodec, ...metaExtraArgs];
+      const passK = (k, f) => { if (knobs[k] != null) args.push(f, String(knobs[k])); };
+      passK("grid", "--grid"); passK("fov", "--fov"); passK("near", "--near"); passK("far", "--far"); passK("edge", "--edge");
+      passK("stabilize", "--stabilize"); passK("texSize", "--tex-size"); passK("crf", "--crf"); passK("gop", "--gop"); passK("smoothTemporal", "--smooth-temporal");
+      if (knobs.decimate != null && knobs.decimate < 1) passK("decimate", "--decimate");
+      if (inpaint) { args.push("--inpaint"); passK("inpaintBand", "--inpaint-band"); }
+      if (!guided) args.push("--no-guided");
+      else passK("guideSigma", "--guide-sigma");
+      if (snapRamps) args.push("--snap-ramps");
+      if (crop !== "auto") args.push("--crop", crop);
+      if (sheets) args.push("--sheets");
+      if (q.get("noAudio") === "1") args.push("--no-audio");
+      if (q.get("noTexture") === "1") args.push("--no-texture");
+      if (center) args.push("--center", center);
+      send("log", `[server] encode: ares ${args.slice(1).map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`);
+      send("progress", { stage: "encode" });
+      await new Promise((resolve, reject) => {
+        const c = spawn(process.execPath, args, { cwd: ROOT, windowsHide: true, env: toolEnv() });
+        child = c;
+        let buf = "";
+        const onData = (d) => {
+          buf += d;
+          const lines = buf.split(/\r?\n/);
+          buf = lines.pop() ?? "";
+          for (const l of lines) {
+            if (!l.trim()) continue;
+            const m = /^\[ares\] progress (\w+) (\d+)\/(\d+)/.exec(l);
+            if (m) { send("progress", { stage: m[1], frame: Number(m[2]), of: Number(m[3]) }); continue; }
+            send("log", l);
+          }
+        };
+        c.stdout.on("data", onData);
+        c.stderr.on("data", onData);
+        c.on("error", reject);
+        c.on("close", (code) => { child = null; if (buf.trim()) send("log", buf); code === 0 ? resolve() : reject(new Error(`encoder exited ${code}`)); });
+      });
+      if (closed) return;
+
+      let frames = null, fps = null;
+      try { const m = JSON.parse(await readFile(outAbs + ".meta.json", "utf8")); frames = m.output?.frames ?? null; fps = m.output?.fps ?? null; } catch { /* sidecar optional */ }
+      historyAdd({
+        kind: "encode", path: video, name: name + ".ares", out: "/" + outRel,
+        meta: { source: "depth", engine, model, codec: textureCodec, texSize: String(knobs.texSize ?? 1024), crf: String(knobs.crf ?? 30), frames, fps,
+          grid: knobs.grid ?? 256, fov: knobs.fov ?? 55, near: knobs.near ?? "", far: knobs.far ?? "", edge: knobs.edge ?? 0.08, sheets: sheets ? "1" : "",
+          stabilize: knobs.stabilize ?? 0.7, maxFrames: knobs.maxFrames ?? "", sampleFps: knobs.fps ?? "", inferWidth: knobs.inferWidth ?? 518,
+          subject, decimate: knobs.decimate ?? "", inpaint: inpaint ? "1" : "", inpaintBand: knobs.inpaintBand ?? "", guided: guided ? "1" : "0",
+          snapRamps: snapRamps ? "1" : "", crop },
+      });
+      send("done", { out: "/" + outRel, frames, fps, seconds: +((Date.now() - t0) / 1000).toFixed(1) });
+    } catch (e) {
+      send("error", { message: String((e && e.message) || e) });
+    } finally {
+      // The run dir holds frames×W×H×4 bytes of float maps: always reclaimed, success or failure,
+      // unless keepRun=1 asked for it (debugging the contract between the engines and the CLI).
+      if (runDir && q.get("keepRun") !== "1") { try { await rm(runDir, { recursive: true, force: true }); } catch { /* best-effort */ } }
+      else if (runDir) send("log", `[server] kept depth run: ${runDir}`);
+    }
+    res.end();
     return;
   }
 

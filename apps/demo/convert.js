@@ -9,6 +9,9 @@
 import { initHistoryPanel, recordHistory } from "./history.js";
 import { accessPrompt, collectFile, fetchJsonEnsuring, sseErrorData } from "./ensure.js";
 import { probeFile, renderProbe, FOURDS_STATUS } from "./probe.js";
+// 2D video → 2.5D: its own module (the menu.js/track.js precedent), ported from VJ-9000's depth
+// source. convert.js only routes a picked or dropped video to it.
+import { initDepthCard, renderDepthCard, pickVideoAndRender, isVideoName } from "./depth-card.js";
 
 const $ = (id) => document.getElementById(id);
 const MB = (b) => (b >= 1073741824 ? (b / 1073741824).toFixed(2) + " GB" : (b / 1048576).toFixed(1) + " MB");
@@ -271,6 +274,8 @@ async function handleImport(files) {
   if (files.length === 1) {
     const lower = files[0].name.toLowerCase();
     if (lower.endsWith(".ares") || lower.endsWith(".4ds")) { await handleProbeFile(files[0]); return; }
+    // A dropped video arrives with a name and no path; the card asks for the path via the picker.
+    if (isVideoName(lower)) { await renderDepthCard("", { hint: files[0].name }); return; }
   }
   analyse(files);
 }
@@ -778,6 +783,8 @@ function runEncode(job) {
 export function initConvert() {
   const drop = $("convertDrop"), input = $("convertFile"), probeInput = $("convertProbeFile");
   $("convertPick").onclick = pickAndAnalyse;   // native folder dialog — the primary, no-typing path
+  if ($("convertVideo")) $("convertVideo").onclick = pickVideoAndRender;   // 2D video → 2.5D card
+  initDepthCard({ addToShowcase, refreshHistory: () => history && history.refresh() });
   // Format matrix lives behind the ⋯ button: it is reference material, not a control, and it
   // used to cost five lines of permanent vertical space above the drop zone.
   const info = $("convertInfo"), formats = $("convertFormats");
@@ -802,10 +809,12 @@ export function initConvert() {
     actions: (item) => {
       const acts = [];
       if (item.kind === "encode" && item.out) acts.push({ label: "Play", run: () => { location.search = "?src=" + item.out.split("/").pop(); } });
-      if (item.kind === "encode" && item.meta) acts.push({ label: "Use settings", run: () => useSettings(item.meta) });
+      // A depth conversion's recipe re-opens its own card; the mesh card's fields do not apply to it.
+      if (item.kind === "encode" && item.meta && item.meta.source === "depth") acts.push({ label: "Use settings", run: () => { renderDepthCard(item.path || "", { settings: item.meta }); $("convertOut").scrollTop = 0; } });
+      else if (item.kind === "encode" && item.meta) acts.push({ label: "Use settings", run: () => useSettings(item.meta) });
       if (item.kind === "enhance" && item.out) acts.push({ label: "Use output", run: () => analyseServer(item.out) });
       if (item.kind === "inspect" && item.meta && item.meta.probe) acts.push({ label: "View", run: () => { $("convertOut").innerHTML = renderProbeOut(item.meta.probe); $("convertOut").scrollTop = 0; } });
-      if (item.path) acts.push({ label: "Re-analyse", run: () => { analyseServer(item.path); $("convertOut").scrollTop = 0; } });
+      if (item.path && !(item.meta && item.meta.source === "depth")) acts.push({ label: "Re-analyse", run: () => { analyseServer(item.path); $("convertOut").scrollTop = 0; } });
       return acts;
     },
   });
