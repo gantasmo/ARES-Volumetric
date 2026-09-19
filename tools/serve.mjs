@@ -307,7 +307,27 @@ async function analyseDir(dir0) {
 // ---- standalone Real-ESRGAN (ncnn-vulkan): the no-server, low-VRAM upscale tier -----------
 const REALESRGAN_DIR = join(ROOT, "tools", "bin", "realesrgan-ncnn-vulkan");
 const REALESRGAN_EXE = join(REALESRGAN_DIR, "realesrgan-ncnn-vulkan.exe");
-const FFMPEG = process.env.FFMPEG || "ffmpeg";
+// The vendored weights (realesrgan-x4plus, -anime) are fixed-4× nets, and the binary's -s flag
+// only picks a stride — it does not switch weights — so any value but 4 misplaces every output
+// tile. Never pass a different ratio here; resample afterwards instead.
+const NCNN_NATIVE_SCALE = 4;
+const NCNN_TILE = process.env.REALESRGAN_TILE || "256";   // 256 keeps peak VRAM ~1 GB
+// -g picks the Vulkan device; unset means the binary's own auto-select, which is the right
+// default on machines whose device 0 is an iGPU.
+const NCNN_GPU = process.env.REALESRGAN_GPU ? ["-g", process.env.REALESRGAN_GPU] : [];
+
+// ---- CUDA batch upscaler (tools/sr/upscale_dir.py) ----------------------------------------
+// One process for the whole folder, one model replica per CUDA device. It exists because the
+// ncnn path paid a Vulkan init + weight load PER FRAME. Measured on 2 x RTX 2080 Ti, one
+// 2048² atlas -> 8192²: ncnn per-frame 21908 ms, ncnn directory mode both GPUs 9974 ms,
+// this worker with x4plus 12300 ms, this worker with the compact general net 674 ms.
+const SR_WORKER = join(ROOT, "tools", "sr", "upscale_dir.py");
+// Weights are spandrel-loaded, so the architecture comes from the checkpoint: adding a newer
+// model (SPAN, DAT, RealPLKSR …) is a catalog entry and a file, never a code change here.
+const SR_TIERS = {
+  fast:    { ckpt: "realesr-general-x4v3.pth", label: "Real-ESRGAN Compact x4v3 (CUDA)" },
+  quality: { ckpt: "RealESRGAN_x4plus.pth",    label: "Real-ESRGAN x4plus (CUDA)" },
+};
 
 // ---- ffmpeg / ffprobe: ONE resolver --------------------------------------------------------
 // installer.mjs findFfmpeg() owns the search order (FFMPEG override, tools/bin/ffmpeg, the legacy
@@ -395,6 +415,13 @@ async function ensureOrEnd(ids, send, res) {
   res.end();
   return false;
 }
+/** Components the /enhance tiers run on. */
+const ENHANCE_COMPONENTS = {
+  fast: ["python-env", "esrgan-general"],
+  quality: ["python-env", "esrgan-x4plus"],
+  ncnn: ["esrgan-ncnn", "ffmpeg"],
+  sd: ["forge"],
+};
 
 // Run a child to completion; resolve on exit 0. onChild exposes it so /enhance can cancel it.
 function runProc(exe, args, opts, onChild) {
@@ -426,6 +453,28 @@ function runProcLines(exe, args, opts, onChild, onLine) {
     c.on("error", (e) => { onLine("ERROR " + e.message); resolve(1); });
     c.on("close", (code) => { if (buf.trim()) onLine(buf.trim().slice(0, 400)); resolve(code ?? 1); });
   });
+}
+
+// ---- elevation without a terminal -----------------------------------------------------------
+// The few steps that need administrator rights (machine certificate store, Developer Mode, an
+// ACL the account cannot change) run through Start-Process -Verb RunAs: Windows shows its own
+// consent dialog, the elevated shell is hidden, and nothing is pasted anywhere. The script rides
+// in as -EncodedCommand so no quoting survives to be got wrong. Resolves with the elevated exit
+// code, or 1223 (ERROR_CANCELLED) when the dialog was declined.
+function runElevated(script) {
+  const enc = Buffer.from(script, "utf16le").toString("base64");
+  const outer = `try { $p = Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -Wait -PassThru ` +
+    `-ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','${enc}'; exit $p.ExitCode } catch { exit 1223 }`;
+  return runProcLines("powershell.exe", ["-NoProfile", "-Command", outer], {}, null, () => {});
+}
+/** Read + traverse for the current account on one folder tree, nothing wider. */
+function grantReadAccess(dir) {
+  const who = `${process.env.USERDOMAIN ? process.env.USERDOMAIN + "\\" : ""}${process.env.USERNAME || ""}`;
+  const q = (v) => "'" + String(v).replace(/'/g, "''") + "'";
+  const grant = `& icacls.exe ${q(dir)} /grant ${q(who + ":(OI)(CI)RX")} /t /c | Out-Null`;
+  // Ownership moves only when the plain grant is refused, which is the case of files copied off
+  // another machine whose owner SID does not exist here.
+  return runElevated(`${grant}; if ($LASTEXITCODE -ne 0) { & takeown.exe /f ${q(dir)} /a /r /d y | Out-Null; ${grant} }; exit $LASTEXITCODE`);
 }
 
 // ---- Forge (generative "hero" tier only) — auto-launched headless, no terminal ------------
@@ -1820,9 +1869,23 @@ data: ${JSON.stringify(data)}
     let ok = false;
     try { ok = !!dir && statSync(dir).isDirectory(); } catch { ok = false; }
     if (!ok) { res.writeHead(400, { ...HEADERS, "Content-Type": "text/plain" }); res.end(`not a directory: ${dir}`); return; }
-    // tiers: "ncnn" = standalone Real-ESRGAN (no server, default) · "sd" = Forge img2img (generative).
-    // Legacy tier names (resrgan/forge) fold into the no-server ncnn path.
-    const tier = q.get("tier") === "sd" ? "sd" : "ncnn";
+    // Tiers, fastest first:
+    //   "fast"    CUDA batch worker, compact general net   ~0.7 s/frame   (default)
+    //   "quality" CUDA batch worker, x4plus                ~12 s/frame
+    //   "ncnn"    vendored ncnn-vulkan, no Python env      ~22 s/frame    (portable fallback)
+    //   "sd"      Forge img2img, generative                 minutes/frame
+    // Legacy names (resrgan/forge) fold into ncnn, which is what they used to mean.
+    const tierIn = q.get("tier") || "fast";
+    // An unknown tier is an error, never a silent downgrade: the old handler folded everything
+    // it did not recognise into ncnn, which turned a 2 s/frame request into 22 s/frame with no
+    // indication that it had happened.
+    const LEGACY_TIERS = { resrgan: "ncnn", forge: "ncnn" };
+    const tier = ["fast", "quality", "ncnn", "sd"].includes(tierIn) ? tierIn : LEGACY_TIERS[tierIn];
+    if (!tier) {
+      res.writeHead(400, { ...HEADERS, "Content-Type": "text/plain" });
+      res.end(`unknown tier: ${tierIn}`); return;
+    }
+    const cudaTier = tier === "fast" || tier === "quality";
     const strength = Math.min(1, Math.max(0, Number(q.get("strength") ?? 1) || 0));
     const scale = Math.min(4, Math.max(1, Number(q.get("scale") ?? 2) || 2));
     const model = /anime/i.test(q.get("model") || "") ? "realesrgan-x4plus-anime" : "realesrgan-x4plus";
@@ -1865,23 +1928,83 @@ data: ${JSON.stringify(data)}
       await mkdir(outDir, { recursive: true });
       // Make the out folder a drop-in /encode source: hard-link (same volume — it's a sibling;
       // copy as fallback) the meshes and any atlas frames beyond maxFrames.
+      // A carry failure used to be swallowed, which produced an output folder that LOOKED fine
+      // and silently had no meshes in it — /encode then reported "no frames" about a folder the
+      // user had just watched succeed. Count the failures and say so.
+      const carryFailed = [];
       const carry = async (f) => {
-        try { await link(join(srcDir, f), join(outDir, f)); }
-        catch (e) { if (e.code !== "EEXIST") { try { await copyFile(join(srcDir, f), join(outDir, f)); } catch { /* ignore */ } } }
+        try { await link(join(srcDir, f), join(outDir, f)); return; }
+        catch (e) { if (e.code === "EEXIST") return; }
+        try { await copyFile(join(srcDir, f), join(outDir, f)); }
+        catch (e) { carryFailed.push({ f, code: e.code || "?" }); }
       };
-      for (const f of all) if (!/\.png$/i.test(f)) await carry(f);
-      for (const f of atlases.slice(todo.length)) await carry(f);
-      send("start", { dir: srcDir, out: outDir, frames: todo.length, of: atlases.length, tier, strength, scale, via: tier === "sd" ? "SD img2img (Forge)" : "Real-ESRGAN (ncnn, no server)" });
+      const carryAll = async () => {
+        carryFailed.length = 0;
+        for (const f of all) if (!/\.png$/i.test(f)) await carry(f);
+        for (const f of atlases.slice(todo.length)) await carry(f);
+      };
+      await carryAll();
+      if (carryFailed.some((c) => c.code === "EPERM" || c.code === "EACCES")) {
+        // The source files deny read access to this account. Granting it needs elevation, so
+        // Windows shows its consent dialog once; the grant is read-only and scoped to this folder.
+        send("log", `[setup] ${carryFailed.length} source file(s) deny read access: requesting elevation to grant read access on ${srcDir}`);
+        const code = await grantReadAccess(srcDir);
+        send("log", code === 0 ? "[setup] read access granted" : code === 1223 ? "[setup] elevation declined" : `[setup] access grant exit ${code}`);
+        if (code === 0) await carryAll();
+      }
+      if (carryFailed.length) {
+        const codes = [...new Set(carryFailed.map((c) => c.code))].join(", ");
+        send("error", {
+          message: `could not copy ${carryFailed.length} source file(s) into ${basename(outDir)} (${codes})`,
+          hint: codes.includes("EPERM")
+            ? `${basename(carryFailed[0].f)}: read access denied and the elevated access grant did not complete`
+            : "the output folder would have no meshes, so /encode could not use it",
+        });
+        res.end(); return;
+      }
+      const via = tier === "sd" ? "SD img2img (Forge)"
+        : cudaTier ? SR_TIERS[tier].label
+        : "Real-ESRGAN x4plus (ncnn-vulkan, no Python)";
+      send("start", { dir: srcDir, out: outDir, frames: todo.length, of: atlases.length, tier, strength, scale, via });
 
-      // Tier prechecks: sd auto-launches Forge; ncnn just needs the vendored binary present.
+      // Tier prerequisites are installed here when absent (ENHANCE_COMPONENTS): the CUDA tiers
+      // run on the venv plus one weight file, ncnn on the vendored binary plus ffmpeg for the
+      // resample, sd on Forge, which forgeEnsure also starts.
+      const ENV_PY = installPaths(ROOT).envPy;
       if (tier === "sd") {
         const f = await forgeEnsure(send);
         if (f !== true) { sendEnsureFailure(send, f); res.end(); return; }
-      } else if (!existsSync(REALESRGAN_EXE)) {
-        send("error", { message: "Real-ESRGAN upscaler missing", hint: "expected tools/bin/realesrgan-ncnn-vulkan/realesrgan-ncnn-vulkan.exe (re-run the vendor step)" }); res.end(); return;
+      } else if (!(await ensureOrEnd(ENHANCE_COMPONENTS[tier], send, res))) return;
+      const FFMPEG = ffTools()?.ffmpeg;
+
+      // ---- CUDA tiers: one worker for the whole folder ---------------------------------
+      // The worker does the resample and the strength blend on the GPU, so there is no 4x
+      // intermediate PNG on disk and no second ffmpeg decode per frame.
+      if (cudaTier) {
+        const tW = Date.now();
+        let doneN = 0, workerErr = null;
+        const args = [SR_WORKER, "--src", srcDir, "--out", outDir,
+          "--model", SR_TIERS[tier].ckpt, "--scale", String(scale), "--strength", String(strength),
+          "--tile", process.env.SR_TILE || "1024"];
+        if (Number.isFinite(maxFrames)) args.push("--max-frames", String(maxFrames));
+        const code = await runProcLines(ENV_PY, args, { cwd: ROOT, env: toolEnv() }, (c) => { child = c; }, (line) => {
+          const m = /^PROGRESS (\d+) (\d+) (\S+) (\d+)$/.exec(line);
+          if (m) { doneN = Number(m[1]); send("progress", { frame: doneN, of: Number(m[2]), file: m[3], ms: Number(m[4]) }); return; }
+          if (line.startsWith("LOAD ")) { send("log", line); return; }
+          if (line.startsWith("ERROR ")) { workerErr = line.slice(6); return; }
+          if (!line.startsWith("DONE ")) send("log", line);
+        });
+        child = null;
+        if (closed) return;
+        if (code !== 0 || workerErr) { send("error", { message: workerErr || `upscale worker exited ${code}` }); res.end(); return; }
+        historyAdd({ kind: "enhance", path: srcDir, name: basename(outDir), out: outDir, meta: { frames: doneN, tier, strength, scale } });
+        send("done", { out: outDir, frames: doneN, ms: Date.now() - tW });
+        res.end();
+        return;
       }
 
       const t0 = Date.now();
+      let ncnnTile = Number(NCNN_TILE) || 256;
       for (let i = 0; i < todo.length; i++) {
         if (closed) return;
         const f = todo[i];
@@ -1903,26 +2026,55 @@ data: ${JSON.stringify(data)}
           if (!outB64) throw new Error("Forge returned no image (no checkpoint loaded)");
           await writeFile(join(outDir, f), Buffer.from(outB64, "base64"));
         } else {
-          // ncnn upscales to 2× → tmp; an optional ffmpeg pass handles scale=1 (downscale to source
-          // for detail-only) and/or the strength blend: out = lanczos(orig)*(1-S) + esrgan*S — the same
-          // Lanczos/R-ESRGAN blend Forge's extras tier did, but with no server.
+          // ncnn ALWAYS runs at the model's native ratio. The x4plus nets are fixed 4×: passing
+          // -s 2 / -s 3 makes the binary stride its output tiles at 2×/3× while the net still emits
+          // 4×, so every tile lands at the wrong offset and the atlas comes back shredded into a
+          // displaced checkerboard. Running native costs nothing — the net does 4× either way
+          // (measured 40.0s vs 41.9s on a 2048² atlas) — so the requested `scale` and the strength
+          // blend are both applied afterwards by ffmpeg: out = lanczos(orig)*(1-S) + esrgan*S,
+          // the same Lanczos/R-ESRGAN blend Forge's extras tier did, but with no server.
           const tmpPng = join(outDir, "._up_" + f);
-          await runProc(REALESRGAN_EXE, ["-i", srcPng, "-o", tmpPng, "-n", model, "-s", "2", "-t", "256", "-g", "0"], { cwd: REALESRGAN_DIR }, (c) => { child = c; });
+          await runProc(REALESRGAN_EXE, ["-i", srcPng, "-o", tmpPng, "-n", model, "-s", String(NCNN_NATIVE_SCALE), "-t", String(ncnnTile), ...NCNN_GPU], { cwd: REALESRGAN_DIR }, (c) => { child = c; });
           child = null;
           if (closed) { try { await unlink(tmpPng); } catch { /* ignore */ } return; }
           const dims = pngDimsBuf(await readFile(srcPng));
           const outPng = join(outDir, f);
-          if ((strength < 0.99 || scale < 2) && dims) {
-            const tw = scale < 2 ? dims[0] : dims[0] * 2, th = scale < 2 ? dims[1] : dims[1] * 2;
+          const tw = dims ? dims[0] * scale : 0, th = dims ? dims[1] * scale : 0;
+          if (dims && strength < 0.99) {
             await runProc(FFMPEG, ["-y", "-loglevel", "error", "-i", srcPng, "-i", tmpPng,
               "-filter_complex", `[0:v]scale=${tw}:${th}:flags=lanczos[a];[1:v]scale=${tw}:${th}:flags=lanczos[b];[a][b]blend=all_expr='A*(1-${strength})+B*${strength}'`,
               "-frames:v", "1", outPng], {}, (c) => { child = c; });
+            child = null;
+            try { await unlink(tmpPng); } catch { /* ignore */ }
+          } else if (dims && scale !== NCNN_NATIVE_SCALE) {
+            // Full strength: the source contributes nothing to the blend, so this is a plain
+            // resample of the 4× result down to the requested ratio — one decode instead of two.
+            await runProc(FFMPEG, ["-y", "-loglevel", "error", "-i", tmpPng,
+              "-vf", `scale=${tw}:${th}:flags=lanczos`, "-frames:v", "1", outPng], {}, (c) => { child = c; });
             child = null;
             try { await unlink(tmpPng); } catch { /* ignore */ }
           } else {
             try { await rename(tmpPng, outPng); } catch { await copyFile(tmpPng, outPng); try { await unlink(tmpPng); } catch { /* ignore */ } }
           }
           if (closed) return;
+          // ncnn exits 0 and writes an ALL-BLACK png when tile x concurrency outruns VRAM.
+          // A real atlas never compresses that small, so size is a reliable, cheap detector;
+          // caught here the cause is still known, whereas the encoder would just bake it in.
+          try {
+            const st = await stat(outPng);
+            if (st.size < 65536) throw new Error("blank frame");
+          } catch {
+            // Out of VRAM at this tile size. Halve it and redo the same frame: the smaller tile
+            // stays in force for the rest of the run, and only a 32 px tile failing is an error.
+            if (ncnnTile > 32) {
+              ncnnTile = Math.max(32, Math.floor(ncnnTile / 2));
+              send("log", `blank frame (${f}): GPU memory exhausted, tile size reduced to ${ncnnTile} px, frame repeated`);
+              i--;
+              continue;
+            }
+            send("error", { message: `upscaler produced a blank frame (${f}) at the 32 px minimum tile size` });
+            res.end(); return;
+          }
         }
         send("progress", { frame: i + 1, of: todo.length, file: f, ms: Date.now() - t });
       }

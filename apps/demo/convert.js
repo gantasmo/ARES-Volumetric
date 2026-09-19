@@ -330,7 +330,7 @@ function renderConvertCard(stats) {
         <div class="cap">Enhance texture (AI) — optional pre-step</div>
         <div class="kv" style="grid-template-columns:168px 1fr;gap:8px 12px">
           <div class="k">tier</div><div>
-            <select id="enTier" class="inp"><option value="ncnn">Fast — Real-ESRGAN (seconds/frame)</option><option value="sd">Generative — SD img2img (Forge, auto-starts; minutes/frame)</option></select>
+            <select id="enTier" class="inp"><option value="fast">Compact x4v3: CUDA</option><option value="quality">x4plus: CUDA</option><option value="ncnn">x4plus: ncnn-vulkan</option><option value="sd">SD img2img: Forge</option></select>
           </div>
           <div class="k">strength</div><div><input id="enStrength" type="range" min="0" max="100" value="70" style="width:180px;vertical-align:middle"> <span id="enStrengthVal" style="font:12px ui-monospace,monospace;color:var(--text-mid)">70%</span></div>
           <div class="k">scale</div><div>
@@ -368,12 +368,19 @@ function renderConvertCard(stats) {
   $("enForge").onclick = prewarmForge;
   $("enStrength").oninput = () => { $("enStrengthVal").textContent = $("enStrength").value + "%"; };
   const enTier = $("enTier");
+  // Status line, not prose: which net runs, on what runtime, at what measured rate.
+  // Rates are per 2048² atlas on this machine's class of GPU; the net always runs at its
+  // native ratio and the scale above is a resample of that result.
+  const TIER_NOTE = {
+    fast:    "RealESRGAN Compact x4v3 · CUDA fp16, all devices · ~0.7 s/frame · needs the Python environment",
+    quality: "RealESRGAN x4plus · CUDA fp16, all devices · ~12 s/frame · needs the Python environment",
+    ncnn:    "RealESRGAN x4plus · ncnn-vulkan, no Python · ~22 s/frame · works on AMD and Intel GPUs",
+    sd:      "SD img2img via Forge · auto-start, 30–60 s cold · checkpoint required · minutes/frame",
+  };
   const syncTier = () => {
     const sd = enTier.value === "sd";
-    $("enForge").style.display = sd ? "inline-block" : "none";
-    $("enNote").innerHTML = sd
-      ? "<b>Generative</b> regenerates each frame with SD img2img via Forge — Forge <b>auto-starts</b> the first time (headless, ~30–60 s cold start). Needs a checkpoint on your Forge install."
-      : "<b>Fast</b> uses a bundled Real-ESRGAN (Vulkan) — runs locally on this machine's GPU. Writes enhanced atlas PNGs to a sibling folder and repoints the folder above at them, so “Convert on this machine” encodes the enhanced frames.";
+    $("enForge").style.display = sd ? "inline-flex" : "none";
+    $("enNote").textContent = TIER_NOTE[enTier.value] || "";
   };
   enTier.onchange = syncTier; syncTier();
   const PRESETS = {
@@ -539,8 +546,15 @@ async function runBatch() {
   }
 }
 
-/** Enhance the atlas PNGs via the dev server's /enhance SSE endpoint (local SD-Forge), then
- *  point #cvPath at the enhanced sibling folder so the normal encode picks it up. */
+const TIER_NOTE_LOG = {
+  fast:    "RealESRGAN Compact x4v3 · CUDA fp16 · batch worker over every CUDA device",
+  quality: "RealESRGAN x4plus · CUDA fp16 · batch worker over every CUDA device",
+  ncnn:    "RealESRGAN x4plus · ncnn-vulkan · one process per frame",
+  sd:      "SD img2img · Forge",
+};
+
+/** Enhance the atlas PNGs via the dev server's /enhance SSE endpoint, then point #cvPath at
+ *  the enhanced sibling folder so the normal encode picks it up. */
 async function runEnhance() {
   const path = $("cvPath").value.trim();
   if (!path) { $("cvPath").focus(); $("cvPath").style.borderColor = "var(--bad)"; return; }
@@ -560,6 +574,7 @@ async function runEnhance() {
   done.innerHTML = ""; go.disabled = true; go.textContent = "Enhancing…";
   const line = (t) => { log.textContent += t + "\n"; log.scrollTop = log.scrollHeight; };
   line(`\n=== enhance ${path} (${$("enTier").value} · ${$("enStrength").value}% · ${$("enScale").value}×) ===`);
+  line(TIER_NOTE_LOG[$("enTier").value] || "");
 
   const es = new EventSource("/enhance?" + q.toString());
   const finish = (ok, msg) => {
@@ -567,9 +582,16 @@ async function runEnhance() {
     if (ok) prog.firstChild.style.width = "100%";
     else { prog.firstChild.style.background = "var(--bad)"; line("✗ " + msg); done.innerHTML = `<div class="note" style="color:var(--bad);margin-top:10px">✗ ${msg}</div>`; }
   };
+  const wantTier = $("enTier").value;
   es.addEventListener("start", (e) => {
     const d = JSON.parse(e.data);
     line(`▶ ${d.frames} frame(s) → ${d.out} via ${d.via}`);
+    // A dev server started before the CUDA tiers existed silently answers every tier with ncnn.
+    // The symptom is a 10x slowdown and nothing else, so name it the moment it is detectable.
+    if (d.tier && d.tier !== wantTier) {
+      line(`! asked for tier "${wantTier}", server ran "${d.tier}"`);
+      done.innerHTML = `<div class="note2" style="color:var(--warn);margin-top:8px">Dev server build predates the ${wantTier} tier: ${d.tier} ran in its place (roughly 10× slower).</div>`;
+    }
   });
   es.addEventListener("log", (e) => line("· " + JSON.parse(e.data)));
   es.addEventListener("progress", (e) => {
