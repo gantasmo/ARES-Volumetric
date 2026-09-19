@@ -22,6 +22,12 @@ safetensors==0.8.0
 huggingface_hub==1.30.0
 hf-xet==1.6.0
 
+# Video-Depth-Anything (depth model keys video-small/base/large, depth_vda.py). The upstream code is
+# a clone under tools/ext/video-depth-anything and its temporal module imports einops. Its other
+# imports are already above (torch, torchvision) or not needed by the service: cv2 is never
+# imported, xformers is optional upstream, easydict is stood in for when absent.
+einops==0.8.2
+
 # Optional endpoints /upscale (Real-ESRGAN via spandrel) and /detail (SD 1.5 img2img via
 # diffusers). The service imports these lazily; without them those two routes answer 503 and
 # everything else works.

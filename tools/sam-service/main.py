@@ -313,6 +313,24 @@ except Exception as e:
     _track_import_error = f"{type(e).__name__}: {e}"
     print(f"[ares-sam] video tracker routes unavailable: {_track_import_error}")
 
+# ---- DEPTH ENGINE (2D video -> 2.5D volumetric) — /depth/*, reached by the browser as /sam/depth/*.
+# Purely additive, same discipline as track.py above: its Depth-Anything-V2 checkpoint loads LAZILY
+# on the first /depth/run and the failure is latched, so nothing here can change what /segment or
+# /segment_text do. It takes _lock per inference BATCH (never for a whole job, which runs for
+# minutes) so an interactive click interleaves, and waits on _load_done before its first load rather
+# than allocating on top of the SAM 3 load. An import failure is latched the same way: /depth/*
+# routes never mount, /health reports it, everything else is untouched.
+_depth_import_error = None
+try:
+    import depth as _depth
+
+    _depth.configure(device=DEVICE, dtype=SAM_DTYPE, load_done=_load_done, model_lock=_lock)
+    app.include_router(_depth.router)
+except Exception as e:
+    _depth = None
+    _depth_import_error = f"{type(e).__name__}: {e}"
+    print(f"[ares-sam] depth routes unavailable: {_depth_import_error}")
+
 
 def _ready():
     """503 while loading or after a failed load; returns the active backend name."""
@@ -376,6 +394,11 @@ def health():
     track = _track.health_fields() if _track is not None else {
         "trackReady": False, "trackLoading": False, "trackError": _track_import_error,
         "trackSessions": 0, "trackRes": None, "trackMaxSessions": 0}
+    # Depth engine — reported even when its routes failed to mount, for the same reason as track's:
+    # one flag, read the same way by every caller, whether the module is there or not.
+    depth = _depth.health_fields() if _depth is not None else {
+        "depthReady": False, "depthLoading": False, "depthModel": None,
+        "depthError": _depth_import_error, "depthJobs": 0}
     return {
         "ok": _backend is not None,
         "loading": _backend is None and _load_error is None,
@@ -392,6 +415,7 @@ def health():
         "textLoading": SAM_TEXT and _backend == "sam3" and _sam3_concept_model is None and _concept_load_error is None,
         "textError": _concept_load_error,
         **track,
+        **depth,
     }
 
 

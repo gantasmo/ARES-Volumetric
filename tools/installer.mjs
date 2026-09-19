@@ -348,6 +348,11 @@ export function catalog(ROOT, gpu) {
     .find((d) => existsSync(join(d, "config.json")) && existsSync(join(d, "model.safetensors")));
   const liteSnap = hfSnapshot("vil-uob/sam3-litetext-s0", ["config.json"]);
   const dreamSnap = hfSnapshot("Lykon/dreamshaper-8", ["model_index.json"]);
+  // Depth-Anything-V2 (the 2D video → 2.5D engine, tools/sam-service/depth.py). Public repos in
+  // transformers format; the service downloads one on first use, and these rows let the Settings
+  // tab pre-fetch and report them. Weights are one safetensors file each.
+  const DEPTH_FILES = ["config.json", "model.safetensors"];
+  const depthSnap = (repo) => hfSnapshot(repo, DEPTH_FILES);
   // SAM 3D Body ships as a gated Meta repo plus an ungated community mirror of the same weights
   // (validated 2026-07-13, and re-checked against the Hub 2026-09-08: model.ckpt 2.1 GB +
   // assets/mhr_model.pt 696 MB). Either satisfies the component, so probe both.
@@ -365,6 +370,17 @@ export function catalog(ROOT, gpu) {
   // pip step was interrupted has python.exe and nothing else.
   const envReady = existsSync(P.envPy)
     && ["torch", "transformers", "uvicorn"].every((m) => existsSync(join(P.envDir, "Lib", "site-packages", m)));
+  // Video-Depth-Anything (tools/sam-service/depth.py video-* models): source tree + one .pth each.
+  const vdaDir = join(P.ext, "video-depth-anything");
+  const vda = (id, label, file, repo, sizeMB, vramMB, licence, note) => ({
+    id, group: "Depth", label,
+    enables: "temporally consistent depth for 2D video → 2.5D",
+    why: `${note}, ${licence}`,
+    sizeMB, vramMB, optional: true,
+    requires: ["vda-code", "python-env"],
+    ...fileFound(join(P.models, file)),
+    install: { kind: "url", url: `https://huggingface.co/${repo}/resolve/main/${file}`, into: P.models, as: file },
+  });
 
   const items = [
     {
@@ -403,7 +419,7 @@ export function catalog(ROOT, gpu) {
       id: "python-env",
       group: "Runtime",
       label: "Python environment (PyTorch + transformers)",
-      enables: "every local model: segmentation, upscaling, detail",
+      enables: "every local model: segmentation, upscaling, detail, depth",
       why: `PyTorch built for ${idx}: ${gpu?.cudaWhy || "default CUDA build"}. CPython ${PRIVATE_PYTHON.version} is unpacked into tools/bin when the machine has no usable interpreter`,
       sizeMB: 3400,
       ...(envReady ? found(true, P.envDir) : found(false)),
@@ -531,6 +547,90 @@ export function catalog(ROOT, gpu) {
         ignore: ["safety_checker/*", "*.ckpt", "*.bin", "*nonema*"],
       },
     },
+    // ---- 2D video → 2.5D (Depth-Anything-V2, tools/sam-service/depth.py). Sizes are the
+    // safetensors on the Hub; VRAM is fp16 weights plus batch-8 activations at 518 px, an
+    // estimate until measured on this card (see docs/depth-2d-to-25d.md).
+    {
+      id: "depth-base",
+      group: "Depth",
+      label: "Depth Anything V2 Base",
+      enables: "the Convert tab's 2D video → 2.5D conversion at the default quality",
+      why: "97M parameters, CC-BY-NC-4.0 (non-commercial); the service downloads it on first use if this is skipped",
+      sizeMB: 390,
+      vramMB: 1000,
+      requires: ["python-env"],
+      ...(depthSnap("depth-anything/Depth-Anything-V2-Base-hf") ? found(true, depthSnap("depth-anything/Depth-Anything-V2-Base-hf"), dirBytes(depthSnap("depth-anything/Depth-Anything-V2-Base-hf"))) : found(false)),
+      install: { kind: "hf", repo: "depth-anything/Depth-Anything-V2-Base-hf", allow: ["*.json", "*.safetensors"] },
+    },
+    {
+      id: "depth-small",
+      group: "Depth",
+      label: "Depth Anything V2 Small",
+      enables: "the fastest 2D → 2.5D depth model; also what the browser engine runs",
+      why: "25M parameters, Apache-2.0: the only checkpoint of the family with a permissive licence",
+      sizeMB: 100,
+      vramMB: 600,
+      optional: true,
+      requires: ["python-env"],
+      ...(depthSnap("depth-anything/Depth-Anything-V2-Small-hf") ? found(true, depthSnap("depth-anything/Depth-Anything-V2-Small-hf"), dirBytes(depthSnap("depth-anything/Depth-Anything-V2-Small-hf"))) : found(false)),
+      install: { kind: "hf", repo: "depth-anything/Depth-Anything-V2-Small-hf", allow: ["*.json", "*.safetensors"] },
+    },
+    {
+      id: "depth-large",
+      group: "Depth",
+      label: "Depth Anything V2 Large",
+      enables: "the highest-quality relative depth for 2D → 2.5D",
+      why: "335M parameters, CC-BY-NC-4.0 (non-commercial); several times slower than Base",
+      sizeMB: 1340,
+      vramMB: 2600,
+      optional: true,
+      requires: ["python-env"],
+      ...(depthSnap("depth-anything/Depth-Anything-V2-Large-hf") ? found(true, depthSnap("depth-anything/Depth-Anything-V2-Large-hf"), dirBytes(depthSnap("depth-anything/Depth-Anything-V2-Large-hf"))) : found(false)),
+      install: { kind: "hf", repo: "depth-anything/Depth-Anything-V2-Large-hf", allow: ["*.json", "*.safetensors"] },
+    },
+    {
+      id: "depth-metric-indoor",
+      group: "Depth",
+      label: "Depth Anything V2 Metric Indoor Base",
+      enables: "2D → 2.5D with depth in metres for indoor footage (no near/far guess)",
+      why: "97M parameters fine-tuned on Hypersim; the untagged Hub repo follows the Base licence (CC-BY-NC-4.0)",
+      sizeMB: 390,
+      vramMB: 1000,
+      optional: true,
+      requires: ["python-env"],
+      ...(depthSnap("depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf") ? found(true, depthSnap("depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf"), dirBytes(depthSnap("depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf"))) : found(false)),
+      install: { kind: "hf", repo: "depth-anything/Depth-Anything-V2-Metric-Indoor-Base-hf", allow: ["*.json", "*.safetensors"] },
+    },
+    {
+      id: "depth-metric-outdoor",
+      group: "Depth",
+      label: "Depth Anything V2 Metric Outdoor Base",
+      enables: "2D → 2.5D with depth in metres for outdoor footage",
+      why: "97M parameters fine-tuned on Virtual KITTI; the untagged Hub repo follows the Base licence (CC-BY-NC-4.0)",
+      sizeMB: 390,
+      vramMB: 1000,
+      optional: true,
+      requires: ["python-env"],
+      ...(depthSnap("depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf") ? found(true, depthSnap("depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf"), dirBytes(depthSnap("depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf"))) : found(false)),
+      install: { kind: "hf", repo: "depth-anything/Depth-Anything-V2-Metric-Outdoor-Base-hf", allow: ["*.json", "*.safetensors"] },
+    },
+    // ---- Video-Depth-Anything (the video-* model keys). Repos, file names, byte sizes and
+    // licences read from the Hub API 2026-09-18; all three are ungated, so a plain URL fetch works.
+    {
+      id: "vda-code",
+      group: "Depth",
+      label: "Video Depth Anything source",
+      enables: "the video-small / video-base / video-large depth models",
+      why: "shallow git clone of DepthAnything/Video-Depth-Anything into tools/ext, Apache-2.0",
+      sizeMB: 60,
+      optional: true,
+      requires: ["git"],
+      ...(existsSync(join(vdaDir, ".git")) ? found(true, vdaDir) : found(false)),
+      install: { kind: "git", url: "https://github.com/DepthAnything/Video-Depth-Anything", into: vdaDir },
+    },
+    vda("vda-small", "Video Depth Anything Small", "video_depth_anything_vits.pth", "depth-anything/Video-Depth-Anything-Small", 111, 6800, "Apache-2.0", "28M parameters; VRAM is the published fp16 figure for a 32-frame 518 px window"),
+    vda("vda-base", "Video Depth Anything Base", "video_depth_anything_vitb.pth", "depth-anything/Video-Depth-Anything-Base", 437, undefined, "CC-BY-NC-4.0 (non-commercial)", "113M parameters; no published VRAM figure"),
+    vda("vda-large", "Video Depth Anything Large", "video_depth_anything_vitl.pth", "depth-anything/Video-Depth-Anything-Large", 1467, 23600, "CC-BY-NC-4.0 (non-commercial)", "382M parameters; VRAM is the published fp16 figure for a 32-frame 518 px window"),
   ];
 
   // ---- status only: nothing here is downloadable, but each one gates a feature, so the tab
@@ -696,17 +796,17 @@ export function profiles(items, gpu) {
     {
       id: "best", label: "Best",
       blurb: "Everything, at full quality. Pick this when the GPU has the room.",
-      want: ["python-env", "sam3", "vit-h", "esrgan-x4plus", "esrgan-ncnn", "dreamshaper"],
+      want: ["python-env", "sam3", "vit-h", "esrgan-x4plus", "esrgan-ncnn", "dreamshaper", "depth-base"],
     },
     {
       id: "balanced", label: "Balanced",
       blurb: "The full segmentation and upscale models, without the generative extras.",
-      want: ["python-env", "sam3", "esrgan-x4plus", "esrgan-ncnn"],
+      want: ["python-env", "sam3", "esrgan-x4plus", "esrgan-ncnn", "depth-base"],
     },
     {
       id: "smallest", label: "Smallest",
       blurb: "Ungated and light, no licence to accept, least disk and VRAM.",
-      want: ["python-env", "sam3-lite", "esrgan-general", "esrgan-ncnn"],
+      want: ["python-env", "sam3-lite", "esrgan-general", "esrgan-ncnn", "depth-small"],
     },
   ];
 
