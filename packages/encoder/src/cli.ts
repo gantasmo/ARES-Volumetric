@@ -17,12 +17,12 @@
  *   ares info   <file.ares>
  *   ares verify-edits <file.edits.json>               (mask2d/keyframe pre-flight, exit 1 on any issue)
  */
-import { readdir, readFile, writeFile, stat } from "node:fs/promises";
+import { readdir, readFile, writeFile, stat, open } from "node:fs/promises";
 import { readFileSync } from "node:fs";
 import { join, extname, basename } from "node:path";
 import { performance } from "node:perf_hooks";
 import { createHash } from "node:crypto";
-import { Demuxer, GeometryProfile, BlockType, decodeGeometryBlock, decodePFrameBlock, decodeSplatBlock, decodeSplatPBlock, dequantScale, meshoptReady, transformMatrix, type DecodedGeometry } from "@ares/core";
+import { Demuxer, GeometryProfile, BlockType, decodeGeometryBlock, decodePFrameBlock, decodeSplatBlock, decodeSplatPBlock, dequantScale, meshoptReady, transformMatrix, type DecodedGeometry, type GopEntry } from "@ares/core";
 import { parsePly, parsePlyHeader, isSplatPlyHeader, parsePlySplat, writeSplatPly } from "./importers/ply.js";
 import { parseObj } from "./importers/obj.js";
 import { parseSpz, writeSpz } from "./importers/spz.js";
@@ -36,7 +36,7 @@ import { filterFrame, parseCropBox } from "./crop.js";
 import { decimateFrame, simplifierReady } from "./decimate.js";
 import { parseEditList, validateMasks, keepPredicateAt, prepareRangeAt, prepareRangeSdfAt, isRangeEnabled, type EditList, type EditRange } from "@ares/core";
 import { resolveOffset, applyTransform, applyTransformNormals, transformAabb, type ModelTransform } from "@ares/core";
-import type { Aabb } from "@ares/core";
+import { HEADER_SIZE, type Aabb } from "@ares/core";
 import { collectCopyOps, applyGeoCopy, resolveSrcFragment, buildPieceFragment, type CopyOp } from "./frame-copy.js";
 import {
   buildPatchedAtlasDir, pngSize, rasterizeUvFootprint, dilateMask,
@@ -1071,29 +1071,53 @@ async function exportCmd(a: string[]) {
 
 async function info(a: string[]) {
   const path = a[1]!;
-  const file = Demuxer.parse(new Uint8Array(await readFile(path)));
-  const h = file.header, s = file.superblock;
-  const profile = h.geometryProfile === GeometryProfile.SplatIPB ? "splat" : h.geometryProfile === GeometryProfile.MeshIPB ? "mesh" : `profile ${h.geometryProfile}`;
-  console.log(`[ares] ${path}: v${h.versionMajor}.${h.versionMinor}, ${h.frameCount} frames @ ${h.fps}fps, ${(Number(h.durationUs) / 1e6).toFixed(2)}s`);
-  if (h.geometryProfile === GeometryProfile.SplatIPB) {
-    await meshoptReady();
-    let n = 0;
-    try { const { blocks } = locateFrame(file, 0); n = decodeSplatBlock(blocks[0]!.data).count; } catch { /* leave 0 */ }
-    console.log(`       geometry ${profile} · ${n} splats in frame 0 · SH degree ${s.shDegree} · quant ${s.quantBitsPos}b pos · gop=${s.gopLength}`);
-  } else {
-    console.log(`       geometry ${profile} intra=${h.intraCodec} · quant ${s.quantBitsPos}b pos / ${s.quantBitsUv}b uv · gop=${s.gopLength}`);
-  }
-  console.log(`       ${file.gopIndex.length} chunk(s), ${file.tracks.length} track(s): ${file.tracks.map((t) => t.codecFourcc).join(", ")}`);
-  const vid = Demuxer.textureVideo(file);
-  const tex = Demuxer.textureAtlas(file);
-  console.log(`       texture: ${vid ? `${vid.fourcc} video ${vid.width}x${vid.height}` : tex ? `${tex.width}x${tex.height} still atlas, ${(tex.bytes.length / 1024).toFixed(1)} KB` : "none"}`);
-  const at = Demuxer.audioTrack(file);
-  if (at) {
-    let packets = 0, bytes = 0, endUs = 0;
-    for (const gop of file.gopIndex) for (const p of Demuxer.audioPackets(file, Demuxer.chunkAt(file, gop))) { packets++; bytes += p.data.byteLength; endUs = Math.max(endUs, p.ptsUs + p.durationUs); }
-    console.log(`       audio: ${at.fourcc} 48 kHz ${at.channels === 1 ? "mono" : "stereo"}, ${packets} packets, ${(endUs / 1e6).toFixed(2)}s, ${(bytes / 1024).toFixed(1)} KB`);
-  }
-  console.log(`       AABB min [${s.aabb.min.map((v) => v.toFixed(2)).join(", ")}] max [${s.aabb.max.map((v) => v.toFixed(2)).join(", ")}]`);
+  // Never read whole: a clip runs to gigabytes, and `ares depth` ends every encode with this. The
+  // head (everything before the first chunk) is read once; the audio totals and a splat clip's
+  // first frame come from chunks read one at a time.
+  const fh = await open(path, "r");
+  try {
+    const hdr = new Uint8Array(HEADER_SIZE);
+    await fh.read(hdr, 0, HEADER_SIZE, 0);
+    const first = Number(Demuxer.parseHeader(hdr).firstChunkOffset);
+    const head = new Uint8Array(first);
+    await fh.read(head, 0, first, 0);
+    const file = Demuxer.parse(head);
+    /** One chunk as a file of its own: its bytes at offset 1 (chunkAt rejects a chunk at 0). */
+    const chunkFile = async (gop: GopEntry) => {
+      const buf = new Uint8Array(1 + gop.byteLength);
+      await fh.read(buf, 1, gop.byteLength, Number(gop.byteOffset));
+      const f = { ...file, buf, gopIndex: [{ ...gop, byteOffset: 1n }] };
+      return { f, chunk: Demuxer.chunkAt(f, f.gopIndex[0]!) };
+    };
+    const h = file.header, s = file.superblock;
+    const profile = h.geometryProfile === GeometryProfile.SplatIPB ? "splat" : h.geometryProfile === GeometryProfile.MeshIPB ? "mesh" : `profile ${h.geometryProfile}`;
+    console.log(`[ares] ${path}: v${h.versionMajor}.${h.versionMinor}, ${h.frameCount} frames @ ${h.fps}fps, ${(Number(h.durationUs) / 1e6).toFixed(2)}s`);
+    if (h.geometryProfile === GeometryProfile.SplatIPB) {
+      await meshoptReady();
+      let n = 0;
+      try {
+        const { f, chunk } = await chunkFile(file.gopIndex[0]!);
+        n = decodeSplatBlock(Demuxer.geometryBlocks(f, chunk)[0]!.data).count;
+      } catch { /* leave 0 */ }
+      console.log(`       geometry ${profile} · ${n} splats in frame 0 · SH degree ${s.shDegree} · quant ${s.quantBitsPos}b pos · gop=${s.gopLength}`);
+    } else {
+      console.log(`       geometry ${profile} intra=${h.intraCodec} · quant ${s.quantBitsPos}b pos / ${s.quantBitsUv}b uv · gop=${s.gopLength}`);
+    }
+    console.log(`       ${file.gopIndex.length} chunk(s), ${file.tracks.length} track(s): ${file.tracks.map((t) => t.codecFourcc).join(", ")}`);
+    const vid = Demuxer.textureVideo(file);
+    const tex = Demuxer.textureAtlas(file);
+    console.log(`       texture: ${vid ? `${vid.fourcc} video ${vid.width}x${vid.height}` : tex ? `${tex.width}x${tex.height} still atlas, ${(tex.bytes.length / 1024).toFixed(1)} KB` : "none"}`);
+    const at = Demuxer.audioTrack(file);
+    if (at) {
+      let packets = 0, bytes = 0, endUs = 0;
+      for (const gop of file.gopIndex) {
+        const { f, chunk } = await chunkFile(gop);
+        for (const p of Demuxer.audioPackets(f, chunk)) { packets++; bytes += p.data.byteLength; endUs = Math.max(endUs, p.ptsUs + p.durationUs); }
+      }
+      console.log(`       audio: ${at.fourcc} 48 kHz ${at.channels === 1 ? "mono" : "stereo"}, ${packets} packets, ${(endUs / 1e6).toFixed(2)}s, ${(bytes / 1024).toFixed(1)} KB`);
+    }
+    console.log(`       AABB min [${s.aabb.min.map((v) => v.toFixed(2)).join(", ")}] max [${s.aabb.max.map((v) => v.toFixed(2)).join(", ")}]`);
+  } finally { await fh.close(); }
 }
 
 /**

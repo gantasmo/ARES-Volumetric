@@ -223,7 +223,7 @@ test("CLI: synth splat → export (.spz/.glb/.ply/.splat) → encode the exports
     const clip = join(dir, "s.ares");
     execFileSync(process.execPath, [CLI, "synth", "--shape", "splat", "--frames", "4", "--sh-degree", "1", "-o", clip], { stdio: "pipe" });
     const info = execFileSync(process.execPath, [CLI, "info", clip], { encoding: "utf8" });
-    assert.match(info, /geometry splat/);
+    assert.match(info, /geometry splat · [1-9]\d* splats in frame 0/, "frame 0 decodes from its chunk alone");
     const spzDir = join(dir, "spz"); mkdirSync(spzDir);
     for (let i = 0; i < 4; i++) execFileSync(process.execPath, [CLI, "export", clip, "--frame", String(i), "-o", join(spzDir, `frame-${i}.spz`)], { stdio: "pipe" });
     for (const ext of ["glb", "ply", "splat"]) execFileSync(process.execPath, [CLI, "export", clip, "--frame", "1", "-o", join(dir, `f1.${ext}`)], { stdio: "pipe" });
