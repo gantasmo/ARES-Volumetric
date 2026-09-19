@@ -2140,15 +2140,42 @@ function initEditor(player) {
   const overlay = $("selectOverlay"), marquee = $("marquee");
   const xrayOn = () => $("xray").getAttribute("aria-pressed") === "true";
   $("xray").onclick = () => $("xray").setAttribute("aria-pressed", String(!xrayOn()));
+  // The options strip shows the ACTIVE tool's controls only. A tool with no options gets a
+  // one-line reminder of how it is driven, so the strip is never a blank gap.
+  const TOOL_HINT = {
+    nav: "orbit · middle-drag pan · wheel zoom",
+    sbox: "drag a rectangle · X-ray cuts through",
+    lasso: "draw a loop · X-ray cuts through",
+    sam: "click an object · shift-click excludes",
+    measure: "click two points · Esc clears",
+  };
+  function syncToolOptions() {
+    for (const row of document.querySelectorAll("#editPanel [data-tool-opt]")) {
+      row.hidden = !row.dataset.toolOpt.split(" ").includes(tool);
+    }
+    const hint = $("toolHint");
+    if (hint) hint.textContent = TOOL_HINT[tool] || "";
+  }
+  const brushRVal = $("brushRVal");
+  const syncBrushR = () => { if (brushRVal) brushRVal.textContent = $("brushR").value + " mm"; };
+  $("brushR").addEventListener("input", syncBrushR);
+  syncBrushR();
+
   for (const b of document.querySelectorAll("#editPanel .tool")) b.onclick = () => {
     tool = b.dataset.tool;
-    for (const o of document.querySelectorAll("#editPanel .tool")) o.setAttribute("aria-pressed", String(o === b));
+    for (const o of document.querySelectorAll("#editPanel .tool")) {
+      const on = o === b;
+      o.setAttribute("aria-pressed", String(on));
+      o.setAttribute("aria-checked", String(on));   // it is a radiogroup: keep both in step
+    }
+    syncToolOptions();
     overlay.style.display = tool === "nav" ? "none" : "block";
     if (tool !== "nav" && tool !== "measure") player.pause(), $("play").textContent = "▶︎"; // edit on a held frame
     if (tool !== "sam") samSelClear();                                  // pending SAM prompts die with the tool
     if (tool !== "measure") measureClear();
     if (tool !== "lasso") lassoClear();
   };
+  syncToolOptions();
 
   // ---- Lasso: a free polygon in screen space → the same mask2d/bitmap volume SAM produces, so
   // the evaluator, X-ray law, depth band and bake path are all shared with it. Drawn as an SVG
