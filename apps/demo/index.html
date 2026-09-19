@@ -457,7 +457,59 @@
     min-height: 0; width: 100%; }
   /* Each overlay page is a bounded column — its dynamic region is the internal scroller, so the
      page itself never scrolls wholesale. */
-  #convertOut { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+  #convertOut { flex: 0 1 auto; min-height: 0; overflow-y: auto; }
+  /* ---- Convert tab: two-column control surface -------------------------------------------
+     Everything explanatory is a title= tooltip or lives behind the ⋯ button, and every
+     secondary parameter group is a collapsed <details>, so the card fits one viewport. The
+     only scrollers are the log, the batch queue and the history list. */
+  #tab-convert .wrap { max-width: 1120px; }
+  .tbar { display: flex; align-items: center; gap: 6px; margin: 2px 0 8px; }
+  .tbar h2 { margin: 0; flex: none; }
+  .tbar .sp { flex: 1 1 auto; }
+  .pop { margin: 0 0 8px; padding: 7px 10px; background: var(--bg-panel); border: 1px solid var(--border);
+    border-radius: var(--r); font-size: 12px; }
+  .pop .fmt { display: grid; grid-template-columns: 132px 1fr auto; gap: 2px 10px; padding: 2px 0; align-items: baseline; }
+  .pop .fmt > span:first-of-type { color: var(--text-dim); }
+  .pop .fmt > span:last-child { font-size: 10.5px; text-transform: uppercase; letter-spacing: .3px; color: var(--text-faint); }
+  #convertDrop { padding: 7px 12px; }
+  #convertDrop .big { display: block; font-size: 12.5px; color: var(--text-dim); margin: 0; }
+  /* Two columns of controls, then full-width rows for the action bar, queue, log and result. */
+  .cv2 { display: grid; grid-template-columns: 1.15fr 1fr; gap: 0 22px; align-items: start; }
+  .cv2 > .full { grid-column: 1 / -1; }
+  .cvcol { min-width: 0; }
+  .fld { display: grid; grid-template-columns: 74px 1fr; align-items: center; gap: 0 8px;
+    min-height: 26px; font-size: 12px; }
+  .fld > .k { color: var(--text-dim); }
+  .fld .row { flex-wrap: wrap; min-width: 0; }
+  .fld .row > .k { flex: none; }
+  .fld .row > .inp { min-width: 0; }
+  .fld .suf { color: var(--text-dim); font-size: 11.5px; }
+  .stats { display: grid; grid-template-columns: 74px 1fr; gap: 1px 8px; margin: 3px 0 5px; font-size: 12px; }
+  .stats dt { color: var(--text-dim); }
+  .stats dd { margin: 0; color: var(--text); font-variant-numeric: tabular-nums;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  details.sec { border-top: 1px solid var(--border); }
+  details.sec > summary { cursor: pointer; list-style: none; padding: 5px 0; font-size: 10px;
+    text-transform: uppercase; letter-spacing: .3px; color: var(--text-dim); user-select: none; }
+  details.sec > summary::-webkit-details-marker { display: none; }
+  details.sec > summary::before { content: "▸ "; color: var(--text-faint); }
+  details.sec[open] > summary::before { content: "▾ "; }
+  details.sec > summary:hover { color: var(--text); }
+  details.sec > .body { padding: 0 0 7px; }
+  details.sec .prog { margin-top: 6px; }
+  .cvfoot { display: flex; gap: 8px; align-items: center; margin-top: 8px; padding-top: 8px;
+    border-top: 1px solid var(--border); }
+  .cvfoot .prog { flex: 1 1 auto; margin: 0; display: block; }
+  .cvlog { margin: 0; max-height: 168px; overflow: auto; background: var(--surface); border-radius: var(--r);
+    padding: 5px 8px; font: 11px ui-monospace, monospace; color: var(--text-mid); white-space: pre-wrap; }
+  .note2 { color: var(--text-dim); font-size: 11.5px; }
+  /* The settings card sizes to its content; History absorbs whatever height is left, so the
+     leftover space becomes a longer list rather than a dead band above the fold. */
+  #convertHistory { flex: 1 1 auto; min-height: 96px; display: flex; flex-direction: column; }
+  #convertHistory .card { margin-top: 8px; flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+  #convertHistory .histList { flex: 1 1 auto; min-height: 0; max-height: none; }
+  #convertHistory .card > h3, #convertHistory .card > div:first-child { flex: none; }
+  @media (max-width: 900px) { .cv2 { grid-template-columns: 1fr; } }
   #depsOut { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
   #rpOut { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
   .tool h2 { margin: 4px 0 4px; font-size: 18px; }
@@ -1066,26 +1118,30 @@
 <!-- Convert tab — unified import: a frames folder (Microsoft volcap / PLY sequences / DepthKit
      exports) analyses + converts; a single .ares/.4ds file is structurally probed instead (the
      former standalone Inspect tab was merged in here 2026-07-11 — same probe, same findings,
-     now the first step of "can I convert this" rather than a separate destination). -->
+     now the first step of "can I convert this" rather than a separate destination).
+     The panel is a control surface: the format matrix and the pipeline notes that used to run
+     down the page live in the ⋯ menu and in title= tooltips, so the card fits one viewport and
+     only the log, the batch queue and the history list scroll. -->
 <div class="tool" id="tab-convert">
   <div class="wrap">
-    <h2>Convert to .ares</h2>
-    <p class="lead">Convert a capture folder — per-frame OBJ/PLY meshes with PNG or JPG atlases — into a
-      single .ares clip. Encoding runs locally. A single .ares or .4ds file is probed structurally
-      instead: only the container layout is read, never mesh or texture content.</p>
-    <div class="note" style="margin:0 0 10px">Formats: <b>Microsoft volcap</b> OBJ+PNG <span class="good">✓ converts</span>
-      · <b>PLY sequences</b> <span class="good">✓ converts</span>
-      · <b>DepthKit</b> Textured Geometry Sequence (OBJ/PLY + PNG/JPG, one of each per frame) <span class="good">✓ converts</span>
-      · <b>4DViews</b> <code>.4ds</code> <span class="good">✓ converts</span> (DXT1 desktop captures, ~2 fps decode; needs the
-      codec DLL — <a href="#" id="fourdsSettingsLink">Settings</a> if missing)</div>
-    <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
-      <button class="u primary" id="convertPick" title="pick the capture folder to import — a sequence of per-frame OBJ/PLY meshes + atlas PNGs">Choose folder…</button>
-      <label class="u" for="convertProbeFile">Choose .ares/.4ds…</label>
+    <div class="tbar">
+      <h2>Convert to .ares</h2>
+      <span class="sp"></span>
+      <button class="u primary" id="convertPick" title="Pick a capture folder: per-frame OBJ/PLY meshes plus atlas-*.png textures, or per-frame splats">Folder…</button>
+      <label class="u" for="convertProbeFile" title="Pick a single .ares or .4ds container to probe its structure">File…</label>
       <input type="file" id="convertProbeFile" accept=".4ds,.ares" style="display:none">
+      <button class="u ico" id="convertInfo" aria-expanded="false" aria-controls="convertFormats" title="Supported formats">⋯</button>
+    </div>
+    <div class="pop" id="convertFormats" hidden>
+      <div class="fmt"><b>Microsoft volcap</b><span>OBJ + PNG</span><span class="good">converts</span></div>
+      <div class="fmt"><b>PLY sequence</b><span>mesh or 3DGS</span><span class="good">converts</span></div>
+      <div class="fmt"><b>DepthKit</b><span>Textured Geometry Sequence: OBJ/PLY + PNG/JPG</span><span class="good">converts</span></div>
+      <div class="fmt"><b>Splat sequence</b><span>SPZ / .splat / SOG / glTF</span><span class="good">converts</span></div>
+      <div class="fmt"><b>4DViews .4ds</b><span>DXT1 desktop captures, ~2 fps decode; the licensed codec DLL is located with a file dialog on first use</span><span class="good">converts</span></div>
+      <div class="fmt"><b>.ares</b><span>container layout only, no mesh or texture content is read</span><span>probes</span></div>
     </div>
     <label class="drop" id="convertDrop">
-      <div class="big">Drop a capture folder or a .ares/.4ds file</div>
-      <div class="small">Folders are analysed for conversion; single files are probed.</div>
+      <span class="big">Drop capture folder, .ares / .4ds</span>
       <input type="file" id="convertFile" multiple webkitdirectory>
     </label>
     <div id="convertOut"></div>
