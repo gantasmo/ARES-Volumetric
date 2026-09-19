@@ -28,7 +28,8 @@ Two companion documents summarize the project at different depths:
   spec/                  Specification source, one file per chapter; spec/build.py
                          assembles ARES-Runtime-Specification.md + .html
   apps/phase0-probe/     Capability probe: WebGPU adapters, WebCodecs HW decode, isolation
-  apps/demo/             Four-tab app: Viewer | Compare | Inspect | Convert (+ mesh editor)
+  apps/demo/             The app: Viewer | Compare | Convert | Settings | Compute (+ mesh editor);
+                         depth-card.js + depth-worker.js + depth-browser.js: 2D video → 2.5D
   packages/core/         @ares/core    container demux, geometry decode, WebGPU + WebGL2
                                        renderers, WebCodecs texture, edits, AresPlayer
   packages/encoder/      @ares/encoder OBJ/PLY importers, splat importers (SPZ, 3DGS PLY, .splat,
@@ -37,7 +38,9 @@ Two companion documents summarize the project at different depths:
   packages/three/        @ares/three   AresObject (THREE.Object3D wrapper)
   packages/react/        @ares/react   <Ares/> for @react-three/fiber
   tools/serve.mjs        Zero-dependency dev server: COOP/COEP headers + local GUI endpoints
-  tools/sam-service/     Local FastAPI SAM segmentation service (editor assist)
+  tools/installer.mjs    Component catalog + installers behind the Settings tab (GPU-aware)
+  tools/sam-service/     Local FastAPI service: SAM segmentation (editor assist), SAM 3 video
+                         tracking, Depth-Anything-V2 depth engine (depth.py, 2D video → 2.5D)
   tools/4ds/             .4ds decode host for a locally licensed 4DViews codec DLL (not included)
   tools/coherent/        Coherent-GOP pre-pass: stable-template registration + atlas rebake
   tools/sam3d/           Multiview SAM-3D-Body pose tools + RunPod pod orchestration
@@ -201,8 +204,18 @@ auto-launches a local Forge install headless. Jobs can queue as a batch. Known l
 the default Real-ESRGAN model invents artifacts on skin, documented in
 [docs/whitepaper.md](docs/whitepaper.md) under Known limitations.
 
-Both tabs share a searchable history of every volcap touched — folders analysed, files
-inspected, encodes and enhances produced — persisted server-side; entries re-open with one
+The Convert tab also takes a plain 2D video (`Video…`, or drop an mp4/webm/mov/mkv) and
+produces a 2.5D clip: a monocular depth model (Depth-Anything-V2) estimates a depth map per
+frame, the encoder unprojects each map through a pinhole ray table into a relief mesh with
+silhouette cuts at depth discontinuities, and the video frame itself is the texture. Two depth
+engines share one run contract: the local Python service on CUDA (batched, float output, any
+model size, several times faster than real time on a mid-range GPU) or the browser worker ported
+from VJ-9000 (transformers.js on WebGPU, no Python needed). Temporal stabilization aligns every
+frame's scale and shift to its neighbour and smooths static pixels without smearing moving ones.
+See [docs/depth-2d-to-25d.md](docs/depth-2d-to-25d.md).
+
+Both tabs share a searchable history of every volcap touched: folders analysed, files
+inspected, encodes and enhances produced: persisted server-side; entries re-open with one
 click (replay an inspection, re-analyse a folder, play an encode). A Settings tab (gear
 icon) reports every optional component: what is installed, what each piece enables, and
 either a download link (for gated or manual downloads such as the SAM 3 weights) or a
@@ -246,6 +259,12 @@ node packages/encoder/dist/cli.js encode <frames-dir> -o out.ares
                                          [--meta-extra-file f.json]
                                          splat input: [--sh-degree 0..3] [--splat-min-alpha a]
                                          [--splat-box-alpha a] [--splat-order morton|none] [--quant-bits 8..16]
+node packages/encoder/dist/cli.js depth  <video> --depth <run-dir> -o out.ares
+                                         [--fov 55] [--near 0.5] [--far 6] [--grid 256] [--edge 0.08]
+                                         [--sheets] [--stabilize 0.7] [--gop 30] [--tex-size 1024]
+                                         [--texture-codec vp9|av1] [--crf 30] [--no-texture]
+                                         [--no-audio] [--audio file] [--smooth-temporal N]
+                                         [--center bottom|mass|none] [--meta-extra-file f.json]
 node packages/encoder/dist/cli.js export file.ares -o out.(obj|ply|spz|glb|splat) [--frame N]
 node packages/encoder/dist/cli.js info   file.ares
 ```
@@ -279,6 +298,15 @@ near-transparent outlier haze generated captures carry before the quantization b
 and `--quant-bits` sets the fixed-point precision per axis over each chunk's box. `export`
 writes any frame back out as SPZ, 3DGS PLY, glTF/GLB or `.splat` (meshes: OBJ or PLY), so the
 container is no longer write-only.
+
+**2D video → 2.5D.** `depth <video> --depth <run-dir>` consumes a depth run (`depth.json` +
+`depth.f32`, one float32 map per sampled frame, written by the Python engine
+`tools/sam-service/depth.py` or by the browser engine through the dev server), stabilizes it,
+unprojects every map into a relief mesh (`--fov`, `--near`/`--far` hyperbolic disparity mapping,
+`--grid` columns, `--edge` silhouette cut, `--sheets` for a fixed full-grid topology that codes as
+I+P deltas), extracts the texture frames from the video with the same sampling, carries the
+video's own audio unless `--no-audio`, and muxes. The contract and the tuning notes are in
+[docs/depth-2d-to-25d.md](docs/depth-2d-to-25d.md).
 
 ## Documentation
 
