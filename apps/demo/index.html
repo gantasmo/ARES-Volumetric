@@ -898,6 +898,43 @@
           <button id="samApply" class="u primary" title="Commit this selection as the action chosen beside it, keyframed at the current frame. The Del key always commits as a delete.">Commit</button>
           <button id="samClear" class="u" title="Discard the pending SAM selection and start over (Esc).">Clear</button>
         </div>
+        <!-- Propagation rows (docs/sam-propagation-plan.md steps 5/6). THREE rows, mutually
+             exclusive by state, because .railBody (:201) is the rail's one scrolling container and
+             the rail is clamped to 220-480 px: a pending selection gets the track controls, a live
+             run gets progress + Cancel, a tracked active range gets the correction loop. At most
+             FOUR controls per row, and syncTrackRows (main.js) picks exactly one row from one state
+             variable. The rows are exclusive of each other, NOT of #samSelRow above: a pending
+             selection is what #trackRow is gated on, so its three controls are on screen too. -->
+        <div id="trackRow" class="row" style="display:none;margin-top:4px;flex-wrap:wrap">
+          <button id="trackGo" class="u primary" title="propagate the pending selection across the span with the SAM video tracker (K)">Track</button>
+          <select id="trackDir" class="inp" title="propagation direction from the seed frame">
+            <option value="forward">forward</option>
+            <option value="reverse">reverse</option>
+            <option value="bidirectional">bidirectional</option>
+          </select>
+          <select id="trackSpan" class="inp" title="frame span to track">
+            <option value="clip">clip</option>
+            <option value="range">range</option>
+          </select>
+          <select id="trackMaskRes" class="inp" title="stored bitmap long side; the tracker input edge is fixed at 1008">
+            <option value="512">512</option>
+            <option value="768" selected>768</option>
+            <option value="1024">1024</option>
+          </select>
+        </div>
+        <div id="trackRunRow" class="row" style="display:none;margin-top:4px;flex-wrap:wrap">
+          <span id="trackInfo" style="flex:1;min-width:90px;font:10px ui-monospace,monospace;color:var(--text-dim)"></span>
+          <button id="trackCancel" class="u" style="display:none" title="stop the track; keyframes already written are kept (Esc)">Cancel</button>
+          <button id="trackResume" class="u primary" style="display:none" title="replay this clip's live track session into the sidecar; the ranges it already wrote are rebuilt from the service's own event log">Resume</button>
+          <button id="trackDrop" class="u" style="display:none" title="close the session and keep its frames retired for a retrack">Discard</button>
+        </div>
+        <div id="trackFixRow" class="row" style="display:none;margin-top:4px;flex-wrap:wrap">
+          <span id="trackFixInfo" style="flex:1;min-width:90px;font:10px ui-monospace,monospace;color:var(--text-dim)"></span>
+          <button id="trackNudge" class="u" title="add a click at this frame and re-propagate to the next user keyframe">Nudge</button>
+          <button id="trackReseed" class="u" title="new object id at this frame and re-propagate to the next user keyframe">Re-seed</button>
+          <button id="trackAnchor" class="u" style="display:none" title="rebuild the session from every seed and re-propagate the window">Re-anchor</button>
+          <button id="trackWorst" class="u ico" title="jump to the lowest-confidence frame of the active track (N)">⌄</button>
+        </div>
       </div>
     </section>
     <section class="railSec" data-sec="fx">
@@ -1103,7 +1140,7 @@
 <div class="panel" id="err"></div>
 <!-- Shortcuts were a paragraph pinned across the viewport (owner: no prose in the chrome).
      Now one hoverable ? — the full list lives in its tooltip. -->
-<button id="hint" class="u ico viewer-only" aria-label="keyboard &amp; mouse shortcuts" title="NAVIGATE: left-drag orbit · middle-drag pan · scroll zoom · 1/3/7 snap front/right/top (Ctrl = opposite face) · P ortho/perspective · L lock view · F focus the subject · tools stay live: right/middle-drag &amp; wheel still navigate&#10;&#10;TRANSFORM (Unity keys): W move · E rotate · R scale · F focus · hold X/Y/Z while dragging to constrain to one axis · Shift for fine steps&#10;&#10;PLAYBACK: Space play/pause · ←/→ step 1 frame (Shift = 10) · Home/End first/last&#10;&#10;TIMELINE: [ set clip IN at playhead · ] set clip OUT · drag the brackets to adjust · drag anywhere on the strip to scrub&#10;&#10;VIEWPORT: Z cycle shading · Shift+W wireframe · G grid · Shift+R crop guides · X x-ray&#10;&#10;EDIT: Shift+E collapse/expand the rail · Q/V nav · M box · B brush · S SAM · Ctrl+Z undo · Ctrl+Shift+Z or Ctrl+Y redo · Ctrl+S save now · Del commits a pending SAM selection as a delete, otherwise removes the active range">?</button>
+<button id="hint" class="u ico viewer-only" aria-label="keyboard &amp; mouse shortcuts" title="NAVIGATE: left-drag orbit · middle-drag pan · scroll zoom · 1/3/7 snap front/right/top (Ctrl = opposite face) · P ortho/perspective · L lock view · F focus the subject · tools stay live: right/middle-drag &amp; wheel still navigate&#10;&#10;TRANSFORM (Unity keys): W move · E rotate · R scale · F focus · hold X/Y/Z while dragging to constrain to one axis · Shift for fine steps&#10;&#10;PLAYBACK: Space play/pause · ←/→ step 1 frame (Shift = 10) · Home/End first/last&#10;&#10;TIMELINE: [ set clip IN at playhead · ] set clip OUT · drag the brackets to adjust · drag anywhere on the strip to scrub&#10;&#10;VIEWPORT: Z cycle shading · Shift+W wireframe · G grid · Shift+R crop guides · X x-ray&#10;&#10;EDIT: Shift+E collapse/expand the rail · Q/V nav · M box · B brush · S SAM · K track the SAM selection across the span · N jump to the lowest-confidence frame of the active track · Ctrl+Z undo · Ctrl+Shift+Z or Ctrl+Y redo · Ctrl+S save now · Del commits a pending SAM selection as a delete, otherwise removes the active range · Esc cancels a live track">?</button>
 
 <script type="importmap">
 {

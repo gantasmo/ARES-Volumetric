@@ -5,10 +5,14 @@
  */
 // orbitViewProj is the RENDERER's own camera math — the crop guides project through the exact same
 // matrix the pixels do, so a guide can never drift from the geometry it claims to cut.
-import { AresPlayer, rleEncodeMask, keepPredicateAt, orbitViewProj, orbitViewHeight, growKeyframe, mirrorKeyframe } from "@ares/core";
+import { AresPlayer, rleEncodeMask, rleDecodeMask, keepPredicateAt, isFxIdentity, orbitViewProj, orbitViewHeight, growKeyframe, mirrorKeyframe } from "@ares/core";
 import { aact } from "./log.js";
 import { showMenu, closeMenu, menuOpen } from "./menu.js";
 import { accessPrompt, sseErrorData } from "./ensure.js";
+// The SAM video tracker's browser half lives in its own module (the menu.js precedent) so main.js
+// does not grow another 500 lines: track.js owns the sweep, the upload, the SSE consumer and the
+// keyframe writer, and takes every dependency as an argument. This file is the wiring only.
+import { createTrackWriter, createTrackClient, preflight, captureLine, maskIsSolid, MASK_RES_DEFAULT } from "./track.js";
 
 const $ = (id) => document.getElementById(id);
 const canvas = $("view");
@@ -1070,7 +1074,15 @@ function initEditor(player) {
   const edits = { aresEdits: 1, source: SRC.replace("./", ""), fps: player.getClipFps(), frameCount: 0, ranges: [] };
   let activeRange = null;
   let saveTimer = 0;
-  const doSave = () => fetch("/edits/" + clipBase, { method: "POST", body: JSON.stringify(edits, null, 1) }).catch(() => {});
+  // A propagated track writes one derived keyframe per frame, and pretty-printing costs a measured
+  // 4.1x at RLE nesting depth: at maskRes 768 one tracked object measures 4.4 MB pretty against
+  // serve.mjs's 16 MB cap (:707). So serialize COMPACT the moment the document holds a derived
+  // keyframe, and keep the indented form for small hand-authored sidecars, which stay inspectable.
+  const editsBody = () =>
+    (edits.ranges.some((r) => r.keyframes.some((k) => k.derived))
+      ? JSON.stringify(edits)
+      : JSON.stringify(edits, null, 1));
+  const doSave = () => fetch("/edits/" + clipBase, { method: "POST", body: editsBody() }).catch(() => {});
   const saveEdits = () => { clearTimeout(saveTimer); saveTimer = setTimeout(doSave, 600); };
   const flushSave = () => { clearTimeout(saveTimer); saveTimer = 0; doSave(); };
   const curFrame = () => player.getStats().frameIndex;
@@ -1133,10 +1145,23 @@ function initEditor(player) {
     gestureBefore = null;
     pushUndoIfChanged(before);
   }
+  /** The propagation rows are wired far below (they need samSel, the fx controls and the trim), but
+   *  syncRangeButtons is called from restoreState and from the timeline the moment either one runs.
+   *  Hoisted flag, checked first thing in syncTrackRows, so an early call is a no-op instead of a
+   *  temporal-dead-zone ReferenceError on the const handles down there. */
+  let trackWired = false;
+  /** The provisional drift gate (plan step 7 tightens it with the IoU estimator). Hoisted next to
+   *  trackWired for the same reason: renderRanges draws its caret from this and runs long before
+   *  the propagation block down there is reached. One constant, because the timeline caret, the
+   *  `N flagged` count and the N key all claim to be reading the same thing. */
+  const DRIFT_GATE = 0.60;
   function syncRangeButtons() {
     $("rangeStart").disabled = !!activeRange;
     $("rangeKey").disabled = !activeRange;
     $("rangeEnd").disabled = !activeRange;
+    // The correction row is gated on the ACTIVE range carrying a track, so every path that changes
+    // which range is active has to re-gate it. This is that one choke point.
+    syncTrackRows();
   }
   /** Put the whole editable state back. Each part goes through its OWN apply path (applyXf /
    *  applyTrim / preview) rather than being poked into place, so the player, the rail controls and
@@ -1156,7 +1181,14 @@ function initEditor(player) {
     applyCrop();   // re-applies the restored planes to the live preview + readout
     preview();     // setEditPreview + save + re-render (the save covers the writes above)
   }
+  /** NO destructive edit while a track streams. restoreState REBINDS edits.ranges to a JSON deep
+   *  clone, which detaches every range object the live writer holds in its runs/byFrame index: the
+   *  rest of the run would keep writing keyframes into objects that are no longer in the document
+   *  while the readout counted them. undo()'s own gestureCommit would also consume the run's pending
+   *  gestureBefore, leaving the remainder of the track in no undo step at all. */
+  const trackHolds = () => trackBusy;
   function undo() {
+    if (trackHolds()) return;
     gestureCommit();
     if (!undoStack.length) return;
     const prev = undoStack.pop();
@@ -1165,6 +1197,7 @@ function initEditor(player) {
     restoreState(prev);
   }
   function redo() {
+    if (trackHolds()) return;
     gestureCommit();
     if (!redoStack.length) return;
     const next = redoStack.pop();
@@ -1173,7 +1206,7 @@ function initEditor(player) {
     restoreState(next);
   }
   function deleteActiveRange() {
-    if (!activeRange) return;
+    if (!activeRange || trackHolds()) return;
     gestureCommit();
     const before = snapshotState();
     const idx = edits.ranges.indexOf(activeRange);
@@ -1826,11 +1859,29 @@ function initEditor(player) {
       const col = displayColor(r.color) || SEG_PALETTE[0];   // hex, never a var(): hex-alpha suffixes below
       const act = r === activeRange;
       const l = (r.startFrame / total) * 100, w = Math.max(0.4, ((r.endFrame - r.startFrame + 1) / total) * 100);
-      const dias = r.keyframes.map((k) =>
-        `<span class="tlKf" data-f="${k.frame}" title="keyframe @ ${k.frame} — click to jump" style="position:absolute;left:${((k.frame - r.startFrame) / Math.max(1, r.endFrame - r.startFrame)) * 100}%;top:-3px;transform:translateX(-50%);font-size:9px;cursor:pointer;color:${k.derived ? "var(--text-faint)" : col}">${k.derived ? "◇" : "◆"}</span>`).join("");
+      // A PROPAGATED range holds one keyframe per frame: 272 diamonds in a 12px lane is one glyph
+      // per 1.4px and nothing in it is clickable. So a tracked range draws as a hatched span with
+      // diamonds at the USER keyframes only — the seed and every correction, which are the frames a
+      // click can actually land on — plus one caret at the worst-confidence frame, so N has a
+      // visible target. Plan step 5, TIMELINE.
+      const tracked = !!r.track;
+      const at = (f) => ((f - r.startFrame) / Math.max(1, r.endFrame - r.startFrame)) * 100;
+      const dias = r.keyframes.filter((k) => !(tracked && k.derived)).map((k) =>
+        `<span class="tlKf" data-f="${k.frame}" title="keyframe @ ${k.frame}: click to jump" style="position:absolute;left:${at(k.frame)}%;top:-3px;transform:translateX(-50%);font-size:9px;cursor:pointer;color:${k.derived ? "var(--text-faint)" : col}">${k.derived ? "◇" : "◆"}</span>`).join("");
+      let caret = "";
+      if (tracked) {
+        // conf is the tracker's own sigmoid score today; step 7's IoU estimator tightens it.
+        // Gap-filled keep keyframes carry conf 0 by construction, so they always draw a caret.
+        let worst = null;
+        for (const k of r.keyframes) if (k.derived && (k.conf ?? 1) < DRIFT_GATE && (!worst || k.conf < worst.conf)) worst = k;
+        if (worst) caret = `<span class="tlKf" data-f="${worst.frame}" title="drift gate tripped @ ${worst.frame} · conf ${(worst.conf ?? 0).toFixed(2)}" style="position:absolute;left:${at(worst.frame)}%;top:4px;transform:translateX(-50%);font-size:9px;line-height:6px;cursor:pointer;color:var(--warn)">˅</span>`;
+      }
       const handles = act ? `<span class="tlHandle" data-ridx="${i}" data-edge="start" title="drag to trim the range start (snaps to playhead/edges)" style="position:absolute;left:-3px;top:-2px;width:7px;height:10px;background:${col};border-radius:var(--r);cursor:ew-resize"></span>
         <span class="tlHandle" data-ridx="${i}" data-edge="end" title="drag to trim the range end (snaps to playhead/edges)" style="position:absolute;right:-3px;top:-2px;width:7px;height:10px;background:${col};border-radius:var(--r);cursor:ew-resize"></span>` : "";
-      return `<div style="position:relative;height:12px;margin:2px 0"><div class="tlBar" data-ridx="${i}" title="${act ? "drag to move the range (keyframes ride along)" : "click to select this range"}" style="position:absolute;left:${l}%;width:${w}%;height:6px;top:3px;background:${col}${act ? "BB" : "55"};border-radius:var(--r);cursor:${act ? "grab" : "pointer"}">${dias}${handles}</div></div>`;
+      // background-image AFTER the background shorthand: the shorthand sets the colour, the hatch
+      // rides on top of it, so a tracked range reads as "every frame" at a glance.
+      const hatch = tracked ? `;background-image:repeating-linear-gradient(45deg,transparent 0 3px,${col} 3px 6px)` : "";
+      return `<div style="position:relative;height:12px;margin:2px 0"><div class="tlBar" data-ridx="${i}" title="${act ? "drag to move the range (keyframes ride along)" : "click to select this range"}${tracked ? ` · tracked · ${r.keyframes.length} kf · ${r.track.trackRes} · obj ${r.track.objId}` : ""}" style="position:absolute;left:${l}%;width:${w}%;height:6px;top:3px;background:${col}${act ? "BB" : "55"}${hatch};border-radius:var(--r);cursor:${act ? "grab" : "pointer"}">${dias}${caret}${handles}</div></div>`;
     }).join("") + `</div>` + trimHtml +
       `<div id="tlPlayhead" style="position:absolute;top:0;bottom:0;width:2px;background:var(--text);opacity:.85;pointer-events:none;z-index:5;left:0"></div>`;
     renderRuler();
@@ -2115,12 +2166,32 @@ function initEditor(player) {
     };
   }
 
+  /** Range ids must be MONOTONIC, never "r" + (ranges.length + 1). A delete-mode track authors ONE
+   *  RANGE PER CONTIGUOUS RUN and then merges some of them again, so a length-derived id collides
+   *  inside a single track; restoreState re-finds activeRange by id (:1137), which makes undo
+   *  re-target the wrong range. The high-water mark is re-read from the document every call so a
+   *  sidecar load and an undo restore both feed it. */
+  let rangeSeq = 0;
+  const newRangeId = () => {
+    for (const r of edits.ranges) {
+      const m = /^r(\d+)$/.exec(r.id || "");
+      if (m && Number(m[1]) > rangeSeq) rangeSeq = Number(m[1]);
+    }
+    return "r" + ++rangeSeq;
+  };
   const ensureRange = () => {
-    if (activeRange) return activeRange;
+    // Re-validated, not just truthy: the track writer splices ranges out of the document on its own
+    // (a merge across a refilled gap, a correction window that empties a run) and activeRange is set
+    // from its onRangeCreated, so it can be pointing at a range the document no longer holds.
+    // Appending to that orphan writes an edit that reaches neither the sidecar nor the bake, and
+    // nothing logs it — renderRanges iterates edits.ranges, so the timeline shows nothing either.
+    if (activeRange && edits.ranges.includes(activeRange)) return activeRange;
+    activeRange = null;
     const f = curFrame();
-    activeRange = { id: "r" + (edits.ranges.length + 1), color: nextSegColor(), mode: "delete", startFrame: f, endFrame: frameTotal() - 1, keyframes: [] };
+    activeRange = { id: newRangeId(), color: nextSegColor(), mode: "delete", startFrame: f, endFrame: frameTotal() - 1, keyframes: [] };
     edits.ranges.push(activeRange);
     $("rangeStart").disabled = true; $("rangeKey").disabled = false; $("rangeEnd").disabled = false;
+    syncTrackRows();
     return activeRange;
   };
   /** Append a volume to the keyframe at the current frame (creates it; slider boxes replace, others add). */
@@ -2430,17 +2501,25 @@ function initEditor(player) {
   const samTextInput = $("samTextInput"), samTextGo = $("samTextGo"), samTextHint = $("samTextHint"), samTextChipsEl = $("samTextChips");
   let samSel = null;   // { capture, cam, camKey, color, points, labels, maskObj, bits, depth, score, busy, instances?, selected? }
   let samRaf = 0, samLastCamKey = "", samLastRepaint = 0, samTextQuery = "";
-  const camKeyNow = () => {
-    const c = player.getCamera();
-    return [c.azimuth, c.elevation, c.distance, c.target[0], c.target[1], c.target[2]].map((v) => v.toFixed(5)).join(",");
-  };
+  // `ortho` is part of the key, not just the orbit: P toggles the projection live, and the mask was
+  // drawn in ONE projection. Without it a P toggle leaves samWatch in direct-blit mode, painting raw
+  // mask pixels 1:1 over a render taken through the other frustum.
+  // Split from camKeyNow so a track's STORED camera (TrackProvenance.camera) can be keyed the same
+  // way: a correction click only means anything from the viewpoint the proxy renders were swept
+  // under, and that comparison needs both sides through one formatter.
+  const camKeyOf = (c) =>
+    [c.azimuth, c.elevation, c.distance, c.target[0], c.target[1], c.target[2], c.ortho ? 1 : 0, c.fov ?? 0]
+      .map((v) => v.toFixed(5)).join(",");
+  const camKeyNow = () => camKeyOf(player.getCamera());
   function samSelClear() {
     samSel = null;
+    trackLast = "";                          // a new selection answers the last run's terminal line
     if (samRaf) { cancelAnimationFrame(samRaf); samRaf = 0; }
     samMaskCanvas.style.display = "none";
     samSelRow.style.display = "none";
     samTextChipsEl.style.display = "none";
     samTextChipsEl.innerHTML = "";
+    syncTrackRows();
   }
   $("samClear").onclick = samSelClear;
 
@@ -2472,6 +2551,10 @@ function initEditor(player) {
     const r = canvas.getBoundingClientRect();
     const fx = (e.clientX - r.left) / r.width, fy = (e.clientY - r.top) / r.height;
     if (fx < 0 || fy < 0 || fx > 1 || fy > 1) return;
+    // Capture-image pixels — and x and y do NOT share one scale factor, because captureFrame caps the
+    // LONG side (player.ts): a portrait viewport is scaled by maxDim/height, a landscape one by
+    // maxDim/width. Any consumer re-projecting these into a different render size must scale x by
+    // targetW/capture.width and y by targetH/capture.height independently.
     samSel.points.push([fx * samSel.capture.width, fy * samSel.capture.height]);
     samSel.labels.push(e.shiftKey ? 0 : 1);
     samSel.busy = true;
@@ -2496,6 +2579,7 @@ function initEditor(player) {
 
   /** Decode the mask PNG, capture the depth band, build the volume pieces, paint, start tracking. */
   async function samShowMask(j) {
+    trackLast = "";                        // a fresh selection answers the last run's terminal line
     samSel.instances = null;               // a click-driven mask is single-instance — drop any
     samTextChipsEl.style.display = "none"; // stale chip UI left over from a prior text search.
     const img = new Image();
@@ -2533,6 +2617,7 @@ function initEditor(player) {
     if (!samRaf) samWatch();
     const pts = samSel.points.length;
     samSelInfo.textContent = `mask ${j.score.toFixed(2)} · ${j.backend} · ${j.ms} ms · ${pts} pt${pts > 1 ? "s" : ""} · ${((count / bits.length) * 100).toFixed(0)}% of view`;
+    syncTrackRows();
   }
 
   /** Exact-mask paint for the captured viewpoint (full mask resolution). */
@@ -2700,6 +2785,7 @@ function initEditor(player) {
     const n = instances.length;
     const label = selected === "all" ? `${n} instance${n > 1 ? "s" : ""} (union)` : `#${selected + 1}/${n} · score ${instances[selected].score.toFixed(2)}`;
     samSelInfo.textContent = `"${samTextQuery}" · ${label} · ${samSel.ms} ms · ${((count / bits.length) * 100).toFixed(0)}% of view`;
+    syncTrackRows();
   }
 
   /** [All | 1 | 2 | …] chips, SEG_PALETTE-colored per instance (Meta SAM idiom) — click one to
@@ -2797,6 +2883,502 @@ function initEditor(player) {
     if (e.key === "Enter") { e.preventDefault(); samTextSearch(); }
     else if (e.key === "Escape") { e.preventDefault(); samTextInput.blur(); samSelClear(); }
   });
+
+  // ---- SAM video-tracker propagation (docs/sam-propagation-plan.md steps 5 and 6). apps/demo/
+  // track.js owns the algorithm — the frozen-camera sweep, the JPEG upload, the SSE consumer and
+  // the keyframe writer; everything below is wiring: three state-gated rail rows, K/N/Esc, and the
+  // correction loop's forced cancel -> re-seed -> re-run order (a prompt during a live run answers
+  // 409, track.py:782, so it cannot be sequenced any other way).
+  //
+  // What lands in the sidecar is ordinary mask2d bitmap keyframes with `derived: true`. Nothing new
+  // reaches the bake: keepPredicateAt, filterFrame, recolor and paint all inherit a time-varying
+  // region with zero encoder changes.
+  const trackRow = $("trackRow"), trackRunRow = $("trackRunRow"), trackFixRow = $("trackFixRow");
+  const trackInfo = $("trackInfo"), trackFixInfo = $("trackFixInfo");
+  const trackDirSel = $("trackDir"), trackSpanSel = $("trackSpan"), trackMaskSel = $("trackMaskRes");
+  let trackBusy = false;      // a run (or a correction re-run) is streaming
+  let trackOffer = null;      // a live service session found for this clip at load, awaiting Resume
+  // The last run's TERMINAL line — done, cancelled or failed. It has to outlive the run that
+  // produced it: the readout is written from inside the SSE `done` handler and the promise resolves
+  // in that same task, so the finally below re-gates the rows as a microtask with no paint in
+  // between and the result would never be seen. Cleared by the next track, correction or selection.
+  let trackLast = "";
+
+  /**
+   * Per-frame depth band for a derived keyframe. The seed's own band cannot be carried forward: it
+   * is an NDC z window measured at ONE frame, and a subject walking toward the camera leaves it
+   * within a few. Same recipe (and the same 384x384 raster) as samShowMask above.
+   *
+   * SYNCHRONOUS, which is why it can be a hook at all: pickRaster is a CPU rasterizer, not a GPU
+   * readback (player.ts:374), and track.js seeks the player to the frame before calling. An await
+   * here would let a later frame's keyframe land first.
+   *
+   * Null under X-ray, which is exactly samVolume's rule one screen up: X-ray means "select through
+   * the mesh", so banding the propagated region would contradict the seed the user committed.
+   */
+  function trackDepthAt({ w, h, rle }) {
+    if (xrayOn()) return null;
+    const pick = player.pickRaster(384, 384);
+    if (!pick) return null;
+    const bits = rleDecodeMask(rle, w * h);
+    const { buf } = pick;
+    let zmin = Infinity, zmax = -Infinity;
+    for (let y = 0; y < buf.h; y++) for (let x = 0; x < buf.w; x++) {
+      const mx = Math.floor((x / buf.w) * w), my = Math.floor((y / buf.h) * h);
+      if (!bits[my * w + mx]) continue;
+      const d = buf.depth[y * buf.w + x];
+      if (d !== Infinity) { if (d < zmin) zmin = d; if (d > zmax) zmax = d; }
+    }
+    return zmin === Infinity ? null : { zmin: zmin - 0.002, zmax: zmax + 0.002 };
+  }
+
+  /** One writer + one client per TRACK, not per tab: the writer keys its runs, its byFrame index
+   *  and its correction windows to one plan, and the client holds that track's service session. The
+   *  ctx made here before any run exists is the one health() and listSessions() probe through. */
+  const makeTrackCtx = () => {
+    const writer = createTrackWriter({
+      doc: edits,
+      newRangeId,
+      nextColor: nextSegColor,
+      applyRangeAction: setRangeAction,
+      onRangeCreated: (r) => { activeRange = r; syncRangeButtons(); },
+      // preview() is setEditPreview + saveEdits + renderRanges, so it must never run per keyframe;
+      // the writer already batches this to one call per 16 keyframes, and flushSave puts the
+      // sidecar on disk so a tab reload loses at most those 16 frames rather than the whole track.
+      //
+      // While a run streams, the setEditPreview half is deliberately SKIPPED. The client's freeze
+      // cleared the preview on purpose, and pickRaster reads the same edit-filtered curIndices the
+      // render does (player.ts:374): re-applying a live delete range at the first commit tick would
+      // hand trackDepthAt a raster with the tracked region already cut out, and every depth band
+      // from keyframe 16 on would come back null. The client's onRestore runs preview() once the
+      // freeze is undone; the timeline still repaints here, so the span grows as it streams.
+      onCommit: () => { if (trackBusy) renderRanges(); else preview(); flushSave(); },
+    });
+    const client = createTrackClient({
+      player, writer, doc: edits, clipBase,
+      onStatus: (s) => { trackInfo.textContent = s; },
+      onLog: (s) => aact(s),
+      // onProgress is left at its default no-op: onStatus already carries the same numbers as one
+      // readout line, and the rail has no second place to put a structured progress object.
+      getShade: () => window.__aresShade?.get() ?? "shaded",
+      // The freeze samples this and re-asserts it per capture. camKeyOf is the same formatter the
+      // pending selection is keyed by, so "the camera moved" means one thing across the whole file.
+      camKey: () => camKeyNow(),
+      // The freeze cleared the live edit preview (it would have rendered the subject's own hole and
+      // tracked that); preview() is the only thing that knows how to put the document's own back.
+      onRestore: () => preview(),
+      depthAt: trackDepthAt,
+    });
+    return { writer, client };
+  };
+  let trackCtx = makeTrackCtx();
+  const trackOwns = (r) => !!r && trackCtx.writer.ranges().includes(r);
+
+  /** The frames a run may touch: the kept clip window, or the active range's own span. Tracking
+   *  outside the trim is GPU spent on frames a bake drops. */
+  function trackSpanNow() {
+    const lo = Math.max(0, trimIn), hi = trimOutEff();
+    if (trackSpanSel.value === "range" && activeRange)
+      return { from: Math.max(lo, activeRange.startFrame), to: Math.min(hi, activeRange.endFrame) };
+    return { from: lo, to: hi };
+  }
+
+  /** Every derived keyframe of the active range's track, worst confidence first — what N lands on
+   *  and what the readout counts. A corrected frame is promoted to a user keyframe, so `derived`
+   *  is also the "not yet corrected" test. */
+  function trackDerived() {
+    const r = activeRange;
+    if (!r || !r.track) return [];
+    const id = r.track.trackId, obj = r.track.objId;
+    const out = [];
+    for (const rr of edits.ranges)
+      if (rr.track && rr.track.trackId === id && rr.track.objId === obj)
+        for (const k of rr.keyframes) if (k.derived) out.push(k);
+    return out.sort((a, b) => (a.conf ?? 1) - (b.conf ?? 1));
+  }
+
+  /**
+   * State gating, the hard rail law (the rail is clamped to 220-480 px and .railBody is its one
+   * scrolling container). The three rows are MUTUALLY EXCLUSIVE — one `state`, not three conditions
+   * that have to agree — and none carries more than four controls: a live run owns the panel, then
+   * an interrupted session's offer, then a tracked active range (the correction loop), then a
+   * pending selection (start a track). Critic gap 16.
+   */
+  function syncTrackRows() {
+    if (!trackWired) return;
+    const pending = !!(samSel && samSel.bits && !samSel.busy);
+    const r = activeRange, tracked = !!(r && r.track);
+    // ONE state, not three independent booleans that happen to agree: a live run, then an
+    // interrupted session's offer, then a tracked active range (which carries the last run's
+    // terminal line in its own readout), then a terminal line with no track to attach it to, then a
+    // pending selection. Exactly one row is ever displayed.
+    const state = trackBusy ? "busy" : trackOffer ? "offer" : tracked ? "fix" : trackLast ? "last" : pending ? "start" : "none";
+    trackRunRow.style.display = state === "busy" || state === "offer" || state === "last" ? "flex" : "none";
+    $("trackCancel").style.display = state === "busy" ? "" : "none";
+    $("trackResume").style.display = state === "offer" ? "" : "none";
+    $("trackDrop").style.display = state === "offer" ? "" : "none";
+    trackFixRow.style.display = state === "fix" ? "flex" : "none";
+    trackRow.style.display = state === "start" ? "flex" : "none";
+    if (state === "last") trackInfo.textContent = trackLast;
+    if (state !== "fix") return;
+    // Corrections need the writer that authored the track: its byFrame index is what bounds a
+    // window to [frame, nextUserKeyframe - 1] and what keeps a re-run from overwriting a user
+    // keyframe. A reload loses it, and the honest repair is Resume (replay rebuilds the writer),
+    // not a Nudge that would author a second, unbounded range.
+    const live = trackOwns(r);
+    const seeds = r.track.seeds ? r.track.seeds.length : 0;
+    const flagged = trackDerived().filter((k) => (k.conf ?? 1) < DRIFT_GATE).length;
+    $("trackNudge").disabled = $("trackReseed").disabled = !live || !pending;
+    // max_cond_frame_num is 4 in the checkpoint's tracker_config, so a fifth anchor evicts an
+    // earlier one via _select_closest_cond_frames. Surfaced, not hidden: past four seeds the right
+    // move is splitting the range, and Re-anchor is the escalation that rebuilds every anchor.
+    $("trackAnchor").style.display = live && seeds >= 3 ? "" : "none";
+    $("trackAnchor").disabled = !live;
+    // A terminal line outranks the summary: it is the result of the run the user just watched, and
+    // the correction row is the row that is on screen when a track lands or a Nudge fails.
+    trackFixInfo.textContent = trackLast || (seeds >= 5
+      ? `${Math.min(seeds, 4)} of ${seeds} seeds anchored · split the range`
+      : `track · ${seeds} seed${seeds === 1 ? "" : "s"} · ${flagged} flagged · ${r.track.trackRes} · obj ${r.track.objId}`
+        + (live ? "" : " · no live session"));
+  }
+
+  /** The seed prompt for the pending selection. A click selection carries points; a text/concept
+   *  selection carries none, so it seeds by MASK instead — add_inputs_to_inference_session takes
+   *  input_masks down its own branch and the library resizes it (track.py:869). */
+  const trackObjects = (objId) => (samSel.points.length
+    ? [{ objId, points: samSel.points.map((p) => [p[0], p[1]]), labels: samSel.labels.slice() }]
+    : [{ objId, mask: samSel.maskObj }]);
+
+  /** Every refusal before any GPU work, in track.js's own priority order, plus the two this file
+   *  owns: nothing pending, and a camera that has moved off the captured viewpoint (the prompts
+   *  live in that image, and the stored `camera` is what the bake re-projects through). */
+  async function trackRefusal() {
+    if (!samSel || !samSel.bits || samSel.busy) return "no pending selection · click an object first";
+    if (samSel.camKey !== camKeyNow()) return "camera moved · restore view";
+    // An empty mask is a TRUTHY object whose runs still sum to width*height, so neither the pending
+    // test above nor validateMasks catches it: it seeds the tracker with nothing, and in isolate
+    // mode one gap frame carrying it deletes the whole frame through keepPredicateAt. The commit
+    // path refuses this through the missing depth band; under X-ray there is no band to miss.
+    if (!maskIsSolid(samSel.maskObj)) return "mask covers only background: nothing selected";
+    // A cold service is brought up here, with SAM 3 installed first when absent, before preflight
+    // reads its health: the "not running" refusal can then only follow a start that failed, and
+    // that case reports its own reason.
+    let health = await trackCtx.client.health();
+    if (!player.isSplat() && (!health || !health.ok)) {
+      samSelRow.style.display = "flex";
+      samSelInfo.textContent = "SAM service starting…";
+      const started = await samAutoStart("track");
+      if (!started.ok) return "SAM service start failed: " + started.message;
+      health = await trackCtx.client.health();
+    }
+    return preflight({
+      health,
+      splat: player.isSplat(),
+      xfDefault: xfIsDefault(),
+      // A keyframed fx track overrides the live controls every frame, so identity sliders alone
+      // are not proof: edits.fx present means the shader is displacing and discarding on its own.
+      fxIdentity: isFxIdentity(readFxControls()) && !edits.fx,
+    });
+  }
+
+  /**
+   * K / the Track button. ONE gestureBegin/gestureCommit pair around the whole run, so a 272-frame
+   * track collapses to a single Ctrl+Z even though its keyframes land as they stream (plan
+   * Decisions #1). The run stays interactive on purpose: an interactive click interleaves at about
+   * one frame (measured 219/236/181 ms while a run streamed), so the UI is never locked.
+   */
+  async function startTrack() {
+    if (trackBusy) return;
+    // The busy flag goes up BEFORE the first await, not after: trackRefusal GETs /sam/health and the
+    // close below POSTs, and both K and the Track button enter here — two presses inside that window
+    // would open two sessions against a service that holds two, sweep the clip twice, and leave the
+    // first client unreachable to Cancel. Every early return below puts it back down.
+    trackBusy = true;
+    trackLast = "";
+    syncTrackRows();
+    const done = (line) => { trackBusy = false; samSelRow.style.display = "flex"; samSelInfo.textContent = line; syncTrackRows(); };
+    const refuse = await trackRefusal();
+    // Force the row open the way samClick's own health gate does: K can be pressed with nothing
+    // pending, and a refusal written into a display:none span is a key that does nothing.
+    if (refuse) { done(refuse); return; }
+    const span = trackSpanNow();
+    const seedFrame = Math.max(span.from, Math.min(span.to, curFrame()));
+    const dir = trackDirSel.value;
+    // Only the frames the run can actually reach are swept: forward never looks before the seed.
+    const from = dir === "forward" ? seedFrame : span.from;
+    const to = dir === "reverse" ? seedFrame : span.to;
+    // Names the real condition: the span can be the whole clip and still have nothing to propagate,
+    // because the direction narrowed it to the side of the seed the playhead is already sitting on.
+    if (to <= from) { done(`seed at ${seedFrame} · no frames ${dir === "reverse" ? "before" : "after"} it in the span`); return; }
+    const isolate = samActSel.value === "isolate";
+    // Retire the previous track's frame store under its clip+camera+res+size key before dropping
+    // the session: an identical retrack then skips the sweep entirely (track.py:478).
+    await trackCtx.client.close({ keepFrames: true });
+    trackCtx = makeTrackCtx();
+    // Answered by starting a new track, and cleared only once the refusals are past — a K that
+    // refuses must not silently discard an interrupted session's offer. Nothing else clears it,
+    // which is what let a stale Resume sit on top of the row a finished run selected.
+    trackOffer = null;
+    samSelRow.style.display = "none";
+    syncTrackRows();
+    trackInfo.textContent = captureLine(0, to - from + 1);
+    gestureBegin();
+    try {
+      await trackCtx.client.run({
+        clip: clipBase, camKey: camKeyNow(), frames: frameTotal(),
+        from, to, seedFrame, dir,
+        mode: isolate ? "keep" : "delete",
+        action: isolate ? "delete" : samActSel.value,
+        color: activeSegColor(),
+        camera: samSel.cam, capture: samSel.capture,
+        seedMask: samSel.maskObj,
+        seedDepth: !xrayOn() && samSel.depth ? samSel.depth : null,
+        maskRes: Number(trackMaskSel.value) || MASK_RES_DEFAULT,
+        objects: trackObjects(1),
+      });
+      samSelClear();
+    } catch (err) {
+      trackInfo.textContent = "track failed: " + (err && err.message ? err.message : err);
+    } finally {
+      trackBusy = false;
+      // The run's own done/cancelled line, or the failure written just above. syncTrackRows shows it
+      // in whichever row the new state selects; without it the row carrying the result is hidden in
+      // the same task the result becomes final.
+      trackLast = trackInfo.textContent;
+      gestureCommit();
+      preview();
+      // A failed run leaves the selection pending and still committable by hand, so its row comes
+      // back; a finished one cleared it above and there is nothing to show.
+      if (samSel && samSel.bits) samSelRow.style.display = "flex";
+      syncTrackRows();
+    }
+  }
+
+  /** Esc / Cancel. The POST goes before the EventSource close inside the client; every mask already
+   *  emitted is already a keyframe, so a cancel leaves a shorter but valid track. */
+  async function cancelTrack() {
+    if (!trackBusy) return;
+    await trackCtx.client.cancel();
+  }
+
+  /**
+   * Step 6's correction loop. Both operations are bounded to [frame, nextUserKeyframe - 1] and only
+   * replace DERIVED keyframes inside it — Mocha's AdjustTrack rule: corrections are a sparse layer
+   * over a dense automatic result, never an in-place overwrite of it.
+   *
+   * The input is the ordinary SAM click flow: scrub (or press N) to the drifted frame, click the
+   * object with the SAM tool, then Nudge (accumulate the point on the same object) or Re-seed (a
+   * fresh objId, which is the only thing that genuinely restarts the memory bank, because
+   * is_init_cond_frame is `frame_idx not in frames_tracked_per_obj[obj_idx]` and an already-tracked
+   * frame fails it).
+   */
+  async function correctTrack(kind) {
+    const r = activeRange;
+    if (trackBusy || !r || !r.track || !trackOwns(r)) return;
+    if (!samSel || !samSel.bits || samSel.busy) { trackFixInfo.textContent = "no pending selection · click the object at this frame"; return; }
+    if (camKeyOf(r.track.camera) !== camKeyNow()) { trackFixInfo.textContent = "camera moved · restore view"; return; }
+    const frame = curFrame();
+    // Re-seed allocates an objId the tracker has never seen; Nudge accumulates on the tracked one.
+    // `fromObjId` is the object being corrected either way: the retired one cannot be removed from
+    // the inference session (the library has no per-object removal, track.py:778), so the window is
+    // cleared on it and the new id refills ITS ranges rather than authoring a second overlapping set
+    // the bake would union with the drift still in it.
+    const objId = kind === "reseed" ? nextTrackObjId() : r.track.objId;
+    trackBusy = true;
+    trackLast = "";
+    syncTrackRows();
+    gestureBegin();
+    try {
+      await trackCtx.client.correct({
+        frame, objId, fromObjId: r.track.objId, kind, dir: "forward",
+        objects: trackObjects(objId),
+        capture: samSel.capture, proxy: r.track.proxy,
+        // The correction's OWN mask for the corrected frame. A Nudge is non-conditioning on an
+        // already-tracked frame, so the re-run starts at frame + 1 and never re-emits it: without
+        // this the promoted user keyframe would keep the exact mask the Nudge rejected, and a user
+        // keyframe is what every later run and every rebase refuse to overwrite.
+        volumes: [samVolume()],
+      });
+      samSelClear();
+    } catch (err) {
+      // Into the row this operation refuses into and which stays visible after it finishes —
+      // #trackInfo belongs to the run row, which is hidden the moment trackBusy drops.
+      trackFixInfo.textContent = "track failed: " + (err && err.message ? err.message : err);
+      trackLast = trackFixInfo.textContent;
+    } finally {
+      trackBusy = false;
+      gestureCommit();
+      preview();
+      syncTrackRows();
+    }
+  }
+  /** Monotonic within the tab, and never 1: obj 1 is the seed of every track this session started,
+   *  and a Re-seed whose id the tracker has already tracked is just a Nudge with extra steps. */
+  let trackObjSeq = 1;
+  const nextTrackObjId = () => ++trackObjSeq;
+
+  /** Escalation, when three Nudges have not held: rebuild the session from every seed in frame
+   *  order so each one becomes a true conditioning frame, then re-propagate the window. Costs the
+   *  re-encode of the window and nothing else — the service still holds every uploaded JPEG. */
+  async function reanchorTrack() {
+    const r = activeRange;
+    if (trackBusy || !r || !r.track || !trackOwns(r)) return;
+    trackBusy = true;
+    trackLast = "";
+    syncTrackRows();
+    gestureBegin();
+    try {
+      await trackCtx.client.reanchor({
+        clip: clipBase, camKey: camKeyNow(), frames: frameTotal(),
+        seeds: r.track.seeds || [], proxy: r.track.proxy, maskRes: r.track.maskRes,
+        from: r.track.span.from, to: r.track.span.to, dir: "forward",
+      });
+    } catch (err) {
+      // The correction row, for the same reason as correctTrack: it is the row this operation
+      // refuses into and the one still on screen once the run ends.
+      trackFixInfo.textContent = "track failed: " + (err && err.message ? err.message : err);
+      trackLast = trackFixInfo.textContent;
+    } finally {
+      trackBusy = false;
+      gestureCommit();
+      preview();
+      syncTrackRows();
+    }
+  }
+
+  /** N: jump to the lowest-confidence frame of the active track that has not been corrected yet.
+   *  XMem++'s annotation-candidate selector, built from the conf the tracker already reports. The
+   *  playhead's own frame is skipped so pressing N twice advances instead of sticking. */
+  function jumpWorstFrame() {
+    // Gated like the other three operations: during a run the client is seeking per frame, so the
+    // jump is overwritten within one frame and the readout lands in a hidden row.
+    if (trackBusy) return;
+    const worst = trackDerived();
+    if (!worst.length) return;
+    const f = curFrame();
+    const k = worst.find((x) => x.frame !== f) || worst[0];
+    tlSeek(k.frame);
+    // The gate is the SAME one the timeline caret and the `N flagged` count read, and one `?? 1`
+    // default throughout: printing "drift gate tripped" for a 0.99 frame contradicts a timeline
+    // that is drawing no caret anywhere.
+    const conf = k.conf ?? 1;
+    trackLast = "";                          // reviewing the track answers its terminal line
+    trackFixInfo.textContent = conf < DRIFT_GATE
+      ? `drift gate tripped @ ${k.frame} · conf ${conf.toFixed(2)}`
+      : `no drift · worst @ ${k.frame} · conf ${conf.toFixed(2)}`;
+  }
+
+  /**
+   * REATTACHMENT. A tab that reloaded mid-run left a session holding the model lock and an event
+   * log the service will happily replay, so offer it rather than silently opening a second one
+   * against a service that only holds two.
+   *
+   * The replay ADOPTS the ranges the interrupted run already flushed rather than dropping them: the
+   * writer refills them by frame, so replaying the offered run over them is idempotent, while
+   * dropping them would destroy work the event log cannot reproduce. track_run clears the event log
+   * and bumps run_id on every request (track.py:975-976), so a bidirectional track's offered run is
+   * the REVERSE leg alone — the forward leg's frames exist nowhere but the sidecar.
+   * /track/results is indexed by EVENT INDEX pinned to `run`, not by frame.
+   */
+  async function trackScanSessions() {
+    if (trackBusy) return;
+    let list = null;
+    try { list = await trackCtx.client.listSessions(); } catch { return; }
+    // Only an INTERRUPTED run is worth offering: "running" is a stream this tab no longer holds
+    // (a second GET /run would 409, so /results is the only way to follow it) and "stranded" is one
+    // the idle reaper cancelled after 30 s with no reader, events kept. An "idle" session is a run
+    // that finished cleanly and is already in the sidecar (track.py:385).
+    const sess = (list?.sessions || []).find(
+      (s) => s.clip === clipBase && s.events > 0 && (s.state === "running" || s.state === "stranded"));
+    if (!sess) return;
+    trackOffer = sess;
+    trackInfo.textContent = `track session ${sess.session} · ${sess.events} events · ${sess.state}`;
+    syncTrackRows();
+  }
+  async function resumeTrack() {
+    const sess = trackOffer;
+    if (!sess || trackBusy) return;
+    // The camera the sweep was frozen under IS the session's camKey, and every mask2d volume the
+    // replay writes projects through it. Without a range from that track still in the document
+    // there is nothing to recover the aspect and the palette colour from, and a replay under a
+    // guessed camera would author masks that select the wrong triangles at bake time.
+    //
+    // Matched on camKey as well as objId, then narrowed to ONE trackId: every track this session
+    // starts seeds obj 1 (trackObjects(1) below), so objId alone also matches a COMPLETED track of
+    // the same clip — whose camera and mode would then be stamped onto every mask the replay writes.
+    // Two tracks under one viewpoint is guesswork either way, so it refuses instead.
+    const camMatch = edits.ranges.filter(
+      (r) => r.track && r.track.camera && sess.objIds.includes(r.track.objId) && camKeyOf(r.track.camera) === sess.camKey);
+    const ids = [...new Set(camMatch.map((r) => r.track.trackId))];
+    if (!camMatch.length) { trackInfo.textContent = "track session has no ranges in this sidecar · discard it"; return; }
+    if (ids.length > 1) { trackInfo.textContent = `track session matches ${ids.length} tracks · discard it`; return; }
+    const prior = camMatch;
+    const p = prior[0].track;
+    trackOffer = null;
+    trackBusy = true;
+    trackLast = "";
+    syncTrackRows();
+    gestureBegin();
+    try {
+      activeRange = null;
+      trackCtx = makeTrackCtx();
+      trackCtx.writer.begin({
+        seedFrame: p.seeds?.[0]?.frame ?? p.span.from, from: p.span.from, to: p.span.to,
+        mode: prior[0].mode, action: prior[0].action ?? "delete", color: prior[0].color,
+        camera: p.camera, proxy: p.proxy, seedMask: null,
+        trackId: p.trackId, checkpoint: p.checkpoint, dtype: p.dtype,
+        trackRes: p.trackRes, maskRes: p.maskRes, objIds: [p.objId], ranAt: p.ranAt,
+      });
+      // The ranges stay in the document and the writer takes them over: the replay refills them by
+      // frame, and the frames it cannot reproduce — a completed forward leg, whose events the
+      // reverse leg's run already wiped — are exactly the ones that must not be dropped.
+      trackCtx.writer.adopt(prior);
+      // Back to the viewpoint the sweep was frozen under, the camGo recipe: autoOrbit off first
+      // (setCamera does not touch it and an orbiting camera would walk off the frame within a
+      // second), then the projection, which is the call that repaints.
+      player.autoOrbit = false; $("orbit").setAttribute("aria-pressed", "false");
+      player.setCamera(p.camera);
+      player.setOrtho(!!p.camera.ortho);
+      await trackCtx.client.replay({ session: sess.session, run: sess.run, from: 0 });
+      const st = trackCtx.writer.end();
+      // replay() reports through onProgress, which is a no-op here, so the offer line would otherwise
+      // still be on screen when the resume finishes.
+      trackInfo.textContent = `track resumed · ${st.kf} kf · ${st.ranges} range${st.ranges === 1 ? "" : "s"} · obj ${p.objId}`;
+    } catch (err) {
+      trackInfo.textContent = "track failed: " + (err && err.message ? err.message : err);
+    } finally {
+      trackBusy = false;
+      trackLast = trackInfo.textContent;
+      gestureCommit();
+      preview();
+      syncTrackRows();
+    }
+  }
+  async function dropTrackSession() {
+    const sess = trackOffer;
+    trackOffer = null;
+    syncTrackRows();
+    if (!sess) return;
+    // Straight to the route rather than through the client: the offered session belongs to the tab
+    // that died, not to this tab's client. keepFrames retires its JPEGs under their clip+camera key
+    // for the reaper's 10 minutes, so the retrack that usually follows a discard skips the sweep.
+    await fetch("/sam/track/close", {
+      method: "POST", headers: { "content-type": "application/json" },
+      body: JSON.stringify({ session: sess.session, keepFrames: true }),
+    }).catch(() => {});
+  }
+
+  $("trackGo").onclick = startTrack;
+  $("trackCancel").onclick = cancelTrack;
+  $("trackResume").onclick = resumeTrack;
+  $("trackDrop").onclick = dropTrackSession;
+  $("trackNudge").onclick = () => correctTrack("nudge");
+  $("trackReseed").onclick = () => correctTrack("reseed");
+  $("trackAnchor").onclick = reanchorTrack;
+  $("trackWorst").onclick = jumpWorstFrame;
+  trackWired = true;
+  syncTrackRows();
+  trackScanSessions();
 
   // ---- Selection operators: grow / shrink / invert / mirror on the ▶ active range's regions.
   // One brush radius per step (the slider already states the unit); masks get the matching pixels.
@@ -3033,10 +3615,15 @@ function initEditor(player) {
   $("rangeEnd").onclick = () => {
     if (!activeRange) return;
     doMutation(() => {
-      activeRange.endFrame = Math.max(curFrame(), activeRange.startFrame);
+      // A PROPAGATED range already ends exactly where its last keyframe does. Clamping that to the
+      // playhead would silently disable every frame of the track past it (keepPredicateAt reads
+      // startFrame/endFrame), so on a tracked range ■ only deselects — which is also the way to put
+      // the rail back into "start a new track" state.
+      if (!activeRange.track) activeRange.endFrame = Math.max(curFrame(), activeRange.startFrame);
       activeRange = null;
     });
     $("rangeStart").disabled = false; $("rangeKey").disabled = true; $("rangeEnd").disabled = true;
+    syncTrackRows();
     preview();
   };
 
@@ -3098,7 +3685,7 @@ function initEditor(player) {
     if (edits.ranges.length || trimmed) {
       // flush the sidecar synchronously so the encoder reads the latest state
       clearTimeout(saveTimer);
-      await fetch("/edits/" + clipBase, { method: "POST", body: JSON.stringify(edits, null, 1) }).catch(() => {});
+      await fetch("/edits/" + clipBase, { method: "POST", body: editsBody() }).catch(() => {});
       q.set("editsName", clipBase);
     }
     log.textContent = "▶︎ baking…\n";
@@ -3138,6 +3725,10 @@ function initEditor(player) {
   // for Space/arrows/tool letters too, so it stays the single keydown listener for the whole app.
   return { undo, redo, deleteActiveRange, flushSave, hasPendingSamSelection, commitSamSelection,
     commitPendingSelectionOrRemoveRow,
+    // SAM propagation (K / N / Esc). trackRunning gates Esc's precedence branch: a live run has to
+    // outrank "back to navigate", or the only way to stop an 83-second sweep is the rail button.
+    trackStart: startTrack, trackCancel: cancelTrack, trackWorst: jumpWorstFrame,
+    trackRunning: () => trackBusy,
     // Read-only views the viewport context menu needs; it is built in main(), outside this closure.
     samSelClear, getTool: () => tool, activeRange: () => activeRange };
 }
@@ -3355,9 +3946,10 @@ async function main() {
     ["1 3 7", "front / right / top (Ctrl = opposite)"], ["F", "focus the subject"], ["O", "auto-orbit"], ["U", "mute / unmute audio"], ["L", "lock the view"], ["P", "perspective / ortho"], ["G", "ground grid"],
     ["Z", "cycle shading: shaded · unlit · clay · wire · normals · uv · depth · points"], ["Shift+W", "wireframe"], ["Shift+E", "collapse the Edit rail"], ["Shift+R", "crop guides"],
     ["V / Q", "navigate"], ["M", "box select"], ["B", "brush"], ["S", "SAM select"], ["A", "lasso"], ["T", "measure"], ["X", "x-ray"],
+    ["K", "track the SAM selection across the span"], ["N", "jump to the lowest-confidence frame of the active track"],
     ["W E R", "move / rotate / scale the model"], ["X Y Z (held)", "constrain a transform drag"],
     ["= / −", "grow / shrink the active range (Shift 5×)"], ["I", "invert the active delete range"], ["C", "cycle camera bookmarks"],
-    ["Ctrl+Z / Ctrl+Y", "undo / redo"], ["Ctrl+S", "save the sidecar now"], ["Delete", "commit a pending SAM selection as delete, else remove the active range"], ["Esc", "back to navigate; leave a tool tab; close this panel"], ["?", "this panel"],
+    ["Ctrl+Z / Ctrl+Y", "undo / redo"], ["Ctrl+S", "save the sidecar now"], ["Delete", "commit a pending SAM selection as delete, else remove the active range"], ["Esc", "cancel a live track; back to navigate; leave a tool tab; close this panel"], ["?", "this panel"],
     ["Right-click", "viewport menu: commit a selection, switch tool, view and range actions"],
   ];
   const keysPanel = document.createElement("div");
@@ -3512,6 +4104,12 @@ async function main() {
       case "m": case "M": clickTool("sbox"); break;
       case "b": case "B": clickTool("brush"); break;
       case "s": case "S": clickTool("sam"); break;
+      // K and N are the two bare letters the switch above never claimed (Shift+S is NOT free —
+      // `case "s": case "S"` already takes it, which is why the plan's earlier Shift+S was dead).
+      // K propagates the pending selection across the span; N is XMem++'s annotation-candidate
+      // jump, landing the playhead on the lowest-conf frame of the active track.
+      case "k": case "K": expandRail(); editorApi.trackStart(); break;
+      case "n": case "N": editorApi.trackWorst(); break;
       case "a": case "A": clickTool("lasso"); break;
       case "t": case "T": clickTool("measure"); break;
       case "i": case "I": window.__aresSel?.invert(); break;
@@ -3532,6 +4130,10 @@ async function main() {
       case "p": case "P": window.__aresProj.set(window.__aresProj.get() === "ortho" ? "persp" : "ortho"); break;
       case "Escape":
         if (window.__aresKeys?.isOpen()) { window.__aresKeys.toggle(); break; }
+        // A live track outranks "back to navigate": the run is 83 s for 272 frames and the cancel
+        // is cooperative (POST /track/cancel goes before the EventSource close). Every mask already
+        // emitted is already a keyframe, so this leaves a shorter but valid track.
+        if (editorApi.trackRunning()) { editorApi.trackCancel(); break; }
         expandRail(); document.querySelector('#editPanel .tool[data-tool="nav"]')?.click(); break;
       case "Delete": case "Backspace": e.preventDefault(); editorApi.commitPendingSelectionOrRemoveRow(); break;
     }
