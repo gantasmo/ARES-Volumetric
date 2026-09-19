@@ -1457,6 +1457,7 @@ data: ${JSON.stringify(data)}
 
     const name = await versionedOutName(join(ROOT, "apps", "demo"), rawName); // auto -vN, never overwrite
     const outRel = `apps/demo/${name}.ares`;
+    const outAbs = join(ROOT, outRel);   // was undeclared: every .4ds convert died at the encode stage with "outAbs is not defined"
 
     res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
     const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
