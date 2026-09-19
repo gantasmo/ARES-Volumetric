@@ -27,7 +27,10 @@ let setClipSeg = () => {};
  */
 let lastClipKey = "";
 export function setDiagClip(c) {
-  const key = c ? `${c.name}|${(c.sizeMB || 0).toFixed(1)}|${c.frames}` : "";
+  // fps is in the key because it is the one field that arrives LATE: renderHUD fires once from
+  // inside AresPlayer.create(), before main.js assigns window.__ares, so that first call carries
+  // the 30 fallback. Without fps here the key latches on it and a 24 fps clip reads 30 forever.
+  const key = c ? `${c.name}|${(c.sizeMB || 0).toFixed(1)}|${c.frames}|${c.fps}` : "";
   if (key === lastClipKey) return;
   lastClipKey = key;
   setClipSeg(c);

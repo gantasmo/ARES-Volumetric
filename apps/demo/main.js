@@ -13,6 +13,13 @@ const canvas = $("view");
 // Default = the current keeper recipe (user verdict 2026-07-10: smooth 0 — "much less warping").
 const SRC = new URLSearchParams(location.search).get("src") || "daniel-s0.ares";
 
+// The CLIP's frame rate, for the readouts that live outside initEditor's `player` scope. Every
+// frame↔seconds conversion in this app divides by this and never by PlayerStats.fps, which is the
+// rolling RENDER-rate EMA — a 24 fps clip on a 144 Hz screen would otherwise report a duration off by
+// 6×. The 30 is only reachable before the player exists: renderHUD fires once from inside
+// AresPlayer.create(), before window.__ares is assigned.
+const clipFps = () => window.__ares?.getClipFps?.() || 30;
+
 // A/B source switcher — the person with eyes decides which looks best.
 // Smoothing sweep at the same recipe (oct16 normals + AV1): s0..s3 differ ONLY in Taubin passes.
 // v1 = untouched original for reference. Switching sources carries your camera + timestamp so the
@@ -36,7 +43,7 @@ function navTo(src) {
   let q = "?src=" + src;
   if (p) {
     const st = p.getStats(), cam = p.getCamera();
-    q += "&t=" + (st.frameIndex / 30).toFixed(3);
+    q += "&t=" + (st.frameIndex / p.getClipFps()).toFixed(3);
     q += "&cam=" + [cam.azimuth, cam.elevation, cam.distance, cam.target[0], cam.target[1], cam.target[2]].map((v) => v.toFixed(4)).join("_");
     q += "&paused=" + (p.isPlaying ? "0" : "1");
   }
@@ -727,7 +734,7 @@ function renderHUD(s) {
   // changed, so calling it on every stats tick is free.
   diagMod?.setDiagClip({
     name: (SRC || "").replace("./", ""),
-    sizeMB: aresTotalMB, frames: s.frameCount, fps: 30, durationS: s.frameCount / 30,
+    sizeMB: aresTotalMB, frames: s.frameCount, fps: clipFps(), durationS: s.frameCount / clipFps(),
   });
 
   // THIS clip's real origin, from its own provenance. Everything below prefers it over BASE.
@@ -820,7 +827,7 @@ function renderHUD(s) {
       else if (m.pipeline) prov = String(m.pipeline);
       else prov = `<span style="color:var(--text-faint)">no recipe sidecar</span>`;
       host.innerHTML =
-        rl("size", `<b>${sizeMB(aresTotalMB)}</b> · ${s.frameCount}f · ${(s.frameCount / (s.fps || 30)).toFixed(1)}s`) +
+        rl("size", `<b>${sizeMB(aresTotalMB)}</b> · ${s.frameCount}f · ${(s.frameCount / clipFps()).toFixed(1)}s`) +
         rl("split", `geom ${aresGeomMB.toFixed(1)} + tex ${aresTexMB.toFixed(1)} MB`) +
         (hasVideo ? rl("texture", `${texShort} · HW`) : "") +
         (s.audioLabel && s.audioLabel !== "none" ? rl("audio", s.audioLabel) : "") +
@@ -834,8 +841,8 @@ function renderHUD(s) {
 
   // Transport readout. The scrub SLIDER is gone — the timeline strip is the scrubber now, and it
   // moves itself (tlWatch's rAF), so there is nothing to push here but the numbers.
-  const dur = s.frameCount / 30;
-  $("time").textContent = `${s.frameIndex + 1}/${s.frameCount} · ${((s.frameIndex + 1) / 30).toFixed(2)}s / ${dur.toFixed(1)}s`;
+  const dur = s.frameCount / clipFps();
+  $("time").textContent = `${s.frameIndex + 1}/${s.frameCount} · ${((s.frameIndex + 1) / clipFps()).toFixed(2)}s / ${dur.toFixed(1)}s`;
 
   // The headline: THIS clip vs the raw source THIS clip came from. When we have provenance it names
   // the origin and the ratio is a real measurement ÷ a real measurement; when we don't, it says so
@@ -1032,7 +1039,9 @@ function initEditor(player) {
   // ---- Timeline-ranged deletion (editor v2 §6/§11): the box sliders author DELETE keyframes while
   // a range session is active; regions interpolate between keyframes; preview == bake (shared rule).
   const clipBase = SRC.replace("./", "").replace(/\.ares$/i, "");
-  const edits = { aresEdits: 1, source: SRC.replace("./", ""), fps: 30, frameCount: 0, ranges: [] };
+  // `fps` comes from the loaded file's own header, not a literal: the sidecar is the bake's input, and
+  // a 24 fps clip carrying `fps: 30` is a document that disagrees with the .ares it names.
+  const edits = { aresEdits: 1, source: SRC.replace("./", ""), fps: player.getClipFps(), frameCount: 0, ranges: [] };
   let activeRange = null;
   let saveTimer = 0;
   const doSave = () => fetch("/edits/" + clipBase, { method: "POST", body: JSON.stringify(edits, null, 1) }).catch(() => {});
@@ -1617,11 +1626,11 @@ function initEditor(player) {
     const kept = trimOutEff() - trimIn + 1;
     const el = $("trimRead");
     if (el) {
-      el.textContent = trimIsFull() ? "full" : `${trimIn}–${trimOutEff()} · ${kept}f · ${(kept / 30).toFixed(2)}s`;
+      el.textContent = trimIsFull() ? "full" : `${trimIn}–${trimOutEff()} · ${kept}f · ${(kept / player.getClipFps()).toFixed(2)}s`;
       el.classList.toggle("on", !trimIsFull());
       el.title = trimIsFull()
         ? "No trim, the whole clip plays and bakes."
-        : `Trimmed to source frames ${trimIn}–${trimOutEff()} (${kept} of ${total} frames, ${(kept / 30).toFixed(2)}s). Playback loops inside this window and a bake encodes only it; the dimmed frames are dropped, and edit ranges shift onto the new numbering.`;
+        : `Trimmed to source frames ${trimIn}–${trimOutEff()} (${kept} of ${total} frames, ${(kept / player.getClipFps()).toFixed(2)}s). Playback loops inside this window and a bake encodes only it; the dimmed frames are dropped, and edit ranges shift onto the new numbering.`;
     }
     if (save) saveEdits();
     renderRanges();
@@ -1650,7 +1659,7 @@ function initEditor(player) {
     const total = frameTotal();
     return Math.max(0, Math.min(total - 1, Math.round(((clientX - rect.left) / Math.max(1, rect.width)) * total - 0.5)));
   }
-  const tlSeek = (f) => { player.pause(); $("play").textContent = "▶︎"; player.seek(f / 30); tlLastF = -1; };
+  const tlSeek = (f) => { player.pause(); $("play").textContent = "▶︎"; player.seekFrame(f); tlLastF = -1; };
   // Playhead follows the presented frame (rAF, cheap: one style write when the frame changes).
   (function tlWatch() {
     requestAnimationFrame(tlWatch);
@@ -3286,7 +3295,9 @@ async function main() {
   //  W wireframe · O orbit (no-op while locked) · Esc back to Nav · Delete/Backspace: with a
   //  pending SAM selection, commits it as a delete range; otherwise removes the active (▶) range
   //  row (only when not typing in an input)
-  const holdAt = (sec) => { player.pause(); $("play").textContent = "▶︎"; player.seek(sec); };
+  // Frame-indexed, not seconds: stepping is an integer operation on the frame the HUD is showing, and
+  // routing it through seconds made every step on a non-30 fps clip land on the wrong frame.
+  const holdFrame = (f) => { player.pause(); $("play").textContent = "▶︎"; player.seekFrame(f); };
   window.addEventListener("keydown", (e) => {
     const ctrl = e.ctrlKey || e.metaKey;
 
@@ -3315,7 +3326,7 @@ async function main() {
 
     const st = player.getStats();
     const n = Math.max(1, st.frameCount);
-    const step = (d) => holdAt((((st.frameIndex + d) % n + n) % n) / 30);
+    const step = (d) => holdFrame(((st.frameIndex + d) % n + n) % n);
     const rail = $("editPanel");
     // A collapsed rail hides its buttons behind a ~30px strip (display:none on .railBody) — a
     // shortcut that changes tool state must expand it first, or the change is invisible until the
@@ -3329,8 +3340,8 @@ async function main() {
       case " ": e.preventDefault(); $("play").click(); break;
       case "ArrowLeft": e.preventDefault(); step(e.shiftKey ? -10 : -1); break;
       case "ArrowRight": e.preventDefault(); step(e.shiftKey ? 10 : 1); break;
-      case "Home": e.preventDefault(); holdAt(0); break;
-      case "End": e.preventDefault(); holdAt((n - 1) / 30); break;
+      case "Home": e.preventDefault(); holdFrame(0); break;
+      case "End": e.preventDefault(); holdFrame(n - 1); break;
       // Clip trim in/out at the playhead — the NLE convention, and the two glyphs on the buttons.
       case "[": e.preventDefault(); window.__aresTrim?.setIn(); break;
       case "]": e.preventDefault(); window.__aresTrim?.setOut(); break;

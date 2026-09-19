@@ -55,6 +55,9 @@ async function loadVariants() {
 
 let A = null, B = null;
 let raf = 0, playing = true, t = 0, lastNow = 0, duration = 9.07, frameCount = 272, orbitOn = false;
+// A's CLIP fps, read from its header the moment it loads. Never a hardcoded 30: this pane drives
+// both players off one seconds clock, so a wrong divisor scrubs to the wrong frame in BOTH.
+let clipFps = 30;
 
 function fitBoth() {
   const dpr = Math.min(2, window.devicePixelRatio || 1);
@@ -83,7 +86,8 @@ async function createA(src) {
   if (cam) A.setCamera(cam);
   applyCmpShade();
   frameCount = A.getStats().frameCount;
-  duration = frameCount / 30;
+  clipFps = A.getClipFps();
+  duration = frameCount / clipFps;
   // Frame-accurate transport (same law as the viewer): the scrub value IS A's frame index.
   const scrub = $("cmpScrub");
   scrub.max = String(Math.max(1, frameCount - 1));
@@ -122,7 +126,7 @@ function drive(now) {
     if (B) B.setCamera(A.getCamera());
     A.seek(t);
     B?.seek(t);
-    const f = Math.min(frameCount - 1, Math.floor(t * 30 + 1e-6));
+    const f = Math.min(frameCount - 1, Math.floor(t * clipFps + 1e-6));
     const scrub = $("cmpScrub");
     if (!scrub.matches(":active")) scrub.value = String(f);
     $("cmpTime").textContent = `${f + 1}/${frameCount} · ${t.toFixed(2)}s / ${duration.toFixed(2)}s`;
@@ -192,7 +196,7 @@ export async function initCompare() {
   };
   $("cmpScrub").oninput = (e) => {
     if (playing) { playing = false; $("cmpPlay").textContent = "Play"; }
-    t = Number(e.target.value) / 30;   // value IS the frame index; core's seek guard makes k/30 exact
+    t = Number(e.target.value) / clipFps;   // value IS the frame index; core's seek guard makes k/fps exact
   };
   wireWipe();
   window.addEventListener("resize", fitBoth);
