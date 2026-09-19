@@ -12,11 +12,11 @@ import { decodeGeometryBlock, decodePFrameBlock, decodeSplatBlock, decodeSplatPB
 import { BlockType, GeometryProfile } from "./format.js";
 import { dequantScale, type Aabb } from "./quant.js";
 import { WebGPURenderer } from "./renderer.js";
-import { WebGL2Renderer, type AresRenderer, type SplatParams } from "./renderer-gl2.js";
+import { WebGL2Renderer, reliefFromMeta, type AresRenderer, type SplatParams, type ReliefDiscard } from "./renderer-gl2.js";
 import { WorkerGeometryDecoder, type WorkerDecodeResult } from "./worker-decode.js";
 import { keepPredicateAt, filterIndicesByPredicate, type EditList } from "./edits.js";
 import { rasterizeIds, type IdBuffer } from "./raster.js";
-import { orbitViewProj, orbitMatrices, orbitViewHeight, multiply, type OrbitState } from "./camera.js";
+import { orbitViewProj, orbitMatrices, orbitViewHeight, multiply, ORBIT_FOV_DEG, type OrbitState } from "./camera.js";
 import { SplatSorter } from "./splat-sort.js";
 import type { DecodedSplat } from "./splat.js";
 import { FX_DEFAULTS, packFx, mergeFx, evalFxTrack, type FxParams, type FxTrack } from "./fx.js";
@@ -135,6 +135,7 @@ export class AresPlayer {
     this.splat = file.header.geometryProfile === GeometryProfile.SplatIPB;
     this.autoOrbit = opts.autoOrbit !== false;
     this.frameToAabb(file.superblock.aabb);
+    this.frameRelief();
     // Size the origin tripod to the clip. A capture is a person either way, but "a person" is ~1700
     // world units in a mm clip and ~1.7 in a metre one; the old fixed 300 was invisible in one and a
     // set of arms across the whole scene in the other.
@@ -161,16 +162,18 @@ export class AresPlayer {
   isOrtho(): boolean { return !!this.orbit.ortho; }
 
   /** Snapshot the orbit camera (for carrying a viewpoint across source switches / A-B compares). */
-  getCamera(): { azimuth: number; elevation: number; distance: number; target: [number, number, number]; ortho?: boolean } {
+  getCamera(): { azimuth: number; elevation: number; distance: number; target: [number, number, number]; ortho?: boolean; fov?: number } {
     const o = this.orbit;
-    // `ortho` rides along: hosts feed this straight back into orbitViewProj (the crop guides do),
-    // and dropping it there would silently project through a different camera than the renderer.
-    return { azimuth: o.azimuth, elevation: o.elevation, distance: o.distance, target: [o.target[0], o.target[1], o.target[2]], ortho: !!o.ortho };
+    // `ortho` and `fov` ride along: hosts feed this straight back into orbitViewProj (the crop
+    // guides and every mask2d volume do), and dropping either there would silently project through
+    // a different camera than the renderer.
+    return { azimuth: o.azimuth, elevation: o.elevation, distance: o.distance, target: [o.target[0], o.target[1], o.target[2]], ortho: !!o.ortho, ...(o.fov != null ? { fov: o.fov } : {}) };
   }
 
-  /** Restore a camera snapshot. Does not touch autoOrbit — set `player.autoOrbit = false` to hold it. */
-  setCamera(c: { azimuth: number; elevation: number; distance: number; target: [number, number, number]; ortho?: boolean }): void {
-    this.orbit = { azimuth: c.azimuth, elevation: c.elevation, distance: c.distance, target: [c.target[0], c.target[1], c.target[2]], ortho: c.ortho ?? this.orbit.ortho };
+  /** Restore a camera snapshot. Does not touch autoOrbit — set `player.autoOrbit = false` to hold it.
+   *  A snapshot without `ortho` or `fov` keeps the current value of each. */
+  setCamera(c: { azimuth: number; elevation: number; distance: number; target: [number, number, number]; ortho?: boolean; fov?: number }): void {
+    this.orbit = { azimuth: c.azimuth, elevation: c.elevation, distance: c.distance, target: [c.target[0], c.target[1], c.target[2]], ortho: c.ortho ?? this.orbit.ortho, fov: c.fov ?? this.orbit.fov };
   }
 
   /** The clip's world-space bounding box (superblock AABB) — the mesh editor's crop range. */
@@ -221,9 +224,92 @@ export class AresPlayer {
     this.orbit.target = c;
     // orbitViewHeight(d) is the world height on screen at distance d; solve it for "the bounding
     // sphere fits", with a little margin so the subject isn't jammed against the frame edge.
-    this.orbit.distance = (radius * 2.3) / (2 * Math.tan((50 * Math.PI) / 180 / 2));
+    this.orbit.fov = undefined;
+    this.orbit.distance = (radius * 2.3) / orbitViewHeight(1);
     this.baseDistance = this.orbit.distance;
+    this.frameRelief();
     this.renderCurrent();
+  }
+
+  /** Largest sway half-angle of a relief's auto-orbit, radians; a deep relief sways less (frameRelief). */
+  static readonly RELIEF_SWAY = 0.2;
+  /** Parallax, radians, between the relief's nearest 5 % and its pivot at the end of a sway. */
+  static readonly RELIEF_PARALLAX = 0.06;
+  private relief: ReliefDiscard | null = null;
+  private reliefSway = AresPlayer.RELIEF_SWAY;
+  /** The FOV (degrees) that fits a relief's whole picture in the canvas: the wheel zooms from it. */
+  private reliefFov = ORBIT_FOV_DEG;
+  private swayPhase = 0;
+  private swayApplied = 0;
+
+  /**
+   * A 2D-to-2.5D relief is a surface seen from ONE camera. Framed like a capture (from outside its
+   * bounding box, turntable orbit) it is viewed from where no pixel of it was ever observed: the
+   * perspective is wrong, the silhouette cuts face the viewer, and half the turntable shows its
+   * missing back. It opens AT the camera that shot it instead, pivoting about the midpoint in
+   * disparity of its surface (`relief.pivot`) so that orbiting reads as parallax, and its
+   * auto-orbit is a sway about that axis.
+   *
+   * The eye sits exactly on the capture camera, with the capture FOV widened only as far as the
+   * canvas needs to show the whole picture (`relief.aspect` against the canvas aspect), and the
+   * wheel zooms by FOV (zoomRelief). Any other point on the axis changes the perspective: stepping
+   * back shrinks near content more than far content, so the characters of a shot turn small against
+   * a background that turns large, and the gap each silhouette cut leaves behind a near subject
+   * opens into a halo.
+   *
+   * Orbiting by an angle a about the pivot p moves content at depth z by a * (p / z - 1) against
+   * the pivot, so the sway is sized to give the nearest 5 % of the surface RELIEF_PARALLAX at its
+   * ends: a shallow scene sways the full RELIEF_SWAY, a deep one less, and the gaps the cuts leave
+   * behind near subjects stay narrow.
+   */
+  private frameRelief(): void {
+    const r = reliefFromMeta(this.file.superblock.meta);
+    this.relief = r;
+    if (!r) return;
+    const b = this.file.superblock.aabb;
+    const diag = Math.hypot(b.max[0] - b.min[0], b.max[1] - b.min[1], b.max[2] - b.min[2]) || 1;
+    const pivot = r.pivot > 0 ? r.pivot : diag * 0.35;
+    const lever = r.near > 0 && pivot > r.near ? pivot / r.near - 1 : 0;
+    this.reliefSway = lever > 0 ? Math.min(AresPlayer.RELIEF_SWAY, Math.max(0.02, AresPlayer.RELIEF_PARALLAX / lever)) : AresPlayer.RELIEF_SWAY;
+    const f = r.forward;
+    const canvasAspect = this.opts.canvas.width / Math.max(1, this.opts.canvas.height);
+    const tanHalf = Math.tan(((r.fov > 0 ? r.fov : ORBIT_FOV_DEG) * Math.PI) / 360);
+    const widen = r.aspect > 0 ? Math.max(1, r.aspect / canvasAspect) : 1;
+    this.reliefFov = (2 * Math.atan(tanHalf * widen) * 180) / Math.PI;
+    this.orbit = {
+      azimuth: Math.atan2(-f[0], -f[2]),
+      elevation: Math.asin(Math.max(-1, Math.min(1, -f[1]))),
+      distance: pivot,
+      target: [r.camera[0] + f[0] * pivot, r.camera[1] + f[1] * pivot, r.camera[2] + f[2] * pivot],
+      ortho: this.orbit.ortho,
+      fov: this.reliefFov,
+    };
+    this.baseDistance = this.orbit.distance;
+  }
+
+  /**
+   * Wheel zoom on a relief: the FOV narrows or widens about the capture camera, from an eighth of
+   * the fitted picture's tangent to three times it, and the perspective the picture was shot with
+   * holds at every zoom.
+   */
+  private zoomRelief(direction: number): void {
+    const t0 = Math.tan((this.reliefFov * Math.PI) / 360);
+    const t = Math.tan(((this.orbit.fov ?? this.reliefFov) * Math.PI) / 360) * (1 + direction * 0.08);
+    const clamped = Math.min(Math.min(3 * t0, Math.tan((150 * Math.PI) / 360)), Math.max(t0 / 8, t));
+    this.orbit.fov = (2 * Math.atan(clamped) * 180) / Math.PI;
+  }
+
+  /** The capture-camera description of a relief clip, or null for any other clip. */
+  getRelief(): ReliefDiscard | null { return this.relief; }
+
+  /** Auto-orbit step: a turntable for a capture, a bounded sway about the capture axis for a relief. */
+  private autoOrbitStep(dt: number): void {
+    if (!this.relief) { this.orbit.azimuth += dt * this.orbitSpeed; return; }
+    // Additive, so a drag composes with the sway instead of fighting it.
+    this.swayPhase += dt * this.orbitSpeed * 3;
+    const s = this.reliefSway * Math.sin(this.swayPhase);
+    this.orbit.azimuth += s - this.swayApplied;
+    this.swayApplied = s;
   }
 
   /** Live crop preview (world space); null disables. Rendering only — bake via the encoder. */
@@ -332,7 +418,7 @@ export class AresPlayer {
   /** Recompute the grid's LOD from the live camera. Called once per render — that per-frame
    *  recompute IS the feature: it is what lets one shader cover every zoom without popping. */
   private updateGridParams(): void {
-    const viewHeight = orbitViewHeight(this.orbit.distance);
+    const viewHeight = orbitViewHeight(this.orbit.distance, this.orbit.fov);
     const pxPerUnit = this.opts.canvas.height / Math.max(1e-9, viewHeight);
     const lod = gridLod(pxPerUnit, 12, this.gridStep);
     this.gridLast = lod;
@@ -442,6 +528,7 @@ export class AresPlayer {
       : await WebGPURenderer.create(opts.canvas);
     renderer.resize(opts.canvas.width, opts.canvas.height);
     renderer.setNormalEncoding(file.superblock.normalEncoding); // 0 = legacy i8×4, 1 = oct16
+    renderer.setRelief(reliefFromMeta(file.superblock.meta));   // sheet reliefs: silhouettes cut at draw time
 
     // Texture: video track (spec §7.1) if present, else still atlas (§7.7).
     let textureVideo: TextureVideo | null = null;
@@ -910,7 +997,7 @@ export class AresPlayer {
    */
   tick(dtSec: number): void {
     this.clockUs += dtSec * 1e6;
-    if (this.autoOrbit && !this.dragging) this.orbit.azimuth += dtSec * this.orbitSpeed;
+    if (this.autoOrbit && !this.dragging) this.autoOrbitStep(dtSec);
     const idx = this.frameIndexForClock();
     if (idx !== this.presented) {
       this.present(idx, true); this.opts.onFrame?.(this.frames[idx]!.ptsUs / 1e6, idx);
@@ -924,7 +1011,7 @@ export class AresPlayer {
     const dt = Math.min(0.05, (now - this.lastNow) / 1000);
     this.lastNow = now;
     if (this.playing) this.clockUs += dt * 1e6;
-    if (this.autoOrbit && !this.dragging) this.orbit.azimuth += dt * this.orbitSpeed;
+    if (this.autoOrbit && !this.dragging) this.autoOrbitStep(dt);
 
     // Audio-led clock: when the track is running, its context time replaces the accumulator above.
     if (this.audio && this.playing && this.audio.isRunning) {
@@ -1026,7 +1113,7 @@ export class AresPlayer {
         const rx = Math.cos(a), rz = -Math.sin(a);                          // camera right (world)
         const ux = -se * Math.sin(a), uy = ce, uz = -se * Math.cos(a);      // camera up (world)
         const h = (c as HTMLCanvasElement).clientHeight || 1;
-        const k = (2 * this.orbit.distance * Math.tan((50 * Math.PI) / 180 / 2)) / h; // world units / pixel
+        const k = orbitViewHeight(this.orbit.distance, this.orbit.fov) / h; // world units / pixel
         this.orbit.target[0] += (-rx * dx + ux * dy) * k;
         this.orbit.target[1] += (uy * dy) * k;
         this.orbit.target[2] += (-rz * dx + uz * dy) * k;
@@ -1039,7 +1126,12 @@ export class AresPlayer {
     });
     // Middle button on some browsers still tries autoscroll on mousedown; cancel it there too.
     c.addEventListener("mousedown", (e) => { if (e.button === 1) e.preventDefault(); });
-    c.addEventListener("wheel", (e) => { e.preventDefault(); this.orbit.distance = Math.max(this.baseDistance * 0.15, Math.min(this.baseDistance * 5, this.orbit.distance * (1 + Math.sign(e.deltaY) * 0.08))); this.renderIfIdle(); }, { passive: false });
+    c.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      if (this.relief) this.zoomRelief(Math.sign(e.deltaY));
+      else this.orbit.distance = Math.max(this.baseDistance * 0.15, Math.min(this.baseDistance * 5, this.orbit.distance * (1 + Math.sign(e.deltaY) * 0.08)));
+      this.renderIfIdle();
+    }, { passive: false });
   }
 
   /**

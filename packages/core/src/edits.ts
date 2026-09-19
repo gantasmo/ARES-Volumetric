@@ -30,7 +30,12 @@ export interface Mask2dVolume {
   rect?: [number, number, number, number];
   /** Row-major bitmap covering the captured viewport; rle alternates 0-run/1-run lengths, 0-run first. */
   mask?: { width: number; height: number; rle: number[] };
-  camera?: { azimuth: number; elevation: number; distance: number; target: [number, number, number]; aspect: number };
+  camera?: {
+    azimuth: number; elevation: number; distance: number; target: [number, number, number]; aspect: number;
+    /** Vertical field of view in degrees (camera.ts OrbitState.fov); absent is the orbit default.
+     *  A relief is viewed through its own FOV, and a mask drawn there must be tested through it. */
+    fov?: number;
+  };
   /** NDC z band captured from the pick buffer (visible-only approximation, design §5.2) */
   depth?: { zmin: number; zmax: number };
   [k: string]: unknown;
@@ -260,7 +265,7 @@ function prepareVolume(v: EditVolume): SdfFn | null {
   if (v.type === "brushStrokes") return (x, y, z) => brushSdf(v, x, y, z);
   if (v.type === "mask2d" && v.camera && (v.kind === "rect" ? v.rect : v.kind === "bitmap" && v.mask)) {
     const m = orbitViewProj(
-      { azimuth: v.camera.azimuth, elevation: v.camera.elevation, distance: v.camera.distance, target: v.camera.target },
+      { azimuth: v.camera.azimuth, elevation: v.camera.elevation, distance: v.camera.distance, target: v.camera.target, fov: v.camera.fov },
       v.camera.aspect || 1);
     const depth = v.depth;
     const r = v.rect;

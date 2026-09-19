@@ -1459,7 +1459,7 @@ function initEditor(player) {
     const c = player.getCamera();
     // The dock height is part of the signature: the ruler is laid out against it, so resizing the
     // timeline has to repaint the guides even though the camera never moved.
-    const sig = `${c.azimuth.toFixed(4)}|${c.elevation.toFixed(4)}|${c.distance.toFixed(3)}|${c.target}|${innerWidth}x${innerHeight}|${$("controls")?.offsetHeight}|${cropPct}`;
+    const sig = `${c.azimuth.toFixed(4)}|${c.elevation.toFixed(4)}|${c.distance.toFixed(3)}|${c.fov ?? ""}|${c.target}|${innerWidth}x${innerHeight}|${$("controls")?.offsetHeight}|${cropPct}`;
     if (sig === cropSig) return;
     cropSig = sig;
     renderCropUi();
@@ -2736,7 +2736,8 @@ function initEditor(player) {
     if (!activeRange) { selStatus("grow/shrink: make a range ▶ active first"); return; }
     const mm = Number($("brushR").value) * steps;
     const world = mm * worldPerMm;
-    const viewH = orbitViewHeight(player.getCamera().distance) || 1;
+    const cam = player.getCamera();
+    const viewH = orbitViewHeight(cam.distance, cam.fov) || 1;
     const ndc = (world / viewH) * 2;
     const px = Math.round((world / viewH) * 768);
     doMutation(() => { for (const kf of activeRange.keyframes) growKeyframe(kf, world, ndc, px); });

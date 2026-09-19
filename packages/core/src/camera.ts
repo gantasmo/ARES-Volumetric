@@ -108,12 +108,17 @@ export interface OrbitState {
    *  perspective an axis-aligned plane projects to a REGION, not a line, so a straight guide can
    *  only ever approximate the cut. In ortho, edge-on planes are exact lines. */
   ortho?: boolean;
+  /** Vertical field of view in degrees; absent means ORBIT_FOV_DEG. A 2D-to-2.5D relief opens at
+   *  its capture camera with the FOV that fits its picture and zooms by FOV (player.ts
+   *  frameRelief): a dolly would change the perspective the picture was shot with. */
+  fov?: number;
 }
 
-const FOV_Y = (50 * Math.PI) / 180;
+/** The orbit camera's vertical field of view when OrbitState.fov is absent, degrees. */
+export const ORBIT_FOV_DEG = 50;
 /** The world height the perspective camera sees at the orbit distance. Reused by the ortho box so
  *  toggling projection keeps the subject the same size instead of jumping. */
-export const orbitViewHeight = (distance: number): number => 2 * distance * Math.tan(FOV_Y / 2);
+export const orbitViewHeight = (distance: number, fovDeg: number = ORBIT_FOV_DEG): number => 2 * distance * Math.tan((fovDeg * Math.PI) / 360);
 
 export interface OrbitMatrices {
   view: Mat4;
@@ -138,9 +143,10 @@ export function orbitMatrices(o: OrbitState, aspect: number): OrbitMatrices {
   const view = lookAt(eye, o.target, [0, 1, 0]);
   // near/far scale with distance so the camera works at any model scale (unit or mm).
   const near = o.distance * 0.01, far = o.distance * 20;
+  const fov = o.fov ?? ORBIT_FOV_DEG;
   const proj = o.ortho
-    ? orthographic(orbitViewHeight(o.distance), aspect, near, far)
-    : perspective(FOV_Y, aspect, near, far);
+    ? orthographic(orbitViewHeight(o.distance, fov), aspect, near, far)
+    : perspective((fov * Math.PI) / 180, aspect, near, far);
   return { view, proj, viewProj: multiply(proj, view), eye, ortho: !!o.ortho };
 }
 

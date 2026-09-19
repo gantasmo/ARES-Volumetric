@@ -27,11 +27,57 @@ export interface SplatParams { scaleMul: number; opacityMul: number; }
  * The renderer surface the player drives — implemented by both WebGPURenderer
  * (structurally) and WebGL2Renderer, so the player can hold either.
  */
+/**
+ * Draw-time discard for a 2D-to-2.5D relief coded as fixed-topology sheets (`ares depth --sheets`).
+ * A sheet keeps every grid triangle so its topology never changes and the clip codes as I + P
+ * deltas; the triangles that span a silhouette are then removed here instead of in the file. They
+ * are recognisable without any per-vertex data: a sheet stretched from a subject back to the wall
+ * behind it lies almost along the ray of the camera that captured it.
+ */
+export interface ReliefDiscard {
+  /** Capture camera position, world space. */
+  camera: [number, number, number];
+  /** Capture axis, unit, world space. */
+  forward: [number, number, number];
+  /** Sine of the smallest surface-to-ray angle that still draws. 0 disables the slope test. */
+  slope: number;
+  /** Depth along the capture axis beyond which nothing draws. 0 disables the depth test. */
+  depthMax: number;
+  /** Vertical field of view of the capture camera, degrees (0 when the clip does not say). */
+  fov: number;
+  /** Depth along the capture axis to orbit about: the disparity midpoint of `near` and `far` (0 = unknown). */
+  pivot: number;
+  /** Depths of the nearest and farthest 5 % of the surface along the capture axis (0 = unknown). */
+  near: number;
+  far: number;
+  /** Width over height of the captured picture (0 = unknown). */
+  aspect: number;
+}
+
+/** `relief.*` superblock metadata -> ReliefDiscard, or null when the clip is not a relief. */
+export function reliefFromMeta(meta: Record<string, string> | Map<string, string> | undefined | null): ReliefDiscard | null {
+  if (!meta) return null;
+  const get = (k: string) => (meta instanceof Map ? meta.get(k) : meta[k]);
+  const vec = (s: string | undefined): [number, number, number] | null => {
+    const p = (s ?? "").split(",").map(Number);
+    return p.length === 3 && p.every(Number.isFinite) ? [p[0]!, p[1]!, p[2]!] : null;
+  };
+  const camera = vec(get("relief.camera")), forward = vec(get("relief.forward"));
+  if (!camera || !forward) return null;
+  const nn = (k: string) => { const v = Number(get(k)); return Number.isFinite(v) && v > 0 ? v : 0; };
+  return {
+    camera, forward, slope: nn("relief.slope"), depthMax: nn("relief.depthMax"),
+    fov: nn("relief.fov"), pivot: nn("relief.pivot"), near: nn("relief.near"), far: nn("relief.far"), aspect: nn("relief.aspect"),
+  };
+}
+
 export interface AresRenderer {
   resize(width: number, height: number): void;
   setNormalEncoding(encoding: number): void;
   /** World-space crop-box preview (mesh editor); null disables. */
   setCrop(crop: { min: [number, number, number]; max: [number, number, number] } | null): void;
+  /** Relief discard for fixed-topology 2.5D sheets (see ReliefDiscard); null disables. */
+  setRelief(relief: ReliefDiscard | null): void;
   /** Wireframe render mode (mesh editor). */
   setWireframe(on: boolean): void;
   /** Viewport shading: textured (default) vs untextured clay. */
@@ -145,6 +191,9 @@ uniform float uLitMix;                       // 1 = lit (lambert), 0 = unlit (al
 uniform vec3 uCropMin;                       // world-space crop box (mesh editor preview)
 uniform vec3 uCropMax;
 uniform float uCropOn;
+uniform vec3 uReliefCam;                     // relief discard: capture camera position (world)
+uniform vec3 uReliefFwd;                     // capture axis (unit, world)
+uniform vec2 uRelief;                        // x = slope (0 off), y = depthMax (0 off)
 uniform int uShadeMode;                      // 0 shaded, 1 normals, 2 uv checker, 3 depth, 4 points
 uniform vec2 uDepthRange;
 in float vDepth;
@@ -189,6 +238,12 @@ void main() {
   vec3 albedo = mix(vec3(0.72, 0.71, 0.68), texture(uTex, vUV).rgb, uTexMix);
   // Crop preview: discard LAST so the derivatives above stay uniform (same order as the WGSL).
   if (uCropOn > 0.5 && (any(lessThan(vWorld, uCropMin)) || any(greaterThan(vWorld, uCropMax)))) discard;
+  // Relief discard: a sheet stretched across a silhouette lies along the capture ray (same test
+  // and order as the WGSL).
+  vec3 rv = vWorld - uReliefCam;
+  if (uRelief.y > 0.0 && dot(rv, uReliefFwd) > uRelief.y) discard;
+  float faceLen = length(faceN);
+  if (uRelief.x > 0.0 && faceLen > 0.0 && abs(dot(faceN / faceLen, normalize(rv))) < uRelief.x) discard;
   float lit = mix(1.0, 0.4 + 0.6 * diff, uLitMix);
   vec3 col = albedo * lit;
   if (uShadeMode == 1) col = n * 0.5 + 0.5;
@@ -412,6 +467,9 @@ interface ProgramInfo {
   uCropMin: WebGLUniformLocation | null;
   uCropMax: WebGLUniformLocation | null;
   uCropOn: WebGLUniformLocation | null;
+  uReliefCam: WebGLUniformLocation | null;
+  uReliefFwd: WebGLUniformLocation | null;
+  uRelief: WebGLUniformLocation | null;
   uShadeMode: WebGLUniformLocation | null;
   uDepthRange: WebGLUniformLocation | null;
   uPointSize: WebGLUniformLocation | null;
@@ -464,6 +522,7 @@ export class WebGL2Renderer implements AresRenderer {
   private tripodCount = 0;
   // Crop preview + wireframe (mesh editor) — parity with the WebGPU path.
   private crop: { min: [number, number, number]; max: [number, number, number] } | null = null;
+  private relief: ReliefDiscard | null = null;
   private wireframe = false;
   private lineIdxBuf: WebGLBuffer | null = null;
   private lineIdxCap = 0;
@@ -565,6 +624,9 @@ export class WebGL2Renderer implements AresRenderer {
       uCropMin: gl.getUniformLocation(prog, "uCropMin"),
       uCropMax: gl.getUniformLocation(prog, "uCropMax"),
       uCropOn: gl.getUniformLocation(prog, "uCropOn"),
+      uReliefCam: gl.getUniformLocation(prog, "uReliefCam"),
+      uReliefFwd: gl.getUniformLocation(prog, "uReliefFwd"),
+      uRelief: gl.getUniformLocation(prog, "uRelief"),
       uShadeMode: gl.getUniformLocation(prog, "uShadeMode"),
       uDepthRange: gl.getUniformLocation(prog, "uDepthRange"),
       uPointSize: gl.getUniformLocation(prog, "uPointSize"),
@@ -582,6 +644,7 @@ export class WebGL2Renderer implements AresRenderer {
 
   /** World-space crop box for the mesh-editor preview (fragment discard); null disables. */
   setCrop(crop: { min: [number, number, number]; max: [number, number, number] } | null): void { this.crop = crop; }
+  setRelief(relief: ReliefDiscard | null): void { this.relief = relief; }
 
   /** Wireframe mode (mesh editor): the triangle list expanded to its edges, drawn as GL_LINES. */
   setWireframe(on: boolean): void {
@@ -824,6 +887,10 @@ void main(){
     gl.uniform3f(p.uCropMin, cr ? cr.min[0] : 0, cr ? cr.min[1] : 0, cr ? cr.min[2] : 0);
     gl.uniform3f(p.uCropMax, cr ? cr.max[0] : 0, cr ? cr.max[1] : 0, cr ? cr.max[2] : 0);
     gl.uniform1f(p.uCropOn, cr ? 1 : 0);
+    const rl = this.relief;
+    gl.uniform3f(p.uReliefCam, rl ? rl.camera[0] : 0, rl ? rl.camera[1] : 0, rl ? rl.camera[2] : 0);
+    gl.uniform3f(p.uReliefFwd, rl ? rl.forward[0] : 0, rl ? rl.forward[1] : 0, rl ? rl.forward[2] : 0);
+    gl.uniform2f(p.uRelief, rl ? rl.slope : 0, rl ? rl.depthMax : 0);
     gl.uniform1i(p.uShadeMode, this.shadeMode);
     gl.uniform2f(p.uDepthRange, this.depthRange[0], this.depthRange[1]);
     gl.uniform1f(p.uPointSize, this.pointSize);
