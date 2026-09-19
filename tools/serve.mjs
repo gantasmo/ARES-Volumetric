@@ -1516,7 +1516,43 @@ data: ${JSON.stringify(data)}
     return;
   }
 
-  // Native OS folder/file picker (Windows) — so the user never types a filesystem path.
+  // Resolve a DROPPED folder to a real path. A browser hands a drag-drop or <input webkitdirectory>
+  // only `webkitRelativePath` — the folder's NAME, never its location — so the Convert card had to
+  // ask the user to retype a path they had just pointed at, which is a daft thing to ask.
+  // Given the name (and optionally the file count), look for it under the folders this user has
+  // actually used before (history lastDirs and their parents) plus the drives' obvious roots.
+  // Returns a single unambiguous hit, or the candidates so the UI can ask which.
+  //   GET /resolve-dir?name=Daniel_Volcap[&files=544]  ->  { path } | { candidates:[...] } | {}
+  if (path === "/resolve-dir") {
+    const want = basename(url.searchParams.get("name") || "").trim();
+    const wantFiles = Number(url.searchParams.get("files") || 0);
+    res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
+    if (!want || /[\/:*?"<>|]/.test(want)) { res.end(JSON.stringify({})); return; }
+    try {
+      const hist = await readHistoryStore();
+      const seeds = new Set();
+      for (const d of Object.values(hist.lastDirs || {})) if (d) { seeds.add(d); seeds.add(dirname(d)); seeds.add(dirname(dirname(d))); }
+      for (const it of (hist.items || []).slice(0, 60)) if (it.path) { seeds.add(it.path); seeds.add(dirname(it.path)); }
+      seeds.add(ROOT); seeds.add(dirname(ROOT));
+      const hits = [];
+      for (const seed of seeds) {
+        if (!seed || hits.length >= 8) continue;
+        const cand = join(seed, want);
+        try {
+          const st = await stat(cand);
+          if (!st.isDirectory()) continue;
+          const n = (await readdir(cand)).length;
+          if (wantFiles && Math.abs(n - wantFiles) > Math.max(4, wantFiles * 0.1)) continue;  // name matched, contents did not
+          if (!hits.some((h) => h.path.toLowerCase() === cand.toLowerCase())) hits.push({ path: cand, files: n });
+        } catch { /* not there */ }
+      }
+      if (hits.length === 1) { res.end(JSON.stringify({ path: hits[0].path, files: hits[0].files })); return; }
+      res.end(JSON.stringify({ candidates: hits }));
+    } catch (e) { res.end(JSON.stringify({ error: String((e && e.message) || e) })); }
+    return;
+  }
+
+  // Native OS folder/file picker (Windows), so the user never types a filesystem path.
   //   GET /pick?type=folder|file[&dir=<initial>][&for=<key>][&filter=<ofd filter>]  → { path | null }
   // `for` keys a remembered last-used folder (history.json lastDirs): the dialog reopens there,
   // and a successful pick updates it.

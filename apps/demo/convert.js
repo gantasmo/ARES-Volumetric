@@ -76,8 +76,24 @@ async function statsFromFiles(files) {
   };
 }
 
+/** A dropped folder arrives with a NAME but no location — the browser withholds the absolute path,
+ *  which is why this card used to make you retype a folder you had just pointed at. The server can
+ *  usually find it: it knows the folders you have converted from before. One unambiguous hit fills
+ *  the field; anything else leaves it for the picker rather than guessing wrong. */
+async function resolveDroppedPath(stats) {
+  if (!stats || stats.path || !stats.folderHint) return stats;
+  try {
+    const q = "/resolve-dir?name=" + encodeURIComponent(stats.folderHint) +
+              (stats.files ? "&files=" + stats.files : "");
+    const r = await fetch(q).then((x) => x.json());
+    if (r && r.path) { stats.path = r.path; stats.resolved = true; }
+    else if (r && r.candidates && r.candidates.length) stats.candidates = r.candidates;
+  } catch { /* server not running — the field stays manual, exactly as before */ }
+  return stats;
+}
+
 async function analyse(files) {
-  const stats = await statsFromFiles(files);
+  const stats = await resolveDroppedPath(await statsFromFiles(files));
   if (!stats) { $("convertOut").innerHTML = `<div class="card"><div class="cap">No mesh or splat frames</div><div class="note2">Accepted inputs: ⋯ menu.</div></div>`; return; }
   renderConvertCard(stats);
 }
@@ -415,6 +431,20 @@ ${actionBarHtml()}
   renderQueue();   // a re-analysed folder keeps the batch visible (it lives in memory across cards)
   $("cvPickBtn").onclick = pickAndAnalyse;
   $("cvPath").addEventListener("input", () => { $("cvPath").style.borderColor = ""; }); // clear the validation border once the user edits the field
+  // A dropped folder whose path the server recognised: say so, so the filled-in path is not a mystery.
+  if (stats.resolved && $("cvPathNote")) $("cvPathNote").textContent = "resolved from history: verify before converting";
+  // Several matches: offer them as one-click fills instead of demanding the path be typed.
+  if (stats.candidates && stats.candidates.length && $("cvPathNote")) {
+    const note = $("cvPathNote");
+    note.textContent = stats.candidates.length + " matches: ";
+    for (const c of stats.candidates) {
+      const b = document.createElement("button");
+      b.className = "u"; b.style.cssText = "margin:0 3px"; b.textContent = c.path;
+      b.title = c.files + " files";
+      b.onclick = () => { $("cvPath").value = c.path; note.textContent = ""; };
+      note.append(b);
+    }
+  }
   $("enGo").onclick = runEnhance;
   $("enForge").onclick = prewarmForge;
   $("enStrength").oninput = () => { $("enStrengthVal").textContent = $("enStrength").value + "%"; };
