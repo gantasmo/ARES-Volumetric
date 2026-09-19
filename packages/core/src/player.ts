@@ -66,6 +66,24 @@ export interface PlayerStats {
 
 interface FrameRef { block: Uint8Array; type: BlockType; keyframeIndex: number; gopBox: Aabb; ptsUs: number; }
 
+/**
+ * Frame index → playback clock (µs) at a clip's fps. Exported as a free function because this is the
+ * arithmetic that has actually been wrong in the wild (see the epsilon in clockUsToFrame) and it is
+ * the only part of the seek path that can be exercised in a test: AresPlayer itself needs a document,
+ * navigator.gpu and requestAnimationFrame, so it cannot be constructed under `node --test`.
+ */
+export function frameToClockUs(frame: number, fps: number): number {
+  return (Math.max(0, Math.round(frame)) * 1e6) / fps;
+}
+
+/** Playback clock (µs) → frame index at a clip's fps. Exact inverse of frameToClockUs. */
+export function clockUsToFrame(clockUs: number, fps: number): number {
+  const usPerFrame = 1e6 / fps;
+  // +1e-6 frames: k/fps seconds is not exactly representable — without the guard, seek(40/30)
+  // computes 39.999999999999986 and floors to frame 39 (an off-by-one on ~half of all frames).
+  return Math.floor(clockUs / usPerFrame + 1e-6);
+}
+
 export class AresPlayer {
   private raf = 0;
   private playing = false;
@@ -460,6 +478,24 @@ export class AresPlayer {
     return { buf, triCentroid };
   }
 
+  /**
+   * The presented frame's topology in its QUANTIZED form, with the two values that dequantize it: the
+   * GOP AABB and the position scale. This is exactly what rasterizeIds (raster.ts) takes — exportFrame()
+   * returns dequantized Float32Array positions and cannot feed it — and it is the shape a worker wants,
+   * since every member is a transferable typed array. Null for splat clips (no triangles) or before the
+   * first frame is decoded, matching pickRaster.
+   *
+   * These are the player's LIVE buffers, not copies: structured-clone them (postMessage with no transfer
+   * list) or .slice() first. TRANSFERRING them detaches the arrays the renderer is still drawing from.
+   */
+  frameGeomQ(): { positionsQ: Uint16Array; indices: Uint32Array; box: Aabb; invLevels: number; frameIndex: number } | null {
+    if (this.splat || !this.curPosQ || !this.curIndices || this.presented < 0) return null;
+    return {
+      positionsQ: this.curPosQ, indices: this.curIndices,
+      box: this.frames[this.presented]!.gopBox, invLevels: this.invLevels, frameIndex: this.presented,
+    };
+  }
+
   /** The canvas aspect used for rendering/picking (mask2d volumes serialize it with the camera). */
   getViewAspect(): number {
     return this.opts.canvas.width / Math.max(1, this.opts.canvas.height);
@@ -472,16 +508,40 @@ export class AresPlayer {
    * side; the mask maps back to full-viewport NDC regardless of capture scale.
    */
   captureFrame(maxDim = 1024): { dataUrl: string; width: number; height: number } {
+    const { off, width, height } = this.captureToCanvas(maxDim);
+    return { dataUrl: off.toDataURL("image/png"), width, height };
+  }
+
+  /** The render-then-drawImage half both capture methods share. Kept in one place because the
+   *  long-side scale rule IS the coordinate frame every stored mask is expressed in: if the click
+   *  path and a propagation sweep ever computed it differently, their mask pixels would silently
+   *  mean different things. */
+  private captureToCanvas(maxDim: number): { off: HTMLCanvasElement; width: number; height: number } {
     this.renderCurrent();
     const c = this.opts.canvas;
     const scale = Math.min(1, maxDim / Math.max(1, Math.max(c.width, c.height)));
-    const w = Math.max(1, Math.round(c.width * scale));
-    const h = Math.max(1, Math.round(c.height * scale));
+    const width = Math.max(1, Math.round(c.width * scale));
+    const height = Math.max(1, Math.round(c.height * scale));
     const off = document.createElement("canvas");
-    off.width = w; off.height = h;
-    const ctx = off.getContext("2d")!;
-    ctx.drawImage(c, 0, 0, w, h);
-    return { dataUrl: off.toDataURL("image/png"), width: w, height: h };
+    off.width = width; off.height = height;
+    off.getContext("2d")!.drawImage(c, 0, 0, width, height);
+    return { off, width, height };
+  }
+
+  /**
+   * captureFrame's batch form: the same render-then-drawImage copy, but resolved as a Blob instead of
+   * a data URL. A per-frame sweep cannot afford captureFrame — a PNG data URL costs 15–30 ms of
+   * main-thread deflate per frame and carries a base64 string ~1.37× the byte size, which over a
+   * 272-frame clip is hundreds of MB of string the GC then has to walk. JPEG at 0.95 over loopback is
+   * bytes nobody pays for.
+   *
+   * Returns the capture's own dimensions with the blob: maxDim caps the LONG side, so a portrait
+   * viewport scales x and y by different factors and any caller mapping coordinates into this image
+   * needs both numbers, not just the width. Null when the canvas cannot encode the requested type.
+   */
+  captureFrameBlob(maxDim = 1008, type = "image/jpeg", quality = 0.95): Promise<{ blob: Blob; width: number; height: number } | null> {
+    const { off, width, height } = this.captureToCanvas(maxDim);
+    return new Promise((resolve) => off.toBlob((b) => resolve(b ? { blob: b, width, height } : null), type, quality));
   }
 
   /** Auto-frame the orbit camera on the clip's bounding box (any scale/origin). */
@@ -935,7 +995,24 @@ export class AresPlayer {
 
   /** Seek to seconds via the GOP index (spec §9.2). */
   seek(seconds: number): void {
-    this.clockUs = Math.max(0, seconds * 1e6);
+    this.seekClockUs(Math.max(0, seconds * 1e6));
+  }
+
+  /**
+   * Seek by FRAME INDEX. Identical to seek(idx / getClipFps()) because it is literally the same
+   * body over the same clock (seekClockUs below) — but a sweep that visits every frame of a clip
+   * should not round-trip its index through a float division and back through the epsilon guard in
+   * clockUsToFrame.
+   */
+  seekFrame(idx: number): void {
+    this.seekClockUs(frameToClockUs(idx, this.file.header.fps));
+  }
+
+  /** The seek body, shared so seek() and seekFrame() cannot drift: every scrub, arrow key and
+   *  timeline click in the demo now enters through seekFrame, so anything added to one of these
+   *  tails and not the other would silently miss half the app. */
+  private seekClockUs(us: number): void {
+    this.clockUs = us;
     const idx = this.frameIndexForClock();
     this.present(idx);
     this.renderCurrent();
@@ -943,6 +1020,10 @@ export class AresPlayer {
     this.opts.onFrame?.((this.frames[idx]?.ptsUs ?? 0) / 1e6, idx);
     if (this.playing) this.audioAnchor(); else this.audio?.stop();
   }
+
+  /** The CLIP's frame rate (header fps) — what every frame↔seconds conversion has to divide by.
+   *  Not PlayerStats.fps, which is the rolling RENDER-rate EMA and has nothing to do with the clip. */
+  getClipFps(): number { return this.file.header.fps; }
 
   setTier(_t: "auto" | number): void { /* single tier in P1 (spec §7.6 ladder is P3) */ }
 
@@ -972,10 +1053,7 @@ export class AresPlayer {
   }
 
   private frameIndexForClock(): number {
-    const usPerFrame = 1e6 / this.file.header.fps;
-    // +1e-6 frames: k/fps seconds is not exactly representable — without the guard, seek(40/30)
-    // computes 39.999999999999986 and floors to frame 39 (an off-by-one on ~half of all frames).
-    const raw = Math.floor(this.clockUs / usPerFrame + 1e-6);
+    const raw = clockUsToFrame(this.clockUs, this.file.header.fps);
     const { in: lo, out: hi } = this.getTrim();
     const span = hi - lo + 1;
     // At or before the out point the clock maps straight through — that keeps a seek to ANY frame
@@ -1047,9 +1125,23 @@ export class AresPlayer {
     this.renderCurrent();
   }
 
-  /** Diagnostics for the texture path (frames applied, decoder error). */
-  textureDebug(): { hasVideo: boolean; applied: number; error: string | null } {
-    return { hasVideo: !!this.textureVideo, applied: this.texApplied, error: this.textureVideo?.error ?? null };
+  /**
+   * Diagnostics for the texture path (frames applied, which one, decoder error).
+   *
+   * `settled` is the one a batch consumer needs: seek/seekFrame present geometry synchronously, but
+   * pumpTexture converges the atlas over up to 30 rAF retries because VideoDecoder emission is async.
+   * Without it, anything that seeks and immediately reads the canvas (a capture sweep, a still export)
+   * silently gets frame N's mesh wearing frame N−k's atlas. A clip with no video track is settled by
+   * definition — its still atlas never changes.
+   */
+  textureDebug(): { hasVideo: boolean; applied: number; appliedIdx: number; settled: boolean; error: string | null } {
+    return {
+      hasVideo: !!this.textureVideo,
+      applied: this.texApplied,
+      appliedIdx: this.texAppliedIdx,
+      settled: !this.textureVideo || this.texAppliedIdx === this.presented,
+      error: this.textureVideo?.error ?? null,
+    };
   }
   private texApplied = 0;
 
