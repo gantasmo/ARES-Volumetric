@@ -33,6 +33,7 @@ export async function depStatus(id) {
 async function load() {
   const d = await fetch("/deps").then((r) => r.json());
   deps = d.deps || []; gpu = d.gpu; profs = d.profiles || []; recommended = d.recommended; pre = d.preflight;
+  try { shell = await fetch("/shell/status").then((r) => r.json()); } catch { shell = null; }
   return d;
 }
 
@@ -132,6 +133,96 @@ function profileCards() {
       <div class="note" style="margin:0 0 8px">Each one installs everything it needs, in order: Python environment included. Anything you already have is skipped.</div>
       <div class="profs">${profs.map(card).join("")}</div>
     </div>`;
+}
+
+/** Windows shell integration. Registering writes only under HKCU\Software\Classes, so it needs
+ *  no elevation and the same card turns it off again. */
+let shell = null;
+function shellCard() {
+  if (!shell || !shell.supported) return "";
+  const on = shell.registered;
+  return `
+    <div class="card">
+      <div class="row" style="margin-bottom:2px"><h3 style="margin:0;flex:1">Windows context menu</h3>
+        <button class="u${on ? "" : " primary"}" id="shellToggle">${on ? "Remove" : "Add"}</button></div>
+      <div class="note" style="margin:0 0 6px">“Convert folder to .ares” on a folder, “Convert to .ares” on ${shell.exts} file types. Written under HKCU, no administrator, and Remove takes it back out.</div>
+      <div class="kv">
+        <div class="k">folders</div><div class="v">${on && shell.folders ? "registered" : "not registered"}</div>
+        <div class="k">file types</div><div class="v">${on && shell.files ? shell.exts + " registered" : "not registered"}</div>
+        <div class="k">every file type</div><div class="v"><label style="cursor:pointer"><input type="checkbox" id="shellAll"${shell.allFiles ? " checked" : ""}> also add it to all files</label></div>
+      </div>
+      <div class="note2" style="margin-top:6px">${esc(shell.note || "")}</div>
+      <div class="note2" id="shellMsg" style="margin-top:4px"></div>
+      ${msixRows()}
+    </div>`;
+}
+
+/** The Windows 11 short menu. Separate from the registry verbs above because it is a different
+ *  mechanism with a different failure mode: a packaged IExplorerCommand handler, which has to be
+ *  built and signed, and whose certificate needs one elevated command to trust. */
+function msixRows() {
+  const m = shell && shell.msix;
+  if (!m || !m.supported) return "";
+  const on = m.installed;
+  // Nothing here blocks the button: Install adds MSVC Build Tools through /install when the
+  // compiler is absent, and the server switches Developer Mode and trusts the certificate itself,
+  // each behind one Windows elevation prompt.
+  const pending = [
+    !m.buildable ? "MSVC Build Tools + Windows SDK: installed first (2.5 GB)" : "",
+    !m.devMode ? "Developer Mode: enabled during install (elevation prompt)" : "",
+  ].filter(Boolean).join(" · ");
+  return `
+    <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">
+      <div class="row" style="margin-bottom:2px">
+        <span class="cap" style="flex:1">Windows 11 short menu</span>
+        <button class="u${on ? "" : " primary"}" id="msixToggle">${on ? "Remove" : "Install"}</button>
+      </div>
+      <div class="note2">The entries above live under “Show more options”. This packaged handler puts the same verb in the short menu Windows 11 opens first.</div>
+      <div class="kv" style="margin-top:4px">
+        <div class="k">package</div><div class="v">${on ? esc(m.packageFullName || "installed") : "not installed"}</div>
+        <div class="k">certificate</div><div class="v">${m.certTrusted ? "trusted" : "not trusted: imported during install (elevation prompt)"}</div>
+      </div>
+      ${pending && !on ? `<div class="note2" style="margin-top:4px">${pending}</div>` : ""}
+      <div class="note2" id="msixMsg" style="margin-top:4px"></div>
+    </div>`;
+}
+
+function wireShellCard() {
+  const btn = $("shellToggle");
+  if (!btn) return;
+  const mbtn = $("msixToggle");
+  if (mbtn) mbtn.onclick = async () => {
+    const installed = !!(shell.msix && shell.msix.installed);
+    // The compiler is a catalog component: install it through the normal progress panel first.
+    // runInstall re-renders the tab, so every element is looked up again afterwards.
+    if (!installed && !shell.msix.buildable) {
+      if (busy) return;
+      if (!(await runInstall(["msvc-build-tools"]))) return;
+    }
+    const mbtn2 = $("msixToggle") || mbtn, msg = $("msixMsg");
+    mbtn2.disabled = true;
+    msg.style.color = ""; msg.textContent = installed ? "removing…" : "building, signing, registering: about a minute on the first build…";
+    let r;
+    try { r = await fetch(installed ? "/shell/msix-uninstall" : "/shell/msix-install", { method: "POST", body: "{}" }).then((x) => x.json()); }
+    catch { r = { ok: false, error: "dev server not reachable" }; }
+    mbtn2.disabled = false;
+    if (r.ok) { msg.style.color = "var(--good)"; msg.textContent = (r.log || []).slice(-1)[0] || "done"; render(); return; }
+    msg.style.color = "var(--bad)";
+    msg.textContent = r.error || "failed";
+  };
+
+  btn.onclick = async () => {
+    const msg = $("shellMsg");
+    btn.disabled = true;
+    msg.style.color = ""; msg.textContent = shell.registered ? "removing…" : "registering…";
+    const route = shell.registered ? "/shell/unregister" : "/shell/register";
+    let r;
+    try { r = await fetch(route, { method: "POST", body: JSON.stringify({ allFiles: !!$("shellAll")?.checked }) }).then((x) => x.json()); }
+    catch { r = { ok: false, error: "dev server not reachable" }; }
+    btn.disabled = false;
+    if (r.ok) { msg.style.color = "var(--good)"; msg.textContent = (r.log || []).slice(-1)[0] || "done"; render(); }
+    else { msg.style.color = "var(--bad)"; msg.textContent = r.error || "failed"; }
+  };
 }
 
 function componentRows() {
@@ -261,6 +352,7 @@ async function render({ keepLog = false } = {}) {
     </div>
     ${componentRows()}
     ${statusRows()}
+    ${shellCard()}
     <div class="card">
       <div class="row" style="margin-bottom:4px"><h3 style="margin:0;flex:1">Services</h3>
         <span class="note" style="margin:0">${ready}/${deps.length} components present</span>
@@ -275,6 +367,7 @@ async function render({ keepLog = false } = {}) {
 
   $("depRefresh").onclick = () => render();
   wireTokenForm();
+  wireShellCard();
   for (const b of out.querySelectorAll("[data-profile]")) b.onclick = () => {
     if (busy) return;
     const p = profs.find((x) => x.id === b.dataset.profile);

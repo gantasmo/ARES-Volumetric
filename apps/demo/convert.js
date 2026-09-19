@@ -780,6 +780,40 @@ function runEncode(job) {
   });
 }
 
+/**
+ * Open whatever the Windows shell verb was pointed at. The browser cannot read a path, so the
+ * server classifies it first (/open-info) and the right flow takes over:
+ *   folder            -> analyse it as a frame sequence (the volumetric case)
+ *   .ares             -> probe the container
+ *   .4ds              -> probe, then the on-machine decode row
+ *   a lone mesh/splat -> analyse the folder that CONTAINS it, because a sequence is a folder
+ */
+export async function openPath(target) {
+  const out = $("convertOut");
+  out.innerHTML = `<div class="card"><div class="cap">Opening</div><div class="note2">${target}</div></div>`;
+  let info;
+  try { info = await fetch("/open-info?path=" + encodeURIComponent(target)).then((r) => r.json()); }
+  catch { out.innerHTML = `<div class="card"><div class="cap" style="color:var(--bad)">Dev server not reachable</div></div>`; return; }
+  if (!info || info.error) {
+    out.innerHTML = `<div class="card"><div class="cap" style="color:var(--bad)">Cannot open</div><div class="note2">${(info && info.error) || target}</div></div>`;
+    return;
+  }
+  if (info.kind === "dir") { await analyseServer(info.path); return; }
+
+  const ext = info.ext || "";
+  if (isVideoName(ext)) { await renderDepthCard(info.path); return; }   // a 2D video: the depth card
+  if (ext === ".4ds" || ext === ".ares") {
+    // Both are containers the probe understands, but the probe reads BYTES and the browser has
+    // no path handle. Fall back to analysing the parent so the user is not stranded, and say why.
+    await analyseServer(info.parent);
+    if ($("cvPathNote")) $("cvPathNote").textContent = `opened the folder holding ${target.split(/[\\/]/).pop()}: pick the file itself with “File…” to probe it`;
+    return;
+  }
+  // A single mesh or splat file: a sequence lives in a folder, so analyse the folder.
+  await analyseServer(info.parent);
+  if ($("cvPathNote")) $("cvPathNote").textContent = `opened the folder holding ${target.split(/[\\/]/).pop()}`;
+}
+
 export function initConvert() {
   const drop = $("convertDrop"), input = $("convertFile"), probeInput = $("convertProbeFile");
   $("convertPick").onclick = pickAndAnalyse;   // native folder dialog — the primary, no-typing path

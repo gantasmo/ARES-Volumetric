@@ -20,6 +20,8 @@ import zlib from "node:zlib";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
 import { catalog, encoderState, ensurePrivatePython, findFfmpeg, findGit, FORGE_PYTHON, gpuProbe, hfTokenPresent, installOne, paths as installPaths, preflight, profiles, recommend, resolve, saveHfToken } from "./installer.mjs";
+import { shellRegister, shellStatus, shellUnregister } from "./shell-integration.mjs";
+import { install as msixInstall, msixStatus, uninstall as msixUninstall } from "./msix/build.mjs";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url))); // ares/
 
@@ -1503,6 +1505,87 @@ async function handle(req, res) {
       res.writeHead(500, { ...HEADERS, "Content-Type": "application/json" });
       res.end(JSON.stringify({ error: String((e && e.message) || e) }));
     }
+    return;
+  }
+
+  // Windows shell integration: "Convert to .ares" on the right-click menu.
+  //   GET  /shell/status                     -> { supported, registered, folders, files, allFiles, … }
+  //   POST /shell/register  {allFiles?:bool} -> { ok, … }
+  //   POST /shell/unregister                 -> { ok, … }
+  // Registration writes only under HKCU\Software\Classes, so it needs no elevation and is
+  // reversible from the same screen that turned it on.
+  if (path === "/shell/status") {
+    // Two independent routes to the same verb: registry keys reach the CLASSIC menu (and
+    // Windows 10), the MSIX package reaches the Windows 11 SHORT menu. Report both.
+    const [classic, modern] = await Promise.all([shellStatus(ROOT), msixStatus().catch((e) => ({ supported: false, error: String(e.message || e) }))]);
+    res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ...classic, msix: modern }));
+    return;
+  }
+  if ((path === "/shell/msix-install" || path === "/shell/msix-uninstall") && req.method === "POST") {
+    const log = [];
+    let r;
+    try {
+      if (path === "/shell/msix-install") {
+        // The two machine-wide switches the package needs are flipped here, each behind one
+        // Windows consent dialog, and the install is retried: nothing is handed to the person to
+        // paste. (MSVC, when absent, is installed by the Settings tab through /install first.)
+        const q1 = (v) => "'" + String(v).replace(/'/g, "''") + "'";
+        r = await msixInstall((l) => log.push(l));
+        for (let i = 0; i < 2 && !r.ok; i++) {
+          let script = null, what = "";
+          if (/Developer Mode is off/i.test(r.error || "")) {
+            what = "Developer Mode";
+            script = "reg.exe add 'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock' /v AllowDevelopmentWithoutDevLicense /t REG_DWORD /d 1 /f | Out-Null; exit $LASTEXITCODE";
+          } else if (r.needsTrust && r.cerPath) {
+            what = "signing certificate trust";
+            script = `Import-Certificate -FilePath ${q1(r.cerPath)} -CertStoreLocation Cert:\\LocalMachine\\TrustedPeople -ErrorAction Stop | Out-Null`;
+          } else break;
+          log.push(`${what}: requesting elevation`);
+          const code = await runElevated(script);
+          if (code !== 0) { r = { ok: false, error: code === 1223 ? `${what}: elevation declined` : `${what}: elevated step exit ${code}` }; break; }
+          log.push(`${what}: set`);
+          r = await msixInstall((l) => log.push(l));
+        }
+        if (r && !r.ok) { delete r.command; if (r.needsTrust) r.error = "signing certificate not trusted after the elevated import"; }
+      } else r = await msixUninstall((l) => log.push(l));
+    } catch (e) { r = { ok: false, error: String((e && e.message) || e) }; }
+    res.writeHead(r.ok ? 200 : 400, { ...HEADERS, "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ...r, log }));
+    return;
+  }
+  if ((path === "/shell/register" || path === "/shell/unregister") && req.method === "POST") {
+    let body = "";
+    req.on("data", (d) => { body += d; if (body.length > 4096) req.destroy(); });
+    req.on("end", async () => {
+      const log = [];
+      let r;
+      try {
+        const opts = JSON.parse(body || "{}");
+        r = path === "/shell/register"
+          ? await shellRegister(ROOT, { allFiles: !!opts.allFiles }, (l) => log.push(l))
+          : await shellUnregister(ROOT, (l) => log.push(l));
+      } catch (e) { r = { ok: false, error: String((e && e.message) || e) }; }
+      res.writeHead(r.ok ? 200 : 400, { ...HEADERS, "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ...r, log }));
+    });
+    return;
+  }
+
+  // Classify a path the shell verb handed us, so the Convert tab knows what to do with it.
+  //   GET /open-info?path=…  ->  { kind: "dir"|"file", ext, parent, files? }
+  if (path === "/open-info") {
+    const target = url.searchParams.get("path") || "";
+    res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
+    try {
+      const st = await stat(target);
+      if (st.isDirectory()) {
+        const names = await readdir(target);
+        res.end(JSON.stringify({ kind: "dir", path: target, files: names.length }));
+      } else {
+        res.end(JSON.stringify({ kind: "file", path: target, ext: extname(target).toLowerCase(), parent: dirname(target) }));
+      }
+    } catch (e) { res.end(JSON.stringify({ error: String((e && e.message) || e) })); }
     return;
   }
 

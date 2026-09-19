@@ -23,6 +23,7 @@
  * Options
  *   --port N      base port for the dev server (default 8137; serve.mjs walks up 10 if busy)
  *   --src clip    .ares under apps/demo to open in the app (default: first clip present)
+ *   --open PATH   a folder or file to open in the Convert tab (the Windows shell verb uses this)
  *   --detach      start the server in the background and exit (what the Windows path uses)
  *   --no-open     do not open a browser
  *   --no-build    skip the TypeScript build
@@ -51,7 +52,7 @@ const PAGE = { app: "/apps/demo/", probe: "/apps/phase0-probe/", bench: "/bench/
 /** Clips the app opens without being told which. .ares files are git-ignored, so a fresh clone
  *  has none of them and mode app synthesizes demo.ares instead. */
 const CLIP_CANDIDATES = ["daniel-s0.ares", "daniel.ares", "demo.ares"];
-const OPTIONS = ["--port", "--src", "--detach", "--no-open", "--no-build", "--no-install", "--help"];
+const OPTIONS = ["--port", "--src", "--open", "--detach", "--no-open", "--no-build", "--no-install", "--help"];
 
 let ownsServer = false; // true once this process started the server itself (foreground mode)
 
@@ -105,17 +106,20 @@ Log: tools/launch.log`;
  *  `--src bench.ares bench`, the mode is still bench and the clip is still bench.ares. */
 function parseArgs(argv) {
   if (argv.includes("-h") || argv.includes("--help")) { console.log(HELP); process.exit(0); }
-  const out = { src: undefined, port: DEFAULT_PORT, detach: false, open: true, build: true, install: true };
+  const out = { src: undefined, openPath: undefined, port: DEFAULT_PORT, detach: false, open: true, build: true, install: true };
   const positional = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (!a.startsWith("-")) { positional.push(a); continue; }
     if (!OPTIONS.includes(a)) fail(`unknown option ${a}: run with --help`);
-    if (a === "--port" || a === "--src") {
+    if (a === "--port" || a === "--src" || a === "--open") {
       const v = argv[++i];
       // A value flag followed by another flag (or by nothing) is a usage error, not a value.
-      if (v === undefined || v.startsWith("-")) fail(`${a}: expected a value`);
+      // --open is the exception: a Windows path can legitimately begin with "-", and the shell
+      // verb passes whatever the user right-clicked, so only reject a MISSING value there.
+      if (v === undefined || (a !== "--open" && v.startsWith("-"))) fail(`${a}: expected a value`);
       if (a === "--src") { out.src = v; continue; }
+      if (a === "--open") { out.openPath = v; continue; }
       const n = Number(v);
       if (!Number.isInteger(n) || n < 1024 || n > 65535) fail(`--port: expected an integer 1024-65535, got ${JSON.stringify(v)}`);
       out.port = n;
@@ -255,7 +259,12 @@ await ensureDeps(opts.install);
 await build(opts.build, opts.mode !== "probe");
 
 let query = "";
-if (opts.mode === "app") query = `?src=${await ensureClip(opts.src)}`;
+if (opts.mode === "app") {
+  query = `?src=${await ensureClip(opts.src)}`;
+  // Sent by the Windows "Convert to .ares" shell verb. The app opens the Convert tab on it: a
+  // folder is analysed, a container is probed, a lone mesh points at the folder that holds it.
+  if (opts.openPath) query += `&open=${encodeURIComponent(resolvePath(opts.openPath))}`;
+}
 
 if (opts.mode === "bench") {
   if (!existsSync(BENCH_JS)) fail("the bench is not built. Run without --no-build.");

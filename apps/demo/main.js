@@ -571,7 +571,16 @@ function setTab(name) {
   $("tab-compare").classList.toggle("active", name === "compare");
   $("tab-settings").classList.toggle("active", name === "settings");
   $("tab-compute").classList.toggle("active", name === "compute");
-  if (name === "convert" && !convertInited) { convertInited = true; import("./convert.js").then((m) => m.initConvert()).catch((e) => console.error(e)); }
+  if (name === "convert" && !convertInited) {
+    convertInited = true;
+    import("./convert.js").then((m) => {
+      m.initConvert();
+      // ?open=<path> comes from the Windows "Convert to .ares" shell verb (ARES.mjs --open).
+      // Handled after init so the tab's own wiring exists before the path drives it.
+      const target = new URLSearchParams(location.search).get("open");
+      if (target) m.openPath(target);
+    }).catch((e) => console.error(e));
+  }
   if (name === "compare" && !compareInited) { compareInited = true; import("./compare.js").then((m) => m.initCompare()).catch((e) => console.error(e)); }
   else if (compareInited) import("./compare.js").then((m) => m.setCompareActive?.(name === "compare")).catch(() => { /* module already failed */ });
   if (name === "settings" && !settingsInited) { settingsInited = true; import("./settings.js").then((m) => m.initSettings()).catch((e) => console.error(e)); }
@@ -3809,6 +3818,8 @@ async function main() {
   // looks COMPLETELY BLANK (measured: 0 pickRaster hits vs 730 framed). Out-of-family carry →
   // keep the player's own AABB auto-framing instead of applying it.
   const qs = new URLSearchParams(location.search);
+  // The shell verb opens the app pointed at a path: go where that path is handled, not the Viewer.
+  if (qs.get("open")) setTab("convert");
   if (qs.get("cam")) {
     const [az, el, d, tx, ty, tz] = qs.get("cam").split("_").map(Number);
     let camOk = [az, el, d, tx, ty, tz].every(Number.isFinite);

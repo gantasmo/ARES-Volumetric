@@ -1,0 +1,6 @@
+; COM in-proc server exports. Named here rather than with __declspec(dllexport) so the symbols
+; come out undecorated on both x86 and x64.
+LIBRARY AresShell
+EXPORTS
+    DllGetClassObject   PRIVATE
+    DllCanUnloadNow     PRIVATE

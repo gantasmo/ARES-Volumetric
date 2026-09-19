@@ -39,6 +39,7 @@ Two companion documents summarize the project at different depths:
   packages/react/        @ares/react   <Ares/> for @react-three/fiber
   tools/serve.mjs        Zero-dependency dev server: COOP/COEP headers + local GUI endpoints
   tools/installer.mjs    Component catalog + installers behind the Settings tab (GPU-aware)
+  tools/shell-integration.mjs, tools/msix/   Windows right-click "Convert to .ares" verb
   tools/sam-service/     Local FastAPI service: SAM segmentation (editor assist), SAM 3 video
                          tracking, Depth-Anything-V2 depth engine (depth.py, 2D video → 2.5D)
   tools/4ds/             .4ds decode host for a locally licensed 4DViews codec DLL (not included)
