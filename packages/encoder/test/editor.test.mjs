@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { collectSculptOps, applySculptToFrame, synthClip, filterFrame } from "../dist/index.js";
-import { parseEditList, keepPredicateAt, prepareRangeSdfAt, morphBitmap, growKeyframe, mirrorKeyframe, rleEncodeMask, rleDecodeMask, isRangeEnabled } from "@ares/core";
+import { parseEditList, validateMasks, keepPredicateAt, prepareRangeSdfAt, morphBitmap, growKeyframe, mirrorKeyframe, rleEncodeMask, rleDecodeMask, isRangeEnabled } from "@ares/core";
 
 /** Flat n×n grid on y = 0 (see mesh.test.mjs); noisy y when `noise` is set. */
 function gridPlane(n, noise = 0) {
@@ -151,4 +151,59 @@ test("sculpt runs inside a real mesh frame without breaking topology", () => {
   const st = applySculptToFrame(f, op, 0);
   assert.ok(st && st.vertices > 0 && st.feather > 0);
   assert.equal(f.indices.length, tris);
+});
+
+const CAM = (aspect) => ({ azimuth: 0.3, elevation: 0.1, distance: 2, target: [0, 0, 0], aspect });
+/** An all-zero bitmap of w×h: rleEncodeMask closes the final run, so the runs sum to w*h exactly. */
+const BMP = (w, h) => ({ width: w, height: h, rle: rleEncodeMask(new Uint8Array(w * h)) });
+const doc = (volumes, extra = {}) => ({ aresEdits: 1, ranges: [{ id: "r1", mode: "delete", startFrame: 0, endFrame: 10, keyframes: [{ frame: 3, volumes }], ...extra }] });
+
+test("validateMasks reports the mask2d faults that bake as a silent no-op", () => {
+  // Clean: a marquee rect volume (no mask, no aspect to check) beside a bitmap whose camera aspect
+  // matches it. The rect branch is the regression that matters — every box-select authors one.
+  assert.deepEqual(validateMasks(doc([
+    { type: "mask2d", kind: "rect", rect: [-0.5, -0.25, 0.5, 0.25], camera: CAM(2) },
+    { type: "mask2d", kind: "bitmap", mask: BMP(64, 32), camera: CAM(2) },
+    { type: "box", min: [0, 0, 0], max: [1, 1, 1] },
+  ])), []);
+
+  // prepareVolume gates on `kind` and returns null without it: the range is in the timeline, the
+  // bake reports success, and not one triangle moves.
+  assert.match(validateMasks(doc([{ type: "mask2d", mask: BMP(64, 32), camera: CAM(2) }]))[0], /r1 kf 3 has no kind and will never match/);
+  assert.match(validateMasks(doc([{ type: "mask2d", kind: "blob", mask: BMP(64, 32), camera: CAM(2) }]))[0], /unknown kind "blob"/);
+  assert.match(validateMasks(doc([{ type: "mask2d", kind: "bitmap", mask: BMP(64, 32) }]))[0], /has no camera/);
+  // A truncated write: the runs no longer cover the bitmap, so every pixel past them reads 0.
+  assert.match(validateMasks(doc([{ type: "mask2d", kind: "bitmap", mask: { width: 64, height: 32, rle: [100, 5] } }]))[1], /rle runs sum to 105, not 64x32 = 2048/);
+  assert.match(validateMasks(doc([{ type: "mask2d", kind: "bitmap", mask: BMP(64, 32), camera: CAM(1) }]))[0], /camera\.aspect 1\.0000 is not the bitmap's 64x32 = 2\.0000/);
+  assert.equal(validateMasks(doc([{ type: "mask2d", kind: "bitmap", mask: BMP(64, 32), camera: CAM(1.99) }])).length, 0, "aspect within 1% is a rounding, not a fault");
+
+  // rect faults: an unordered rect selects nothing, and so does one that has left the screen.
+  assert.match(validateMasks(doc([{ type: "mask2d", kind: "rect", rect: [0.5, -0.5, -0.5, 0.5], camera: CAM(1) }]))[0], /is not ordered x0<x1, y0<y1/);
+  assert.match(validateMasks(doc([{ type: "mask2d", kind: "rect", rect: [-3, -0.5, -1.5, 0.5], camera: CAM(1) }]))[0], /lies wholly outside NDC \[-1, 1\]/);
+  assert.match(validateMasks(doc([{ type: "mask2d", kind: "rect", camera: CAM(1) }]))[0], /needs rect \[x0, y0, x1, y1\]/);
+  // A rect that merely OVERHANGS the screen is what Grow writes at the viewport edge, and
+  // prepareVolume's max-of-half-planes evaluates it correctly. Flagging it would fail verify-edits
+  // on a document that bakes exactly as previewed.
+  assert.deepEqual(validateMasks(doc([{ type: "mask2d", kind: "rect", rect: [-1.05, -1.05, 1.05, 1.05], camera: CAM(1) }])), []);
+
+  // Keyframe-level faults. bracket() can only ever reach one of a duplicated pair; a keyframe with
+  // no `volumes` array is the one shape that THROWS in the bake rather than no-opping.
+  const box = { type: "box", min: [0, 0, 0], max: [1, 1, 1] };
+  const kfDoc = (keyframes) => ({ aresEdits: 1, ranges: [{ id: "r1", mode: "delete", startFrame: 0, endFrame: 10, keyframes }] });
+  const issues = validateMasks(kfDoc([{ frame: 3, volumes: [box] }, { frame: 3, volumes: [box] }, { frame: 5 }]));
+  assert.equal(issues.length, 2);
+  assert.match(issues[0], /range r1 has two keyframes at frame 3/);
+  assert.match(issues[1], /range r1 kf 5 has no volumes array — prepareKeyframe throws on it/);
+
+  // NOT a fault: a keyframe past the span's edge is what dragging a range handle leaves behind
+  // (the drag moves startFrame/endFrame and never the keyframes), and bracket() still hands it to
+  // every in-span frame below 40 as the anchor they lerp from.
+  assert.deepEqual(validateMasks(kfDoc([{ frame: 0, volumes: [box] }, { frame: 40, volumes: [box] }])), []);
+  // Unreachable IS a fault: with a second keyframe at 5, kf 0's window is [-∞, 5) and the span
+  // starts at 50, so nothing ever brackets it.
+  const far = validateMasks({ aresEdits: 1, ranges: [{ id: "r1", mode: "delete", startFrame: 50, endFrame: 60, keyframes: [
+    { frame: 0, volumes: [box] }, { frame: 5, volumes: [box] }, { frame: 55, volumes: [box] },
+  ] }] });
+  assert.equal(far.length, 1);
+  assert.match(far[0], /range r1 kf 0 is unreachable — no frame in \[50, 60\] brackets it/);
 });

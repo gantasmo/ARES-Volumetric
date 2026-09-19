@@ -15,6 +15,7 @@
  *               audio (both): [--audio file] [--audio-offset s] [--audio-bitrate kbps]
  *   ares export <file.ares> -o <out> [--frame N]      (.obj/.ply for meshes; .spz/.ply/.glb/.splat for splats)
  *   ares info   <file.ares>
+ *   ares verify-edits <file.edits.json>               (mask2d/keyframe pre-flight, exit 1 on any issue)
  */
 import { readdir, readFile, writeFile, stat } from "node:fs/promises";
 import { readFileSync } from "node:fs";
@@ -33,7 +34,7 @@ import { decodedMeshToFrame, writeObj, writeMeshPly } from "./export.js";
 import { transcodeToOpus, type AudioTrackData } from "./audio-mux.js";
 import { filterFrame, parseCropBox } from "./crop.js";
 import { decimateFrame, simplifierReady } from "./decimate.js";
-import { parseEditList, keepPredicateAt, prepareRangeAt, prepareRangeSdfAt, isRangeEnabled, type EditList, type EditRange } from "@ares/core";
+import { parseEditList, validateMasks, keepPredicateAt, prepareRangeAt, prepareRangeSdfAt, isRangeEnabled, type EditList, type EditRange } from "@ares/core";
 import { resolveOffset, applyTransform, applyTransformNormals, transformAabb, type ModelTransform } from "@ares/core";
 import type { Aabb } from "@ares/core";
 import { collectCopyOps, applyGeoCopy, resolveSrcFragment, buildPieceFragment, type CopyOp } from "./frame-copy.js";
@@ -318,6 +319,11 @@ async function encode(a: string[]) {
   const editsArg = flag(a, "--edits");
   if (editsArg) {
     editList = parseEditList(JSON.parse(await readFile(editsArg, "utf8")));
+    // parseEditList throws on a malformed DOCUMENT; validateMasks reports a malformed VOLUME, which
+    // bakes as a silent no-op instead (prepareVolume returns null and the range matches nothing).
+    // Warn rather than abort: an edit list with one bad keyframe out of hundreds should still bake.
+    // `ares verify-edits` is the same check with an exit code, for a scripted pre-flight.
+    for (const issue of validateMasks(editList)) console.warn(`[ares] edits: ${issue}`);
     const muted = editList.ranges.filter((r) => !isRangeEnabled(r)).length;
     if (muted) { console.log(`[ares] edits: ${muted} muted range(s) skipped`); editList.ranges = editList.ranges.filter(isRangeEnabled); }
   }
@@ -1050,6 +1056,43 @@ async function info(a: string[]) {
   console.log(`       AABB min [${s.aabb.min.map((v) => v.toFixed(2)).join(", ")}] max [${s.aabb.max.map((v) => v.toFixed(2)).join(", ")}]`);
 }
 
+/**
+ * `ares verify-edits <file.edits.json>` — a sidecar pre-flight that needs no frames directory.
+ * parseEditList throws on a malformed document; this additionally runs validateMasks, which is
+ * the only check that catches the failure mode a bake CANNOT report: an unrecognised mask2d
+ * matches nothing, so the encode succeeds and the edit silently did not happen. Exits 1 on any
+ * issue so a script can gate a bake on it.
+ */
+async function verifyEdits(a: string[]) {
+  const path = a[1]!;
+  const list = parseEditList(JSON.parse(await readFile(path, "utf8")));
+  const trim = list.trim ? `, trim ${list.trim.in}..${list.trim.out}` : "";
+  console.log(`[ares] ${path}: ${list.ranges.length} range(s)${list.frameCount ? `, ${list.frameCount} source frames` : ""}${trim}`);
+  const issues = validateMasks(list);
+  list.ranges.forEach((r, i) => {
+    const derived = r.keyframes.filter((k) => k.derived === true).length;
+    const shapes = new Set<string>();
+    for (const kf of r.keyframes) for (const v of kf.volumes ?? []) {
+      shapes.add(v.type !== "mask2d" ? v.type
+        : v.kind === "bitmap" && v.mask ? `mask2d bitmap ${v.mask.width}x${v.mask.height}`
+        : `mask2d ${v.kind ?? "no kind"}`);
+    }
+    // Re-run per range for the count only: the printed issues come from the whole-document pass
+    // above, which is the one that knows each range's real index for an id-less range.
+    const bad = validateMasks({ ...list, ranges: [r] }).length;
+    // `muted` is the one field of the same kind as mode/action that changes whether the bake reads
+    // this range at all (encode filters on isRangeEnabled), so a report that gates a bake has to
+    // say it — otherwise a muted range's issues read as a reason the bake will fail when the bake
+    // will not even look at it.
+    console.log(`       ${r.id ?? `#${i}`} · ${r.mode}${r.action && r.action !== "delete" ? ` ${r.action}` : ""}${isRangeEnabled(r) ? "" : " · muted"} · frames ${r.startFrame}..${r.endFrame} · ` +
+      `${r.keyframes.length} kf (${r.keyframes.length - derived} user, ${derived} derived) · ${[...shapes].join(", ") || "no volumes"} · ${bad ? `${bad} issue(s)` : "ok"}`);
+  });
+  for (const issue of issues) console.log(`[ares] edits: ${issue}`);
+  // exitCode, not exit(): the summary above is several console.log calls and a piped stdout on
+  // Windows flushes asynchronously, so exiting here would truncate the very report being gated on.
+  if (issues.length) process.exitCode = 1;
+}
+
 const USAGE = `usage:
   ares synth  [-o out.ares] [--shape object|talk|splat] [--frames 60] [--fps 30] [--no-texture] [--sh-degree 0|1]
   ares encode <frames-dir> [-o out.ares] [--fps 30] [--max-frames N] [--gop 30]
@@ -1067,7 +1110,8 @@ const USAGE = `usage:
               [--audio file] [--audio-offset seconds] [--audio-bitrate kbps]   (any format ffmpeg reads → Opus 48 kHz)
   ares export <file.ares> -o <out> [--frame N]
               mesh → .obj | .ply      splat → .spz | .ply (3DGS) | .glb (KHR_gaussian_splatting) | .splat
-  ares info   <file.ares>`;
+  ares info   <file.ares>
+  ares verify-edits <file.edits.json>   (per-range keyframe/mask2d report; exit 1 on any issue)`;
 
 async function main() {
   const a = process.argv.slice(2);
@@ -1077,6 +1121,7 @@ async function main() {
     else if (cmd === "encode" && a[1]) await encode(a);
     else if (cmd === "export" && a[1]) await exportCmd(a);
     else if (cmd === "info" && a[1]) await info(a);
+    else if (cmd === "verify-edits" && a[1]) await verifyEdits(a);
     else {
       console.error(USAGE);
       process.exit(cmd === "--help" || cmd === "-h" || cmd === "help" ? 0 : 1);
