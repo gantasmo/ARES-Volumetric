@@ -855,7 +855,10 @@ function samJson(method, pathname, body, timeoutMs = 5000) {
 // every request, so a page on any other origin (or a same-site page on another port) is refused
 // here even though the server only listens on loopback: EventSource/GET side effects were the
 // audit's CSRF finding. Non-browser callers (curl, scripts) send no such header and pass.
-const GUARDED = /^\/(encode|convert-4ds|enhance|sam\/start|forge\/start|setup\/|runpod\/(launch|stop|action|logs)|pick|log|edits\/|showcase|deps\/)/;
+// /sam/track/ joins /sam/start for the same reason: opening a track session pins 2,263 MiB of
+// device memory (measured, tools/sam-service/track_smoke.py) and a run is 291.6 ms/frame of GPU
+// for the length of a clip. The rest of /sam/* stays unguarded — one forward pass, no state.
+const GUARDED = /^\/(encode|convert-4ds|depth-convert|depth\/(upload|source)|probe-video|enhance|sam\/(start|track\/)|forge\/start|setup\/|runpod\/(launch|stop|action|logs|key)|pick|log|edits\/|showcase|deps\/|install|shell\/|hf-token|import-ares|delete-ares|save-thumb|open-info|resolve-dir)/;
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
 function sameOrigin(req) {
   const sfs = req.headers["sec-fetch-site"];
