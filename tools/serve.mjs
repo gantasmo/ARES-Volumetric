@@ -685,9 +685,44 @@ async function handle(req, res) {
       return;
     }
     if (req.method === "POST") {
-      let body = "";
-      req.on("data", (d) => { body += d; if (body.length > 4_000_000) req.destroy(); });
+      // 16 MB, not 4, because one propagated range writes a bitmap keyframe per FRAME and the demo
+      // saves pretty-printed (main.js:1057 — JSON.stringify(edits, null, 1)). rleEncodeMask
+      // (edits.ts:50) emits alternating run lengths over the FLAT row-major bitmap, so a silhouette
+      // costs two runs per edge crossing per covered row: a standing figure in a 768 px long-side
+      // mask (768x432) covers 390 rows and measures 1,185 runs, mean run 280 — 3 digits. Every run
+      // is its own ARRAY ELEMENT nine levels down (ranges/keyframes/volumes/mask/rle), so `null, 1`
+      // spends ",\n" plus 9 spaces plus the digits on each: 13.7 bytes measured, 16,290 bytes for
+      // the keyframe. x272 frames = 4.4 MB, over the old cap on ONE object with no user keyframes
+      // and nothing else in the document. Headroom the 16 MB buys: maskRes 1008 is ~5.8 MB, two
+      // tracked objects at 768 ~8.9 MB, a 500-frame clip at 768 ~8.1 MB. The same document
+      // serialized compact is 1.2 MB, so the cap stays generous even after the writer stops
+      // pretty-printing tracked documents.
+      //
+      // And overflow ANSWERS now. `req.destroy()` sent no response at all, which doSave's
+      // .catch(() => {}) (main.js:1057) swallows whole: the sidecar silently stopped being written
+      // and the track was gone on the next reload with nothing logged anywhere.
+      const CAP = 16_000_000;
+      const chunks = [];
+      let bytes = 0, over = false;
+      req.on("data", (d) => {
+        bytes += d.length;
+        if (bytes > CAP) {
+          if (!over) {
+            over = true;
+            chunks.length = 0;                  // drop what was buffered; keep draining so the 413 flushes
+            const declared = Number(req.headers["content-length"]);
+            res.writeHead(413, { ...HEADERS, "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "edit list too large", bytes: declared > bytes ? declared : bytes, cap: CAP }));
+          }
+          return;
+        }
+        chunks.push(d);
+      });
       req.on("end", async () => {
+        if (over) return;                       // the 413 already answered
+        // Buffer.concat, not `body += d`: the cap is a BYTE cap, and per-chunk toString() turns a
+        // chunk boundary landing mid-sequence in a non-ASCII range label into U+FFFD.
+        const body = Buffer.concat(chunks).toString("utf8");
         try {
           JSON.parse(body); // must at least be JSON
           // One-deep backup before every overwrite: a stale browser tab's debounced autosave can
