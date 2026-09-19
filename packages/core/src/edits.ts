@@ -319,9 +319,15 @@ function bracket(r: EditRange, f: number): { a: EditKeyframe; b: EditKeyframe; t
   const first = kfs[0]!, last = kfs[kfs.length - 1]!;
   if (f <= first.frame) return { a: first, b: first, t: 0 };
   if (f >= last.frame) return { a: last, b: last, t: 0 };
+  // Half-open [a.frame, b.frame): an EXACT keyframe hit must land as `a` with t=0, never as `b`
+  // with t=1. Closed-on-b was harmless while keyframes were sparse and hand-authored, but a
+  // propagated range carries one keyframe per frame, and there every frame is an exact hit:
+  // prepareRangeSdfAt would compile and probe BOTH bracketing keyframes per centroid (2× the
+  // work and 2× the resident decoded-mask memory), and worse, `interp:"hold"` forces t=0 BELOW
+  // this — pinning a dense hold range to the PREVIOUS frame's region at every frame.
   for (let i = 0; i < kfs.length - 1; i++) {
     const a = kfs[i]!, b = kfs[i + 1]!;
-    if (f >= a.frame && f <= b.frame) {
+    if (f >= a.frame && f < b.frame) {
       return { a, b, t: b.frame === a.frame ? 0 : (f - a.frame) / (b.frame - a.frame) };
     }
   }
