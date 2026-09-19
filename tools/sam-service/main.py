@@ -126,6 +126,11 @@ _sam3_processor = None
 _predictor = None        # vit_h SamPredictor
 _load_error = None
 _lock = threading.Lock()  # both backends hold single-image state; serialize requests.
+# Set when _loader() has finished, whether it succeeded or not. The loader runs on a background
+# thread and never takes _lock (it is not a request path), so nothing else stops a second
+# multi-gigabyte load from allocating on top of it — which is exactly what track.py's lazy
+# Sam3VideoModel load would do if a track started inside the 30-60 s window. It waits on this.
+_load_done = threading.Event()
 
 # ---- TEXT/CONCEPT model — loaded after _sam3_model, sharing its vision tower.
 _sam3_concept_model = None
@@ -247,30 +252,36 @@ def _load_vith():
 
 def _loader():
     global _backend, _load_error, _concept_load_error
-    order = {"auto": ["sam3", "vit_h"], "sam3": ["sam3"], "vit_h": ["vit_h"]}.get(BACKEND_PREF, ["sam3", "vit_h"])
-    errors = []
-    for name in order:
-        try:
-            (_load_sam3 if name == "sam3" else _load_vith)()
-            _backend = name
-            break
-        except Exception as e:  # try the next backend; surface everything via /health
-            errors.append(f"{name}: {type(e).__name__}: {e}")
-            print(f"[ares-sam] backend {name} failed: {errors[-1]}")
-    else:
-        _load_error = " | ".join(errors)
-        return
+    try:
+        order = {"auto": ["sam3", "vit_h"], "sam3": ["sam3"], "vit_h": ["vit_h"]}.get(BACKEND_PREF, ["sam3", "vit_h"])
+        errors = []
+        for name in order:
+            try:
+                (_load_sam3 if name == "sam3" else _load_vith)()
+                _backend = name
+                break
+            except Exception as e:  # try the next backend; surface everything via /health
+                errors.append(f"{name}: {type(e).__name__}: {e}")
+                print(f"[ares-sam] backend {name} failed: {errors[-1]}")
+        else:
+            _load_error = " | ".join(errors)
+            return
 
-    # Text/concept-prompted segmentation: only meaningful on the sam3 backend
-    # (vit_h has no text path). Gated by SAM_TEXT so a VRAM-tight machine can disable it
-    # without losing the click-to-select tool — a concept-model failure never takes the
-    # tracker down (it already finished loading above).
-    if _backend == "sam3" and SAM_TEXT:
-        try:
-            _load_sam3_concept()
-        except Exception as e:
-            _concept_load_error = f"{type(e).__name__}: {e}"
-            print(f"[ares-sam] concept model (text prompts) failed to load: {_concept_load_error} — /segment_text will 503")
+        # Text/concept-prompted segmentation: only meaningful on the sam3 backend
+        # (vit_h has no text path). Gated by SAM_TEXT so a VRAM-tight machine can disable it
+        # without losing the click-to-select tool — a concept-model failure never takes the
+        # tracker down (it already finished loading above).
+        if _backend == "sam3" and SAM_TEXT:
+            try:
+                _load_sam3_concept()
+            except Exception as e:
+                _concept_load_error = f"{type(e).__name__}: {e}"
+                print(f"[ares-sam] concept model (text prompts) failed to load: {_concept_load_error} — /segment_text will 503")
+    finally:
+        # In a finally, and after the CONCEPT model too: a load that failed still has to release
+        # the waiter or /track/open blocks for nothing, and the concept model is the vision tower
+        # track.py grafts instead of loading a second ~908 MiB copy of.
+        _load_done.set()
 
 
 # Load on a BACKGROUND thread so uvicorn binds the port within ~1 s of process start.
@@ -279,6 +290,28 @@ def _loader():
 # (WinError 10048 — the 2026-07-10 startup failure). With bind-first, /health answers
 # {"loading": true} immediately and duplicate launchers exit instead of racing.
 threading.Thread(target=_loader, daemon=True, name="sam-load").start()
+
+# ---- VIDEO TRACKER (mask propagation) — /track/*, reached by the browser as /sam/track/*.
+# Purely additive: track.py loads its own Sam3VideoModel LAZILY on the first /track/open and
+# latches the failure, the same discipline /upscale and /detail use, so nothing below this line
+# can change what /segment or /segment_text do. It borrows _lock for each single-frame forward
+# (never for a whole run) and reads _sam3_concept_model through a callable rather than a value,
+# because _loader above is still running on its background thread at this point — the concept
+# model appears minutes later, and IT is the detector the video model then shares instead of moving
+# a second 840.38 M-parameter copy (~1.6 GiB at fp16) onto the card. _load_done is how track.py
+# waits for that rather than racing it. An import failure here is latched the same way: /track/*
+# 503s, everything else is untouched.
+_track_import_error = None
+try:
+    import track as _track
+
+    _track.configure(device=DEVICE, dtype=SAM_DTYPE, sam3_dir=SAM3_DIR, model_lock=_lock,
+                     get_concept_model=lambda: _sam3_concept_model, load_done=_load_done)
+    app.include_router(_track.router)
+except Exception as e:
+    _track = None
+    _track_import_error = f"{type(e).__name__}: {e}"
+    print(f"[ares-sam] video tracker routes unavailable: {_track_import_error}")
 
 
 def _ready():
@@ -338,6 +371,11 @@ def _vith_set_image_cached(predictor, raw: bytes, img: np.ndarray) -> None:
 
 @app.get("/health")
 def health():
+    # Video tracker — independent of both models above, and reported even when its routes failed to
+    # mount so the editor's SAM row and Settings' #depSam read the same flag.
+    track = _track.health_fields() if _track is not None else {
+        "trackReady": False, "trackLoading": False, "trackError": _track_import_error,
+        "trackSessions": 0, "trackRes": None, "trackMaxSessions": 0}
     return {
         "ok": _backend is not None,
         "loading": _backend is None and _load_error is None,
@@ -353,6 +391,7 @@ def health():
         "textReady": _sam3_concept_model is not None,
         "textLoading": SAM_TEXT and _backend == "sam3" and _sam3_concept_model is None and _concept_load_error is None,
         "textError": _concept_load_error,
+        **track,
     }
 
 

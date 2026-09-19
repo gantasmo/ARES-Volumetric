@@ -173,12 +173,16 @@ Each keyframe pins the full region set at a frame: `{ frame, volumes: [...] }`. 
 | Volume type | Interpolation | Rationale / analog |
 |---|---|---|
 | `box` | Lerp `min`/`max` corners | AE mask-path keyframe interpolation for the trivial case; HoloEdit's animated subtractive volume |
-| `brushStrokes` | **SDF lerp:** `d(x,t) = (1−t)·d_A(x) + t·d_B(x)`, inside iff `d < 0` | Field interpolation needs **no correspondence** between stroke A and stroke B — the exact property AE lacks (its first-vertex pairing causes mask-morph artifacts) and that per-frame topology demands. Standard level-set shape morphing; degenerates to identity when the user doesn't re-stroke (hold) |
-| `mask2d` | Camera lerp (lerp az/el/dist/target — the orbit param space is already the serialization, `player.getCamera()`); mask via SDF lerp of the two masks' Euclidean distance transforms; depth band lerp | Only used when the user hand-places two sparse mask keyframes. SAM propagation instead emits **dense derived keyframes** (one per frame), like Premiere's tracker writing a keyframe every frame — inside a propagated span there is nothing to interpolate |
+| `brushStrokes` | **SDF lerp:** `d(x,t) = (1−t)·d_A(x) + t·d_B(x)`, inside iff `d < 0` | Field interpolation needs **no correspondence** between stroke A and stroke B; the exact property AE lacks (its first-vertex pairing causes mask-morph artifacts) and that per-frame topology demands. Standard level-set shape morphing; degenerates to identity when the user doesn't re-stroke (hold) |
+| `mask2d` | **None — a hard cut at t = 0.5** (corrected 2026-09-09; see below) | Only used when the user hand-places two sparse mask keyframes. SAM propagation instead emits **dense derived keyframes** (one per frame), like Premiere's tracker writing a keyframe every frame: inside a propagated span there is nothing to interpolate |
 
-Outside the keyframe span but inside the range: **hold** first/last keyframe (AE hold-keyframe semantics). Evaluation of a frame is pure: `insideRegion(worldPoint, frame)` — the same function drives preview and bake.
+**What the `mask2d` row promised versus what `edits.ts` does** (this row read "camera lerp; mask via SDF lerp of the two masks' Euclidean distance transforms; depth band lerp" until 2026-09-09; none of the three was ever implemented). `prepareVolume` (`packages/core/src/edits.ts:351-398`) compiles each keyframe's bitmap against **that keyframe's own** camera matrix and **its own** depth band — there is no interpolation of either, and no distance transform anywhere in the file. The bitmap branch returns a two-valued field: `-0.5` inside, `+0.5` outside (`edits.ts:392`, commented "binary in/out; sign drives the predicate"). The range lerp `(1−t)·d_A + t·d_B` (`edits.ts:465`) applied to two such fields is therefore negative wherever A is inside and t < 0.5, and wherever B is inside and t > 0.5: a sparse pair resolves to **exactly A below the midpoint, exactly B above it, and A ∩ B at t = 0.5** (the disagreement region evaluates to exactly 0, and the predicate is `< 0`). Box and brush volumes still lerp as the rows above describe — those SDFs carry real magnitude in mm; only `mask2d` is degenerate, because a binary bitmap has no magnitude to blend.
 
-**Why geo+texture stay synchronized for free:** the interpolated region drops *triangles*; each triangle carries its UVs (§8). There is no separate texture mask to keep in step — the region is the single source of truth per frame, which is the coherence property the task demands.
+Consequences: a propagated span must write a keyframe on **every** frame rather than sparse anchors, and the SAM section's "the range tweens between them" tooltip (`apps/demo/index.html`) describes behaviour that does not exist. Implementing the promised morph means a Euclidean distance transform at decode time — a per-keyframe EDT over a 768×432 bitmap, then a lerp of two float fields — and is only worth the decode cost if hand-placed sparse mask keyframes become a real authoring path.
+
+Outside the keyframe span but inside the range: **hold** first/last keyframe (AE hold-keyframe semantics). Evaluation of a frame is pure: `insideRegion(worldPoint, frame)`; the same function drives preview and bake.
+
+**Why geo+texture stay synchronized for free:** the interpolated region drops *triangles*; each triangle carries its UVs (§8). There is no separate texture mask to keep in step, the region is the single source of truth per frame, which is the coherence property the task demands.
 
 ### 6.3 Timeline UX
 
@@ -265,28 +269,125 @@ GET  /health         → { model, device }
 
 **Bake-time re-evaluation** (why this survives per-frame topology): at bake, frame f's *source OBJ* triangles are projected into the stored camera and tested against mask f + depth band (§9). The mask constrains a region of the view frustum; whatever geometry frame f has there gets dropped. Vertex correspondence is never consulted.
 
-### 8.4 SAM 3 / SAM 3D status (updated 2026-07-10)
+### 8.4 SAM 3 / SAM 3D status (measured 2026-09-09)
 
-- **SAM 3 is now the service's primary backend** (`tools/sam-service/main.py`,
-  `Sam3TrackerModel` via transformers 5.13, bf16, dedicated env; `facebook/sam3` snapshot at
-  repo-root `sam3\`; ViT-H fallback). `/segment` verified: 0.93-score masks, 360-550 ms per
-  warm click on the 6 GB 3060. The service starts from inside the app (`/sam/start` SSE, Edit
-  panel SAM row).
-- **The click tool shipped 2026-07-10** (see 8.2). Remaining service-side work: a per-image
-  vision-feature cache (each click currently re-encodes the frame, 360-550 ms warm).
-- **Concept (text) prompts** remain available through the same weights (`Sam3Model` family):
-  type "boom mic" and get all instances. The UI text field is future work; the mask output
-  path it needs (bitmap mask2d volumes) now exists.
-- **Temporal propagation**: the SAM 3.1 Object Multiplex video-tracker checkpoint sits at
-  repo-root `sam3.1\` but loads only via the facebookresearch/sam3 repo path today and OOM'd
-  a 24 GB 4090 in video mode (issue #511) — held until transformers integration lands.
-  Practical near-term options: `Sam3TrackerVideoModel` with frames offloaded to CPU
-  (unverified on 6 GB), or SAM 2.1 small (Apache 2.0, proven on 6 GB, identical session API).
-- **SAM 3D** (`sam-3d-objects`, `sam-3d-body`) does single-image 3D reconstruction, not
-  segmentation of existing meshes, so it plays no role in selection. Researched 2026-07-10:
-  sam-3d-body outputs Meta's MHR parametric body (a possible pose prior for temporal denoise,
-  via the fast InstantHMR distillation), and SAM 3D Objects could someday synthesize patch
-  meshes for hole-filling — both out of scope for v2.
+Everything numbered below was produced by `tools/sam-service/track_smoke.py`, a read-only probe
+that CI never runs (it loads a 3.4 GB checkpoint) and whose assertions are its own test. Run it
+to reproduce any of these: `env/Scripts/python.exe track_smoke.py load | seam | measure`.
+
+**Installed environment.** transformers **5.13.0**, torch **2.6.0+cu124**, torchvision
+0.21.0+cu124, Python 3.13.7, in `tools/sam-service/env`. These are NOT the pins in
+`requirements.txt` (5.16.1 / 2.14.0); every signature the propagation work cites was read from
+the installed tree. The checkpoint is the `facebook/sam3` hub-cache snapshot `3c879f39…`,
+`model.safetensors` 3,439,938,512 bytes (`main.py:45-80` resolves it there). All of `sam3`,
+`sam3_tracker`, `sam3_tracker_video`, `sam3_video`, `sam2` and `sam2_video` are present.
+
+**Checkpoint shape**, read out of the safetensors header without loading torch: 1797 tensors, of
+which **538** under `detector_model.vision_encoder.*`, **0** under `tracker_model.vision_encoder.*`,
+and 22 under `tracker_neck.*`. There is exactly one vision tower on disk.
+
+**The load path.** `Sam3VideoModel.from_pretrained` reports **0 missing and 0 mismatched keys** —
+859.92 M parameters: detector 840.38 M (its vision tower 454.04 M), tracker 11.74 M,
+`tracker_neck` 7.80 M. Its `tracker_model.vision_encoder` **is `None`**, because
+`modeling_sam3_video.py:512` constructs the tracker with `remove_vision_encoder=True`.
+Checkpoint config as loaded: `num_maskmem` 7, `max_cond_frame_num` 4, `low_res_mask_size` 288,
+tracker `image_size` 1008.
+
+**Negative control, and a correction.** Loading the tracker alone was expected to fail loudly
+(`base_model_prefix = "tracker_model"` at `modeling_sam3_tracker_video.py:703` plus
+`_keys_to_ignore_on_load_unexpected = [r"^detector_model."]` at `:1602` predict 538 randomly
+initialised vision tensors). Measured, it does not: on transformers 5.13.0
+`Sam3TrackerVideoModel.from_pretrained` loads **845 tensors, 0 missing / 0 unexpected /
+0 mismatched**, because the flexible cross-architecture loader remaps
+`detector_model.vision_encoder.*` onto `vision_encoder.*` (516 trunk tensors, all bit-identical to
+the checkpoint) and `tracker_neck.*` onto `vision_encoder.neck.*` (22 tensors, bit-identical).
+The real cost is duplication, not corruption: **454.04 M of that model's 465.78 M parameters are a
+second copy of the tower the concept model already holds**, ~908 MiB at fp16. That is the
+argument for loading `Sam3VideoModel`, and `track_smoke.py load` pins the bit-identity so a
+future transformers that stops remapping fails there instead of in a quietly worse mask.
+
+**Resident-set delta of adding video tracking**, by parameter count rather than estimate. Today's
+pair after the vision-tower graft (`main.py:180`) is `Sam3TrackerModel` 458.26 M + `Sam3Model`
+840.38 M − the 454.04 M shared tower = **844.60 M**. The video path is `Sam3VideoModel` 859.92 M
+plus the click tracker's non-vision remainder 4.22 M = **864.14 M**. **+19.54 M parameters,
+37.3 MiB at fp16, for the whole memory bank.**
+
+**The towerless-tracker seam is verified running**, not just read. `track_smoke.py seam` primes
+the vision-feature cache with the library's own three-call sequence
+(`modeling_sam3_video.py:1614-1632`: `detector_model.get_vision_features` →
+`get_vision_features_for_tracker` → `inference_session.cache.cache_vision_features`), seeds one
+object, and forwards `vm.tracker_model(inference_session=…, frame_idx=…)`. Result on CUDA in
+fp16: **0 cache misses** across the seeded frame and the propagated frame, `pred_masks`
+(1, 1, 288, 288), `post_process_masks` restoring frame size. `_prepare_vision_features`
+(`modeling_sam3_tracker_video.py:1900`) consults the cache before it would dereference the `None`
+encoder, so a forward that returns at all is itself the proof; the miss counter is the positive
+evidence beside it.
+
+**Measured propagation**, RTX 2080 Ti (sm_75, 11 GB), fp16, 24 frames at trackRes 1008, one
+object, `torch.cuda.synchronize()` around each phase:
+
+| | fp16 | bf16 |
+|---|---|---|
+| per frame, end to end | **291.6 ms** | 1,286.3 ms |
+| vision encoder, median / max | 189.3 / 523.5 ms | 1,079.7 / 1,191.1 ms |
+| tracker head, median / max | 75.6 / 184.8 ms | 197.2 / 221.9 ms |
+| first frame (warm-up included) | 708.2 ms | 1,243.7 ms |
+| device: weights | 1,835 MiB | 1,884 MiB |
+| device: peak allocated | **2,263 MiB** | 5,789 MiB |
+| device: activations + feature cache | 428 MiB | 3,905 MiB |
+| device: peak reserved (what `nvidia-smi` shows) | 3,744 MiB | 7,076 MiB |
+| host RSS | 3,358 MiB | 3,808 MiB |
+| `from_pretrained` + `.to(cuda)` | 4.3 s | 4.1 s |
+
+At 291.6 ms/frame a 272-frame forward pass is **≈ 79 s**, and the whole clip's masks fit inside
+2.3 GiB of device allocation. Max is reported rather than p95, per the instrumentation rule in
+`docs/targeted-temporal.md:27`.
+
+**fp16 is the right dtype on this card, twice over.** `_best_dtype` (`main.py:92-106`) already
+picks fp16 below sm_80 on a throughput measurement; this adds a second, independent one — bf16 is
+**4.4× slower end to end, 5.7× slower in the encoder, and needs 2.6× the device memory** (the
+activation footprint alone goes 428 MiB → 3,905 MiB) because pre-Ampere bf16 falls off the
+tensor-core path onto fallback kernels. Note these bf16 numbers are the pre-Ampere penalty and say
+nothing about bf16 on an Ampere-or-later card, where it is the documented path.
+
+**Three things these numbers do not settle.** (a) **The fp16 accuracy gate.** Whether fp16 is safe
+for the video tracker rests on its mask agreement with bf16 (every SAM 3 model-card video example
+is bfloat16; no published fp16 video validation exists), and this corpus cannot answer it. The
+only numbered frame sequence on this machine is the source capture's **atlas** PNGs, and §8.3
+already records why an atlas is not a SAM input: chart-scrambled, so the tracker never establishes
+a lock — object score falls from 19.8 logits at the seed to a 0.3–2.6 band and mask area
+oscillates tenfold frame to frame, after which the two runs' memory banks diverge and stay
+diverged. Across all 24 frames the IoU median is 0.9245 and the minimum 0.0, which measures the
+corpus. On the one frame where **both** runs hold a confident lock the dtypes agree at **IoU
+0.9867**, which is the only line here that is about numerics. `track_smoke.py measure` therefore
+reports the locked series separately; re-run it over frozen-camera proxy renders once the player
+can capture them, and gate on that series. (b) **VRAM on the 6 GB Ampere card `main.py` also ships
+to**: it picks bf16 on the proper tensor-core path, which this sm_75 box cannot exercise. (c)
+**Mask quality**, which per `docs/targeted-temporal.md:66-72` needs visual review of a full
+propagated span, not a metric — every distance metric in this toolchain has a 0.5–1 mm floor and
+read ~0 for the flattened-nose failure.
+
+**The 2026-07-10 blocker is withdrawn.** It read: the SAM 3.1 video tracker "loads only via the
+facebookresearch/sam3 repo path today and OOM'd a 24 GB 4090 in video mode (issue #511)". That
+loader materialises the whole decoded video on the device before propagating; this path does not
+exist here. `Sam3TrackerVideoInferenceSession` holds frames on `video_storage_device` and caches
+**one** frame's vision features at a time (`max_vision_features_cache_size` defaults to 1,
+`modeling_sam3_tracker_video.py:72-77` evicts the oldest on insert), which is why the measured
+peak above is 2.3 GiB on an 11 GB card rather than 24 GB. Neither the SAM 2.1 fallback nor CPU
+frame offloading is needed.
+
+**Still true from 2026-07-10.** SAM 3 is the service's primary backend (`main.py`,
+`Sam3TrackerModel` click path, `Sam3Model` concept path sharing one grafted vision tower, ViT-H
+fallback); `/segment` returns 0.93-score masks in 360-550 ms per warm click on the 6 GB 3060; the
+service starts from inside the app (`/sam/start` SSE, Edit panel SAM row); the click tool shipped
+(§8.2) and the per-image vision-feature cache that section wanted now exists (`main.py:279-320`).
+Concept (text) prompts run through the same weights.
+
+**SAM 3D** (`sam-3d-objects`, `sam-3d-body`) does single-image 3D reconstruction, not segmentation
+of existing meshes, so it plays no role in selection. Researched 2026-07-10: sam-3d-body outputs
+Meta's MHR parametric body (a possible pose prior for temporal denoise, via the fast InstantHMR
+distillation), and SAM 3D Objects could someday synthesize patch meshes for hole-filling: both out
+of scope for v2.
 
 ---
 
