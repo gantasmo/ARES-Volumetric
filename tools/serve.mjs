@@ -652,8 +652,20 @@ async function handle(req, res) {
       res.writeHead(ur.statusCode ?? 502, out);
       ur.pipe(res);
     });
+    // Tell the SAM service when the browser walked away. pipe() only UNPIPES a dead client socket;
+    // it never destroys the upstream request, so the proxy keeps the upstream response and its
+    // socket open and the service goes on computing for a reader that will never come back.
+    // Measured on a 60-frame /sam/track/run abandoned after 4 masks: without this the service ran
+    // the whole span (16.7 s of GPU) before anything noticed; with it the run stalls at once and
+    // the service's own idle-stream reaper cancels it and frees the inference session. It does NOT
+    // end the upstream generator by itself — starlette cancels its send task and leaves the sync
+    // generator parked, which is exactly the case tools/sam-service/track.py's reaper exists for.
+    // Guarded on writableFinished so a normally completed response is left alone.
+    res.on("close", () => { if (!res.writableFinished) up.destroy(); });
     up.on("error", (e) => {
-      if (res.headersSent) { res.destroy(); return; }
+      // Also bail once the response is gone: the close handler above destroys `up` deliberately,
+      // and answering a 502 into a dead ServerResponse raises on the write instead.
+      if (res.headersSent || res.destroyed || res.writableEnded) { res.destroy(); return; }
       const refused = e.code === "ECONNREFUSED";
       // Auto-start on real work (POST /segment); plain health GETs stay passive so
       // status polling never spawns anything.
