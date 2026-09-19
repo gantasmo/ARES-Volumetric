@@ -1,0 +1,46 @@
+<!doctype html>
+<!--
+  Playback trace for a clip in the real player: loads ?src=, seeks ?from= (frame), plays for ?seconds=
+  with audio off, and records on every animation frame the presented geometry frame, the applied
+  texture frame and the timestamp. Sets window.__result (JSON-able) and document.title to "ready",
+  or "error: ..." when it cannot. ?az= / ?el= / ?dist= place the camera as relief-shot.html does.
+  Driven by tools/relief-shot.mjs --trace, which prints window.__result.
+-->
+<meta charset="utf-8">
+<title>loading</title>
+<style>html,body{margin:0;background:#16161a}canvas{display:block}</style>
+<script type="importmap">
+{ "imports": { "meshoptimizer": "/node_modules/meshoptimizer/meshopt_decoder.mjs", "@ares/core": "/packages/core/dist/index.js" } }
+</script>
+<canvas id="c" width="1280" height="720"></canvas>
+<script type="module">
+import { AresPlayer } from "@ares/core";
+const q = new URLSearchParams(location.search);
+const num = (k, d) => (q.has(k) ? Number(q.get(k)) : d);
+try {
+  const canvas = document.getElementById("c");
+  const player = await AresPlayer.create({ canvas, src: new URL(q.get("src"), location.origin + "/").href, audio: false, autoOrbit: false, forceGL2: q.get("gl2") === "1" });
+  window.player = player;
+  player.setGrid(false);
+  const o = player.getCamera();
+  player.setCamera({ azimuth: num("az", o.azimuth) + num("daz", 0), elevation: num("el", o.elevation) + num("del", 0), distance: o.distance * num("dist", 1), target: o.target });
+  player.seekFrame(num("from", 0));
+  // Let the texture decoder settle on the start frame before the clock runs.
+  await new Promise((r) => setTimeout(r, 800));
+  const rows = [];
+  const t0 = performance.now(), dur = num("seconds", 6) * 1000;
+  player.play();
+  await new Promise((resolve) => {
+    const tick = (now) => {
+      rows.push([+(now - t0).toFixed(2), player.presented, player.texAppliedIdx]);
+      if (now - t0 < dur) requestAnimationFrame(tick); else resolve();
+    };
+    requestAnimationFrame(tick);
+  });
+  player.pause();
+  window.__result = { fps: player.getClipFps(), rows, stats: player.getStats ? player.getStats() : null };
+  document.title = "ready";
+} catch (e) {
+  document.title = "error: " + (e && e.message || e) + " :: " + String(e && e.stack || "").slice(0, 400);
+}
+</script>

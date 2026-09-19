@@ -1,0 +1,52 @@
+<!doctype html>
+<!--
+  Headless render harness for 2D-to-2.5D reliefs. Loads ?src=<clip>, seeks ?frame=, places the orbit
+  camera ?az= / ?el= (radians) at ?dist= times the framed distance, and sets document.title to
+  "ready" once the texture frame has decoded and drawn, or "error: ..." when it cannot. Driven by
+  tools/relief-shot.mjs, which screenshots the page over the DevTools protocol.
+  Without ?az= / ?el= the camera keeps the player's own framing; ?daz= / ?del= offset it (radians).
+  ?zoom= scales the field of view the way the wheel does on a relief; ?fov= sets it in degrees.
+  ?gl2=1 forces the WebGL2 renderer; ?shade=depth|normals|shaded picks the view mode.
+-->
+<meta charset="utf-8">
+<title>loading</title>
+<style>html,body{margin:0;background:#16161a}canvas{display:block}</style>
+<script type="importmap">
+{ "imports": { "meshoptimizer": "/node_modules/meshoptimizer/meshopt_decoder.mjs", "@ares/core": "/packages/core/dist/index.js" } }
+</script>
+<canvas id="c" width="1280" height="720"></canvas>
+<script type="module">
+import { AresPlayer } from "@ares/core";
+const q = new URLSearchParams(location.search);
+const num = (k, d) => (q.has(k) ? Number(q.get(k)) : d);
+try {
+  const canvas = document.getElementById("c");
+  const player = await AresPlayer.create({ canvas, src: new URL(q.get("src"), location.origin + "/").href, audio: false, forceGL2: q.get("gl2") === "1" });
+  window.player = player;
+  if (q.get("shade")) player.setShadeMode(q.get("shade"));
+  player.setGrid(false);
+  player.seekFrame(num("frame", 0));
+  player.autoOrbit = false;
+  const o = player.getCamera();
+  // ?zoom= narrows (> 1) or widens (< 1) the field of view the way the wheel does on a relief;
+  // ?fov= sets it outright, in degrees.
+  const fov0 = o.fov ?? 50;
+  const fov = q.has("fov") ? num("fov", fov0) : (2 * Math.atan(Math.tan((fov0 * Math.PI) / 360) / num("zoom", 1)) * 180) / Math.PI;
+  player.setCamera({
+    azimuth: num("az", o.azimuth) + num("daz", 0), elevation: num("el", o.elevation) + num("del", 0),
+    distance: o.distance * num("dist", 1), target: o.target, fov,
+  });
+  // The texture decoder is asynchronous: draw until two consecutive stats report the asked frame.
+  const t0 = performance.now();
+  await new Promise((resolve) => {
+    const tick = () => {
+      player.tick(0);
+      if (performance.now() - t0 > num("settle", 1500)) resolve(); else requestAnimationFrame(tick);
+    };
+    tick();
+  });
+  document.title = "ready";
+} catch (e) {
+  document.title = "error: " + (e && e.message || e) + " :: " + String(e && e.stack || "").slice(0, 400);
+}
+</script>

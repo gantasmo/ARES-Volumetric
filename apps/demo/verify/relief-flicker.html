@@ -1,0 +1,80 @@
+<!doctype html>
+<!--
+  Frame-to-frame flicker of a clip as the player draws it: loads ?src=, and for every frame of
+  ?from= .. ?to= seeks, waits for that frame's texture, draws, and reads the pixels back. Per step it
+  measures the mean absolute luma change against the previous frame and the share of pixels that
+  switch between background (the clear colour, i.e. a hole) and surface. Each view in ?views=
+  ("daz,del,dist;daz,del,dist", radians and a multiple of the framed distance) is measured over
+  the same frames. Seen from the capture camera a depth change moves nothing on screen, so the
+  difference between an off-axis view and the capture view is the flicker the geometry adds.
+  ?fov= fixes the vertical field of view (degrees) so clips framed differently compare at one
+  image scale. ?shade=uv&lit=0 draws the fixed UV checker, unlit, in place of the video, so only moving geometry
+  changes the image. Sets window.__result and document.title "ready". Driven by tools/relief-shot.mjs with a
+  .json out.
+-->
+<meta charset="utf-8">
+<title>loading</title>
+<style>html,body{margin:0;background:#16161a}canvas{display:block}</style>
+<script type="importmap">
+{ "imports": { "meshoptimizer": "/node_modules/meshoptimizer/meshopt_decoder.mjs", "@ares/core": "/packages/core/dist/index.js" } }
+</script>
+<canvas id="c" width="640" height="360"></canvas>
+<script type="module">
+import { AresPlayer } from "@ares/core";
+const q = new URLSearchParams(location.search);
+const num = (k, d) => (q.has(k) ? Number(q.get(k)) : d);
+const nextFrame = () => new Promise((r) => requestAnimationFrame(() => r()));
+try {
+  const canvas = document.getElementById("c");
+  const player = await AresPlayer.create({ canvas, src: new URL(q.get("src"), location.origin + "/").href, audio: false, autoOrbit: false, forceGL2: q.get("gl2") === "1" });
+  window.player = player;
+  player.setGrid(false);
+  if (q.get("shade")) player.setShadeMode(q.get("shade"));
+  if (q.get("lit") === "0") player.setLit(false);
+  const home = player.getCamera();
+  const views = (q.get("views") || "0,0,1").split(";").map((v) => v.split(",").map(Number));
+  const from = num("from", 0), to = num("to", from + 30);
+  const off = document.createElement("canvas"); off.width = canvas.width; off.height = canvas.height;
+  const ctx = off.getContext("2d", { willReadFrequently: true });
+  const bg = [0.05 * 255, 0.055 * 255, 0.07 * 255];
+  const out = [];
+  for (const [daz, del, dist] of views) {
+    player.setCamera({ azimuth: home.azimuth + daz, elevation: home.elevation + del, distance: home.distance * dist, target: home.target, ...(q.has("fov") ? { fov: num("fov", 50) } : {}) });
+    let prevL = null, prevHole = null, lumaSum = 0, holeSum = 0, steps = 0, unsettled = 0;
+    // ?heat=1: mean per-pixel luma change on a 160x90 grid, to see where the flicker is.
+    const HW = 160, HH = 90, heat = q.get("heat") === "1" ? new Float64Array(HW * HH) : null;
+    for (let t = from; t <= to; t++) {
+      player.seekFrame(t);
+      let tries = 0;
+      while (!player.textureDebug().settled && tries++ < 60) { await nextFrame(); player.tick(0); }
+      if (!player.textureDebug().settled) unsettled++;
+      player.tick(0);
+      ctx.drawImage(canvas, 0, 0);
+      const px = ctx.getImageData(0, 0, off.width, off.height).data;
+      const n = off.width * off.height;
+      const L = new Float32Array(n), hole = new Uint8Array(n);
+      for (let i = 0, j = 0; i < n; i++, j += 4) {
+        L[i] = 0.299 * px[j] + 0.587 * px[j + 1] + 0.114 * px[j + 2];
+        hole[i] = Math.abs(px[j] - bg[0]) < 3 && Math.abs(px[j + 1] - bg[1]) < 3 && Math.abs(px[j + 2] - bg[2]) < 3 ? 1 : 0;
+      }
+      if (prevL) {
+        let dl = 0, dh = 0;
+        for (let i = 0; i < n; i++) {
+          const d = Math.abs(L[i] - prevL[i]);
+          dl += d; dh += hole[i] ^ prevHole[i];
+          if (heat) { const x = i % off.width, y = (i - x) / off.width; heat[Math.floor((y * HH) / off.height) * HW + Math.floor((x * HW) / off.width)] += d; }
+        }
+        lumaSum += dl / n; holeSum += dh / n; steps++;
+      }
+      prevL = L; prevHole = hole;
+    }
+    const per = (off.width * off.height) / (HW * HH);
+    out.push({ view: [daz, del, dist], lumaPerStep: +(lumaSum / steps).toFixed(4), holeFlipPerStep: +(holeSum / steps).toFixed(5), steps, unsettled,
+      ...(heat ? { heat: { w: HW, h: HH, v: Array.from(heat, (x) => +(x / per / steps).toFixed(2)) } } : {}) });
+  }
+  window.__result = { src: q.get("src"), from, to, views: out };
+  document.title = "ready";
+} catch (e) {
+  document.title = "error: " + (e && e.message || e) + " :: " + String(e && e.stack || "").slice(0, 400);
+}
+</script>
