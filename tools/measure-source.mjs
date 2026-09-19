@@ -32,15 +32,15 @@ async function measure(aresPath) {
   const metaPath = aresPath + ".meta.json";
   let meta;
   try { meta = JSON.parse(await readFile(metaPath, "utf8")); }
-  catch { return console.log(`skip ${basename(aresPath)} — no provenance sidecar`); }
+  catch { return console.log(`skip ${basename(aresPath)}, no provenance sidecar`); }
 
   const src = meta.source;
-  if (!src?.dir) return console.log(`skip ${basename(aresPath)} — sidecar records no source.dir`);
-  if (src.totalBytes != null) return console.log(`skip ${basename(aresPath)} — already measured (${MB(src.totalBytes)} MB)`);
+  if (!src?.dir) return console.log(`skip ${basename(aresPath)}: sidecar records no source.dir`);
+  if (src.totalBytes != null) return console.log(`skip ${basename(aresPath)}: already measured (${MB(src.totalBytes)} MB)`);
 
   let all;
   try { all = await readdir(src.dir); }
-  catch { return console.log(`skip ${basename(aresPath)} — source folder is gone: ${src.dir}`); }
+  catch { return console.log(`skip ${basename(aresPath)}: source folder is gone: ${src.dir}`); }
 
   // Detect the mesh type from the FOLDER, exactly as the encoder does (`isObj = objFiles.length > 0`).
   // Trusting `source.kind` was wrong: orchestrator-written sidecars (the coherent bakes) record only
@@ -66,21 +66,21 @@ async function measure(aresPath) {
   // "source 0 MB → 0.0× smaller" into the provenance. A count guard alone missed it because those
   // sidecars carry no meshFrames to compare against.
   if (!usedMesh.length) {
-    return console.log(`SKIP ${basename(aresPath)} — no ${isObj ? "OBJ" : "PLY"} frames in ${src.dir} ` +
+    return console.log(`SKIP ${basename(aresPath)}, no ${isObj ? "OBJ" : "PLY"} frames in ${src.dir} ` +
       `(orchestrator sidecar pointing at a staging dir?). Not guessing.`);
   }
   if (src.meshFrames != null && usedMesh.length !== src.meshFrames) {
-    return console.log(`SKIP ${basename(aresPath)} — cannot reproduce the encoded file set ` +
+    return console.log(`SKIP ${basename(aresPath)}: cannot reproduce the encoded file set ` +
       `(found ${usedMesh.length} meshes in ${src.dir}, sidecar says ${src.meshFrames}). Not guessing.`);
   }
 
   const m = await sumBytes(usedMesh, src.dir);
   const t = await sumBytes(usedAtlas, src.dir);
   if (m.missing || t.missing) {
-    return console.log(`SKIP ${basename(aresPath)} — ${m.missing + t.missing} source file(s) unreadable. Not guessing.`);
+    return console.log(`SKIP ${basename(aresPath)}: ${m.missing + t.missing} source file(s) unreadable. Not guessing.`);
   }
   if (m.bytes + t.bytes === 0) {
-    return console.log(`SKIP ${basename(aresPath)} — measured 0 bytes. Not recording that.`);
+    return console.log(`SKIP ${basename(aresPath)}: measured 0 bytes. Not recording that.`);
   }
 
   src.meshBytes = m.bytes;

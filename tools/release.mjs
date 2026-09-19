@@ -111,7 +111,7 @@ const pkg = JSON.parse(await readFile(join(ROOT, "package.json"), "utf8"));
 const name = `ares-volumetric-${pkg.version}`;
 const stage = join(ROOT, "dist", "release", name);
 const coreBundle = join(ROOT, "packages/core/dist/bundle");
-if (!existsSync(coreBundle)) fail("packages/core/dist/bundle missing — run `npm run build && npm run bundle` first");
+if (!existsSync(coreBundle)) fail("packages/core/dist/bundle missing: run `npm run build && npm run bundle` first");
 
 await rm(stage, { recursive: true, force: true });
 await mkdir(join(stage, "bundles"), { recursive: true });
@@ -121,7 +121,7 @@ await mkdir(join(stage, "docs"), { recursive: true });
 await cp(coreBundle, join(stage, "bundles"), { recursive: true });
 const threeBundle = join(ROOT, "packages/three/dist/bundle");
 if (existsSync(threeBundle)) await cp(threeBundle, join(stage, "bundles"), { recursive: true });
-else console.warn("[release] no @ares/three bundle — skipping");
+else console.warn("[release] no @ares/three bundle: skipping");
 
 // npm through its own cli.js, never through a shell: the repo path may contain spaces, and
 // `shell: true` concatenates arguments without quoting them (Node DEP0190).
@@ -145,8 +145,8 @@ for (const p of PACKAGES) {
 
 for (const d of DOCS) {
   const src = join(ROOT, d);
-  if (!existsSync(src)) { console.warn(`[release] missing ${d} — skipping`); continue; }
-  if ((await stat(src)).size === 0) fail(`${d} is empty — regenerate it before cutting a release`);
+  if (!existsSync(src)) { console.warn(`[release] missing ${d}: skipping`); continue; }
+  if ((await stat(src)).size === 0) fail(`${d} is empty: regenerate it before cutting a release`);
   await cp(src, join(stage, "docs", basename(d)));
 }
 
@@ -157,15 +157,15 @@ const repoUrl = pkg.repository?.url?.replace(/^git\+/, "").replace(/\.git$/, "")
  *  diff against — so every generated document opens by saying what the thing IS. */
 const ABOUT = `**ARES Volumetric plays volumetric video in a browser, from a single file.**
 
-A volumetric capture — an animated person or object, one mesh plus one texture per frame, or a
-Gaussian splat cloud — normally arrives as thousands of files and gigabytes of PNGs. ARES packs a
+A volumetric capture: an animated person or object, one mesh plus one texture per frame, or a
+Gaussian splat cloud: normally arrives as thousands of files and gigabytes of PNGs. ARES packs a
 whole clip into one \`.ares\` file: quantized, meshopt-compressed geometry interleaved with a
 hardware-decodable AV1/VP9 video texture in one GOP-aligned stream, plus an optional Opus audio
 track. The player fetches that one file, keeps vertex positions quantized until the vertex shader
 dequantizes them on the GPU, and hands each decoded video frame to the GPU without a CPU pixel copy.
 
 A real 272-frame capture (11.3k vertices per frame, 9.1 s at 30 fps) is **49.7 MB in one file and
-one request** — against 1.58 GB across 544 files as raw OBJ+PNG, or 1.13 GB as a Draco-GLB sequence.
+one request**: against 1.58 GB across 544 files as raw OBJ+PNG, or 1.13 GB as a Draco-GLB sequence.
 
 This ${pkg.version} release is the format, the runtime and the tools that produce it: mesh clips with
 video texture, static and dynamic Gaussian splats (SPZ, 3DGS PLY, \`.splat\`, glTF
@@ -190,7 +190,7 @@ async function changelogSection(version) {
 }
 
 const section = await changelogSection(pkg.version);
-if (!section) console.warn(`[release] CHANGELOG.md has no "## ${pkg.version}" section — notes will omit it`);
+if (!section) console.warn(`[release] CHANGELOG.md has no "## ${pkg.version}" section: notes will omit it`);
 
 await writeFile(join(ROOT, "dist", "release", `${name}-notes.md`), `${ABOUT}
 
@@ -198,12 +198,12 @@ Source, demo app and encoder CLI: ${repoUrl}
 
 ## Download
 
-**\`${name}.zip\`** — the single-file browser bundles, npm tarballs for the four packages, and the
+**\`${name}.zip\`**, the single-file browser bundles, npm tarballs for the four packages, and the
 specification. Unzip and open \`README.md\` inside for the file-by-file guide, including the
 five-line snippet that plays a clip.
 
-Everything else — the demo app (viewer, compare, inspect, convert, mesh editor), the \`ares\`
-encoder CLI and the dev server — comes from a clone: on Windows double-click \`ARES.vbs\`,
+Everything else, the demo app (viewer, compare, inspect, convert, mesh editor), the \`ares\`
+encoder CLI and the dev server: comes from a clone: on Windows double-click \`ARES.vbs\`,
 anywhere else run \`npm install && npm start\`.
 
 ## What is in this release
@@ -235,13 +235,13 @@ Each has a \`.min.js\` and a source map.
       player.play();
     </script>
 
-\`AresPlayer.create\` is the only entry point — the constructor is internal. \`useWorker\`
+\`AresPlayer.create\` is the only entry point, the constructor is internal. \`useWorker\`
 needs \`workerUrl\` to point at \`ares-decode-worker.js\`; neither bundle can resolve it on its
 own, and without a usable worker the player decodes on the main thread. \`ares-core.iife.js\` is
 the classic-script variant (\`window.ARES\`), and \`ares-three.esm.js\` keeps \`three\` external
 as a peer.
 
-Serve the files over HTTP (not \`file://\`) — a module worker and WebCodecs both need an origin.
+Serve the files over HTTP (not \`file://\`); a module worker and WebCodecs both need an origin.
 Cross-origin isolation is not required: the worker path transfers ArrayBuffers rather than sharing
 memory.
 

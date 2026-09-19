@@ -1,0 +1,151 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  ARES sparse MSIX package.
+
+  Sparse: the package carries this manifest and the tiles; the handler DLL and the launcher stub
+  stay in the repo and are reached through uap10:AllowExternalContent plus -ExternalLocation.
+  Rebuilding the handler therefore needs no repack and no reinstall. The repo root is also
+  compiled into the binaries (generated AresRoot.h), so moving the checkout means rebuilding —
+  build.mjs checks for that before installing.
+
+  Two extensions do the work:
+
+    windows.comServer               registers AresShell.dll's class so Explorer can create it
+    windows.fileExplorerContextMenus points Explorer's SHORT (Windows 11) menu at that class
+
+  The registry verbs in tools/shell-integration.mjs stay useful: they cover Windows 10 and the
+  classic "Show more options" menu. This package is purely the Windows 11 short-menu route.
+
+  The CLSID must match AresShell.cpp and tools/msix/build.mjs.
+-->
+<Package
+  xmlns="http://schemas.microsoft.com/appx/manifest/foundation/windows10"
+  xmlns:uap="http://schemas.microsoft.com/appx/manifest/uap/windows10"
+  xmlns:uap10="http://schemas.microsoft.com/appx/manifest/uap/windows10/10"
+  xmlns:rescap="http://schemas.microsoft.com/appx/manifest/foundation/windows10/restrictedcapabilities"
+  xmlns:com="http://schemas.microsoft.com/appx/manifest/com/windows10"
+  xmlns:desktop4="http://schemas.microsoft.com/appx/manifest/desktop/windows10/4"
+  xmlns:desktop5="http://schemas.microsoft.com/appx/manifest/desktop/windows10/5"
+  IgnorableNamespaces="uap uap10 rescap com desktop4 desktop5">
+
+  <!-- Publisher MUST equal the signing certificate's subject exactly, or deployment fails with
+       0x800B0100. tools/msix/build.mjs mints a self-signed certificate with this subject.
+       The unsigned route was tried and does not work for this kind of package: sparse + unsigned
+       is refused with 0x80073D2C, and packaged + unsigned is refused with 0x80080204 even with
+       the unsigned-namespace OID copied verbatim from Microsoft's documentation. -->
+  <Identity Name="ARES.Volumetric" Publisher="CN=ARES Volumetric Dev"
+            Version="1.0.0.0" ProcessorArchitecture="x64" />
+
+  <Properties>
+    <DisplayName>ARES Volumetric</DisplayName>
+    <PublisherDisplayName>ARES</PublisherDisplayName>
+    <Logo>Assets\StoreLogo.png</Logo>
+    <uap10:AllowExternalContent>true</uap10:AllowExternalContent>
+  </Properties>
+
+  <Dependencies>
+    <TargetDeviceFamily Name="Windows.Desktop" MinVersion="10.0.19041.0" MaxVersionTested="10.0.26200.0" />
+  </Dependencies>
+
+  <Resources>
+    <Resource Language="en-us" />
+  </Resources>
+
+  <Capabilities>
+    <rescap:Capability Name="runFullTrust" />
+  </Capabilities>
+
+  <Applications>
+    <Application Id="ARES" Executable="tools\msix\Ares.exe" EntryPoint="Windows.FullTrustApplication">
+      <uap:VisualElements
+        DisplayName="ARES Volumetric"
+        Description="Volumetric video: convert captures to .ares"
+        BackgroundColor="transparent"
+        Square150x150Logo="Assets\Square150x150Logo.png"
+        Square44x44Logo="Assets\Square44x44Logo.png" />
+      <Extensions>
+
+        <com:Extension Category="windows.comServer">
+          <com:ComServer>
+            <com:SurrogateServer DisplayName="ARES shell command">
+              <com:Class Id="7107EFE2-8605-4F5D-8757-7472171D3327"
+                         Path="tools\msix\AresShell.dll" ThreadingModel="STA" />
+            </com:SurrogateServer>
+          </com:ComServer>
+        </com:Extension>
+
+        <desktop4:Extension Category="windows.fileExplorerContextMenus">
+          <desktop4:FileExplorerContextMenus>
+            <!-- Folders first: a volumetric capture is a directory of per-frame meshes and
+                 atlases, so this is the gesture that matches the data. -->
+            <desktop5:ItemType Type="Directory">
+              <desktop5:Verb Id="AresDir" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type="Directory\Background">
+              <desktop5:Verb Id="AresDirBg" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+
+            <desktop5:ItemType Type=".ares">
+              <desktop5:Verb Id="AresAres" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type=".4ds">
+              <desktop5:Verb Id="Ares4ds" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type=".obj">
+              <desktop5:Verb Id="AresObj" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type=".ply">
+              <desktop5:Verb Id="AresPly" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type=".stl">
+              <desktop5:Verb Id="AresStl" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type=".glb">
+              <desktop5:Verb Id="AresGlb" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type=".gltf">
+              <desktop5:Verb Id="AresGltf" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type=".spz">
+              <desktop5:Verb Id="AresSpz" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type=".splat">
+              <desktop5:Verb Id="AresSplat" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type=".sog">
+              <desktop5:Verb Id="AresSog" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type=".abc">
+              <desktop5:Verb Id="AresAbc" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type=".usd">
+              <desktop5:Verb Id="AresUsd" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type=".usdz">
+              <desktop5:Verb Id="AresUsdz" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type=".fbx">
+              <desktop5:Verb Id="AresFbx" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type=".drc">
+              <desktop5:Verb Id="AresDrc" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type=".e57">
+              <desktop5:Verb Id="AresE57" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type=".pcd">
+              <desktop5:Verb Id="AresPcd" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type=".las">
+              <desktop5:Verb Id="AresLas" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+            <desktop5:ItemType Type=".laz">
+              <desktop5:Verb Id="AresLaz" Clsid="7107EFE2-8605-4F5D-8757-7472171D3327" />
+            </desktop5:ItemType>
+          </desktop4:FileExplorerContextMenus>
+        </desktop4:Extension>
+
+      </Extensions>
+    </Application>
+  </Applications>
+</Package>

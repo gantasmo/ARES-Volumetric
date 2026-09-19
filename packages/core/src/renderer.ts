@@ -15,7 +15,7 @@ import type { Aabb } from "./quant.js";
 import { invert, multiply } from "./camera.js";
 import { buildOriginTripod, type GridParams } from "./overlay.js";
 import type { DecodedSplat } from "./splat.js";
-import type { SplatCamera, SplatParams } from "./renderer-gl2.js";
+import type { SplatCamera, SplatParams, ReliefDiscard } from "./renderer-gl2.js";
 
 // Origin tripod: world-space colored lines. Reads only viewProj from the shared uniform (first 64
 // bytes); vertex buffer is interleaved position(vec3)+color(vec3).
@@ -143,6 +143,10 @@ struct Uniforms {
   depthHi   : f32,
   viewport  : vec2<f32>, // pixels (mode 4 quad expansion)
   pad2      : vec2<f32>,
+  reliefCam : vec3<f32>,  // relief discard: capture camera position (world)
+  reliefSlope : f32,      // sine of the smallest surface-to-ray angle kept; 0 = off
+  reliefFwd : vec3<f32>,  // capture axis (unit, world)
+  reliefDepthMax : f32,   // depth along the axis beyond which nothing draws; 0 = off
 };
 @group(0) @binding(0) var<uniform> u : Uniforms;
 @group(0) @binding(1) var<storage, read> qpos : array<u32>; // 2 u32 / vertex (u16 x,y,z,pad)
@@ -231,12 +235,26 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
   n = normalize(n);
   let L = normalize(vec3<f32>(0.35, 0.75, 0.55));
   let diff = abs(dot(n, L));                 // two-sided (winding-agnostic)
+  // Soft fill from the opposing, mostly-horizontal side. One key alone dropped every face at its
+  // terminator to 0.4 — a hard single-source look, worst on captures whose atlas already carries
+  // the room's light. Because lighting is two-sided, -L would be identical to L; the fill has to
+  // sit on a DIFFERENT axis to reach the faces the key misses, so it is mostly sideways where the
+  // key is mostly up. Key swing 0.6 -> 0.40, fill adds 0.15, floor 0.45; peak stays 1.0.
+  let Lf = normalize(vec3<f32>(-0.6, 0.2, 0.5));
+  let fill = abs(dot(n, Lf));
   // texMix 0 = untextured "clay" (neutral paper grey, same lighting) so form reads without the
   // atlas; sampled unconditionally to keep derivatives/control flow uniform.
   let albedo = mix(vec3<f32>(0.72, 0.71, 0.68), textureSample(tex, samp, in.uv).rgb, u.texMix);
   // Crop preview (mesh editor): discard LAST so derivatives/samples above stay uniform.
   if (u.cropOn > 0.5 && (any(in.world < u.cropMin) || any(in.world > u.cropMax))) { discard; }
-  let lit = mix(1.0, 0.4 + 0.6 * diff, u.litMix);
+  // Relief discard: a sheet stretched across a silhouette lies along the capture ray. The point
+  // view has no face (every corner of a point quad shares one world position), so it only takes
+  // the depth test.
+  let rv = in.world - u.reliefCam;
+  if (u.reliefDepthMax > 0.0 && dot(rv, u.reliefFwd) > u.reliefDepthMax) { discard; }
+  let faceLen = length(faceN);
+  if (u.reliefSlope > 0.0 && faceLen > 0.0 && abs(dot(faceN / faceLen, normalize(rv))) < u.reliefSlope) { discard; }
+  let lit = mix(1.0, 0.45 + 0.40 * diff + 0.15 * fill, u.litMix);
   var col = albedo * lit;
   let mode = u32(u.shadeMode + 0.5);
   if (mode == 1u) { col = n * 0.5 + vec3<f32>(0.5, 0.5, 0.5); }
@@ -490,7 +508,8 @@ export class WebGPURenderer {
   private texH = 0;
   private depth: GPUTexture | null = null;
   private slot = 0;
-  private uni = new Float32Array(40);
+  private uni = new Float32Array(48);
+  private relief: ReliefDiscard | null = null;
   private normalEncoding = 0;
   private shadeMode = 0;
   private pointSize = 2;
@@ -542,7 +561,7 @@ export class WebGPURenderer {
     this.ctx = canvas.getContext("webgpu") as unknown as GPUCanvasContext;
     this.format = navigator.gpu.getPreferredCanvasFormat();
     this.ctx.configure({ device, format: this.format, alphaMode: "opaque" });
-    this.uniform = device.createBuffer({ size: 160, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
+    this.uniform = device.createBuffer({ size: 192, usage: GPUBufferUsage.UNIFORM | GPUBufferUsage.COPY_DST });
     this.sampler = device.createSampler({ magFilter: "linear", minFilter: "linear", mipmapFilter: "linear", addressModeU: "repeat", addressModeV: "repeat" });
     this.buildPipeline();
     // 1x1 white placeholder so the first render works even before the atlas loads.
@@ -651,6 +670,13 @@ export class WebGPURenderer {
     this.device.queue.writeBuffer(this.lineIdxBuf, 0, lines);
     this.lineIndexCount = lines.length;
   }
+
+  /**
+   * Relief discard (2D-to-2.5D clips coded as fixed-topology sheets): a fragment is dropped when its
+   * triangle lies along the capture ray (a sheet stretched across a silhouette) or sits beyond
+   * `depthMax` along the capture axis (masked-out vertices parked on the backdrop). null disables.
+   */
+  setRelief(relief: ReliefDiscard | null): void { this.relief = relief; }
 
   /** World-space crop box for the mesh-editor preview (fragment discard); null disables. */
   setCrop(crop: { min: [number, number, number]; max: [number, number, number] } | null): void {
@@ -761,6 +787,11 @@ export class WebGPURenderer {
     this.uni[31] = this.texMix;
     this.uni[32] = this.shadeMode; this.uni[33] = this.pointSize; this.uni[34] = this.depthRange[0]; this.uni[35] = this.depthRange[1];
     this.uni[36] = this.depth ? this.depth.width : 1; this.uni[37] = this.depth ? this.depth.height : 1; this.uni[38] = 0; this.uni[39] = 0;
+    const rl = this.relief;
+    this.uni[40] = rl ? rl.camera[0] : 0; this.uni[41] = rl ? rl.camera[1] : 0; this.uni[42] = rl ? rl.camera[2] : 0;
+    this.uni[43] = rl ? rl.slope : 0;
+    this.uni[44] = rl ? rl.forward[0] : 0; this.uni[45] = rl ? rl.forward[1] : 0; this.uni[46] = rl ? rl.forward[2] : 0;
+    this.uni[47] = rl ? rl.depthMax : 0;
     this.device.queue.writeBuffer(this.uniform, 0, this.uni);
 
     // Pick the pipeline FIRST — with layout:"auto" the bind group must come from the active pipeline.

@@ -13,6 +13,8 @@
  * same Install button works, because the download runs through the stored HF token.
  */
 
+import { accessPrompt } from "./ensure.js";
+
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const gb = (mb) => (mb >= 1024 ? (mb / 1024).toFixed(mb % 1024 && mb < 10240 ? 1 : 0) + " GB" : (mb || 0) + " MB");
@@ -31,6 +33,7 @@ export async function depStatus(id) {
 async function load() {
   const d = await fetch("/deps").then((r) => r.json());
   deps = d.deps || []; gpu = d.gpu; profs = d.profiles || []; recommended = d.recommended; pre = d.preflight;
+  try { shell = await fetch("/shell/status").then((r) => r.json()); } catch { shell = null; }
   return d;
 }
 
@@ -39,8 +42,7 @@ async function load() {
 function hardwareCard() {
   if (!gpu) return "";
   const blockers = [];
-  if (!pre?.python && !pre?.envPresent) blockers.push("No Python on PATH — the environment step will say how to fix it.");
-  if (!pre?.hfToken) blockers.push(`No Hugging Face token stored, so gated models cannot download. Run <code>hf auth login</code> in a terminal.`);
+  if (!pre?.python && !pre?.envPresent) blockers.push("CPython 3.11 to 3.13: none detected. The Python environment component unpacks a private interpreter.");
   const gpuRows = gpu.gpus.map((g, i) =>
     `<div class="k">GPU ${i}</div><div class="v">${esc(g.name)} · ${gb(g.vramMB)} · sm_${String(g.cc).replace(".", "")}</div>`).join("");
   return `
@@ -48,13 +50,57 @@ function hardwareCard() {
       <div class="row" style="margin-bottom:6px"><h3 style="margin:0;flex:1">Your machine</h3>
         <span class="note" style="margin:0">${esc(gpu.label)}</span></div>
       <div class="kv">
-        ${gpuRows || `<div class="k">GPU</div><div class="v">none detected — models will run on the CPU</div>`}
-        <div class="k">precision</div><div class="v">${esc(gpu.dtype)} <small style="color:var(--text-faint)">— ${esc(gpu.dtypeWhy)}</small></div>
-        ${gpu.cudaIndex ? `<div class="k">PyTorch build</div><div class="v">${esc(gpu.cudaIndex)} <small style="color:var(--text-faint)">— ${esc(gpu.cudaWhy)}</small></div>` : ""}
-        <div class="k">Hugging Face</div><div class="v">${pre?.hfToken ? "token stored — gated models can download" : "not signed in"}</div>
+        ${gpuRows || `<div class="k">GPU</div><div class="v">none detected: models will run on the CPU</div>`}
+        <div class="k">precision</div><div class="v">${esc(gpu.dtype)} <small style="color:var(--text-faint)">· ${esc(gpu.dtypeWhy)}</small></div>
+        ${gpu.cudaIndex ? `<div class="k">PyTorch build</div><div class="v">${esc(gpu.cudaIndex)} <small style="color:var(--text-faint)">· ${esc(gpu.cudaWhy)}</small></div>` : ""}
+        <div class="k">Hugging Face</div><div class="v" id="hfState">${pre?.hfToken ? "token stored: gated models can download" : "not signed in"}</div>
       </div>
       ${blockers.map((b) => `<div class="note2" style="color:var(--warn);margin-top:6px">${b}</div>`).join("")}
+      ${tokenFormHtml(!!pre?.hfToken)}
     </div>`;
+}
+
+/** Hugging Face sign-in, inline. Gated repos used to dead-end here: the licence button opened a
+ *  browser and the token still had to be created with `hf auth login` in a terminal. The token is
+ *  posted once to /hf-token, validated server-side, and never rendered back. */
+function tokenFormHtml(haveToken) {
+  if (haveToken) return `<div class="note2" style="margin-top:6px">Signed in. <a href="#" id="hfChange">Use a different token</a></div>`;
+  return `
+    <div id="hfForm" style="margin-top:8px">
+      <div class="row" style="flex-wrap:wrap;gap:6px">
+        <input id="hfToken" class="inp" type="password" autocomplete="off" spellcheck="false"
+               placeholder="hf_…" style="flex:1;min-width:200px">
+        <button class="u primary" id="hfSave">Sign in</button>
+        <a class="u gatebtn" href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">Create a token ↗</a>
+      </div>
+      <div class="note2" id="hfMsg" style="margin-top:4px">A read token is enough. Stored by huggingface_hub, the same place the CLI keeps it.</div>
+    </div>`;
+}
+
+function wireTokenForm() {
+  const change = $("hfChange");
+  if (change) change.onclick = (e) => {
+    e.preventDefault();
+    change.closest(".note2").outerHTML = tokenFormHtml(false);
+    wireTokenForm();
+  };
+  const btn = $("hfSave");
+  if (!btn) return;
+  const submit = async () => {
+    const input = $("hfToken"), msg = $("hfMsg");
+    const token = input.value.trim();
+    if (!token) { input.focus(); return; }
+    btn.disabled = true; msg.textContent = "checking…"; msg.style.color = "";
+    let r;
+    try { r = await fetch("/hf-token", { method: "POST", body: JSON.stringify({ token }) }).then((x) => x.json()); }
+    catch { r = { ok: false, error: "dev server not reachable" }; }
+    input.value = "";                                     // never leave the token in the DOM
+    btn.disabled = false;
+    if (r.ok) { msg.style.color = "var(--good)"; msg.textContent = r.user ? `signed in as ${r.user}` : "token stored"; setTimeout(() => render(), 700); }
+    else { msg.style.color = "var(--bad)"; msg.textContent = r.error || "rejected"; }
+  };
+  btn.onclick = submit;
+  $("hfToken").onkeydown = (e) => { if (e.key === "Enter") submit(); };
 }
 
 function profileCards() {
@@ -63,7 +109,7 @@ function profileCards() {
     const isRec = p.id === recommended;
     const names = p.included.map((id) => byId[id]?.label).filter(Boolean);
     const dropped = p.dropped.length
-      ? `<div class="note2" style="color:var(--warn)">Left out — this GPU cannot hold ${p.dropped.map((d) => `${esc(d.label)} (needs ${gb(d.needMB)})`).join(", ")}.</div>`
+      ? `<div class="note2" style="color:var(--warn)">Left out: this GPU cannot hold ${p.dropped.map((d) => `${esc(d.label)} (needs ${gb(d.needMB)})`).join(", ")}.</div>`
       : "";
     return `
       <div class="prof${isRec ? " rec" : ""}${p.complete ? " done" : ""}">
@@ -84,9 +130,99 @@ function profileCards() {
   };
   return `<div class="card">
       <div class="row" style="margin-bottom:2px"><h3 style="margin:0;flex:1">One click</h3></div>
-      <div class="note" style="margin:0 0 8px">Each one installs everything it needs, in order — Python environment included. Anything you already have is skipped.</div>
+      <div class="note" style="margin:0 0 8px">Each one installs everything it needs, in order: Python environment included. Anything you already have is skipped.</div>
       <div class="profs">${profs.map(card).join("")}</div>
     </div>`;
+}
+
+/** Windows shell integration. Registering writes only under HKCU\Software\Classes, so it needs
+ *  no elevation and the same card turns it off again. */
+let shell = null;
+function shellCard() {
+  if (!shell || !shell.supported) return "";
+  const on = shell.registered;
+  return `
+    <div class="card">
+      <div class="row" style="margin-bottom:2px"><h3 style="margin:0;flex:1">Windows context menu</h3>
+        <button class="u${on ? "" : " primary"}" id="shellToggle">${on ? "Remove" : "Add"}</button></div>
+      <div class="note" style="margin:0 0 6px">“Convert folder to .ares” on a folder, “Convert to .ares” on ${shell.exts} file types. Written under HKCU, no administrator, and Remove takes it back out.</div>
+      <div class="kv">
+        <div class="k">folders</div><div class="v">${on && shell.folders ? "registered" : "not registered"}</div>
+        <div class="k">file types</div><div class="v">${on && shell.files ? shell.exts + " registered" : "not registered"}</div>
+        <div class="k">every file type</div><div class="v"><label style="cursor:pointer"><input type="checkbox" id="shellAll"${shell.allFiles ? " checked" : ""}> also add it to all files</label></div>
+      </div>
+      <div class="note2" style="margin-top:6px">${esc(shell.note || "")}</div>
+      <div class="note2" id="shellMsg" style="margin-top:4px"></div>
+      ${msixRows()}
+    </div>`;
+}
+
+/** The Windows 11 short menu. Separate from the registry verbs above because it is a different
+ *  mechanism with a different failure mode: a packaged IExplorerCommand handler, which has to be
+ *  built and signed, and whose certificate needs one elevated command to trust. */
+function msixRows() {
+  const m = shell && shell.msix;
+  if (!m || !m.supported) return "";
+  const on = m.installed;
+  // Nothing here blocks the button: Install adds MSVC Build Tools through /install when the
+  // compiler is absent, and the server switches Developer Mode and trusts the certificate itself,
+  // each behind one Windows elevation prompt.
+  const pending = [
+    !m.buildable ? "MSVC Build Tools + Windows SDK: installed first (2.5 GB)" : "",
+    !m.devMode ? "Developer Mode: enabled during install (elevation prompt)" : "",
+  ].filter(Boolean).join(" · ");
+  return `
+    <div style="margin-top:10px;padding-top:8px;border-top:1px solid var(--border)">
+      <div class="row" style="margin-bottom:2px">
+        <span class="cap" style="flex:1">Windows 11 short menu</span>
+        <button class="u${on ? "" : " primary"}" id="msixToggle">${on ? "Remove" : "Install"}</button>
+      </div>
+      <div class="note2">The entries above live under “Show more options”. This packaged handler puts the same verb in the short menu Windows 11 opens first.</div>
+      <div class="kv" style="margin-top:4px">
+        <div class="k">package</div><div class="v">${on ? esc(m.packageFullName || "installed") : "not installed"}</div>
+        <div class="k">certificate</div><div class="v">${m.certTrusted ? "trusted" : "not trusted: imported during install (elevation prompt)"}</div>
+      </div>
+      ${pending && !on ? `<div class="note2" style="margin-top:4px">${pending}</div>` : ""}
+      <div class="note2" id="msixMsg" style="margin-top:4px"></div>
+    </div>`;
+}
+
+function wireShellCard() {
+  const btn = $("shellToggle");
+  if (!btn) return;
+  const mbtn = $("msixToggle");
+  if (mbtn) mbtn.onclick = async () => {
+    const installed = !!(shell.msix && shell.msix.installed);
+    // The compiler is a catalog component: install it through the normal progress panel first.
+    // runInstall re-renders the tab, so every element is looked up again afterwards.
+    if (!installed && !shell.msix.buildable) {
+      if (busy) return;
+      if (!(await runInstall(["msvc-build-tools"]))) return;
+    }
+    const mbtn2 = $("msixToggle") || mbtn, msg = $("msixMsg");
+    mbtn2.disabled = true;
+    msg.style.color = ""; msg.textContent = installed ? "removing…" : "building, signing, registering: about a minute on the first build…";
+    let r;
+    try { r = await fetch(installed ? "/shell/msix-uninstall" : "/shell/msix-install", { method: "POST", body: "{}" }).then((x) => x.json()); }
+    catch { r = { ok: false, error: "dev server not reachable" }; }
+    mbtn2.disabled = false;
+    if (r.ok) { msg.style.color = "var(--good)"; msg.textContent = (r.log || []).slice(-1)[0] || "done"; render(); return; }
+    msg.style.color = "var(--bad)";
+    msg.textContent = r.error || "failed";
+  };
+
+  btn.onclick = async () => {
+    const msg = $("shellMsg");
+    btn.disabled = true;
+    msg.style.color = ""; msg.textContent = shell.registered ? "removing…" : "registering…";
+    const route = shell.registered ? "/shell/unregister" : "/shell/register";
+    let r;
+    try { r = await fetch(route, { method: "POST", body: JSON.stringify({ allFiles: !!$("shellAll")?.checked }) }).then((x) => x.json()); }
+    catch { r = { ok: false, error: "dev server not reachable" }; }
+    btn.disabled = false;
+    if (r.ok) { msg.style.color = "var(--good)"; msg.textContent = (r.log || []).slice(-1)[0] || "done"; render(); }
+    else { msg.style.color = "var(--bad)"; msg.textContent = r.error || "failed"; }
+  };
 }
 
 function componentRows() {
@@ -98,7 +234,9 @@ function componentRows() {
       ? `installed${d.onDiskMB ? " · " + gb(d.onDiskMB) : ""}`
       : `${gb(d.sizeMB)}${d.vramMB ? " · " + gb(d.vramMB) + " VRAM" : ""}`;
     const gate = d.gated && !d.present
-      ? `<a class="u gatebtn" href="${esc(d.gated.url)}" target="_blank" rel="noopener">Accept licence ↗</a>` : "";
+      ? `<a class="u gatebtn" href="${esc(d.gated.url)}" target="_blank" rel="noopener">Accept licence ↗</a>`
+        + (pre?.hfToken ? "" : `<span class="csize" style="color:var(--warn)">token needed</span>`)
+      : "";
     return `
       <label class="comp${d.present ? " have" : ""}">
         <input type="checkbox" data-id="${esc(d.id)}"${on ? " checked" : ""}${d.present ? " disabled" : ""}>
@@ -118,7 +256,7 @@ function componentRows() {
       <div class="row" style="margin-bottom:2px"><h3 style="margin:0;flex:1">Or pick your own</h3>
         <button class="u" id="cmpInstall"${chosen.length ? "" : " disabled"}>
           ${chosen.length ? `Install ${chosen.length} · ${gb(totalMB)}` : "Install selected"}</button></div>
-      <div class="note" style="margin:0 0 6px">Dependencies come along automatically — ticking a model pulls in the Python environment if it is missing.</div>
+      <div class="note" style="margin:0 0 6px">Dependencies come along automatically: ticking a model pulls in the Python environment if it is missing.</div>
       ${groups.map((g) => `<div class="cgroup">${esc(g)}</div>` + installable.filter((d) => d.group === g).map(row).join("")).join("")}
     </div>`;
 }
@@ -127,7 +265,7 @@ function statusRows() {
   const rows = deps.filter((d) => d.statusOnly);
   if (!rows.length) return "";
   return `<details class="card"><summary style="cursor:pointer;font-weight:600;font-size:13px">Other components (${rows.filter((r) => r.present).length}/${rows.length} present)</summary>
-      <div class="note" style="margin:6px 0">Not downloadable from here — your own data, a licensed SDK, or a separate application.</div>
+      <div class="note" style="margin:6px 0">Not downloadable from here: your own capture data, or a licensed SDK no installer may fetch.</div>
       ${rows.map((d) => `
         <label class="comp status${d.present ? " have" : ""}">
           <span style="width:16px;text-align:center;color:var(--text-faint)">${d.present ? "✓" : "·"}</span>
@@ -160,7 +298,7 @@ function runInstall(ids) {
     es.addEventListener("log", (e) => { try { line(JSON.parse(e.data)); } catch { /* ignore */ } });
     es.addEventListener("plan", (e) => { try { total = JSON.parse(e.data).todo.length; } catch { /* ignore */ } });
     es.addEventListener("step", (e) => {
-      try { const s = JSON.parse(e.data); title.textContent = `${s.label} — ${s.index + 1} of ${s.total}`; bar.style.width = ((s.index / s.total) * 100).toFixed(0) + "%"; } catch { /* ignore */ }
+      try { const s = JSON.parse(e.data); title.textContent = `${s.label}: ${s.index + 1} of ${s.total}`; bar.style.width = ((s.index / s.total) * 100).toFixed(0) + "%"; } catch { /* ignore */ }
     });
     es.addEventListener("stepDone", (e) => {
       try { const s = JSON.parse(e.data); bar.style.width = ((s.index / s.total) * 100).toFixed(0) + "%"; } catch { /* ignore */ }
@@ -174,13 +312,19 @@ function runInstall(ids) {
     });
     es.addEventListener("error", (e) => {
       es.close(); busy = false;
-      let msg = "failed (connection lost)", gated = null;
-      try { const d = JSON.parse(e.data); msg = d.message || msg; gated = d.gated ? d.url : null; } catch { /* no payload */ }
+      let msg = "failed (connection lost)", gate = null;
+      try { const d = JSON.parse(e.data); msg = d.message || msg; gate = d.gated ? d : null; } catch { /* no payload */ }
       title.textContent = "✗ " + msg;
       line("✗ " + msg);
-      if (gated) line("→ open the licence page above, accept it, then press Install again.");
-      // Re-render so the buttons come back, but keep the log on screen to be read.
-      render({ keepLog: true }).then(() => done(false));
+      // Re-render so the buttons come back, but keep the log on screen to be read. A gated
+      // repository raises the access prompt under the log; Resume repeats this same install.
+      render({ keepLog: true }).then(() => {
+        if (gate) {
+          const host = document.createElement("div");
+          $("instPanel").append(host);
+          accessPrompt(host, gate, () => { runInstall(ids).then(done); });
+        } else done(false);
+      });
     });
   });
 }
@@ -193,7 +337,7 @@ async function render({ keepLog = false } = {}) {
   const priorTitle = keepLog ? $("instTitle")?.textContent : null;
   try { await load(); }
   catch {
-    out.innerHTML = `<div class="card"><div class="note" style="color:var(--bad)">Component check needs the ARES dev server (start it with ARES.vbs, or npm start).</div></div>`;
+    out.innerHTML = `<div class="card"><div class="note" style="color:var(--bad)">Dev server not reachable: component status unavailable.</div></div>`;
     return;
   }
 
@@ -208,19 +352,22 @@ async function render({ keepLog = false } = {}) {
     </div>
     ${componentRows()}
     ${statusRows()}
+    ${shellCard()}
     <div class="card">
       <div class="row" style="margin-bottom:4px"><h3 style="margin:0;flex:1">Services</h3>
         <span class="note" style="margin:0">${ready}/${deps.length} components present</span>
         <button class="u" id="depRefresh">Refresh</button></div>
       <div class="kv">
         <div class="k">SAM segmentation</div><div class="v" id="depSam">checking…</div>
-        <div class="k">dev server</div><div class="v">this page — encode, enhance, pickers, history</div>
+        <div class="k">dev server</div><div class="v">this page: encode, enhance, pickers, history</div>
       </div>
     </div>`;
 
   if (keepLog && priorLog != null) { $("instLog").textContent = priorLog; $("instTitle").textContent = priorTitle; }
 
   $("depRefresh").onclick = () => render();
+  wireTokenForm();
+  wireShellCard();
   for (const b of out.querySelectorAll("[data-profile]")) b.onclick = () => {
     if (busy) return;
     const p = profs.find((x) => x.id === b.dataset.profile);

@@ -10,7 +10,7 @@
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const fmtDur = (s) => {
-  if (s == null) return "—";
+  if (s == null) return ": ";
   s = Math.floor(s); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
   return h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`;
 };
@@ -30,7 +30,7 @@ function openStream(url, header) {
   if (box) box.textContent = (header ? header + "\n" : "");
   es = new EventSource(url);
   es.addEventListener("log", (e) => { try { logLine(JSON.parse(e.data)); } catch { /* */ } });
-  es.addEventListener("done", (e) => { let c = 0; try { c = JSON.parse(e.data).code; } catch { /* */ } logLine(c === 0 ? "✓ done" : "— finished (exit " + c + ")"); stopStream(); });
+  es.addEventListener("done", (e) => { let c = 0; try { c = JSON.parse(e.data).code; } catch { /* */ } logLine(c === 0 ? "✓ done" : "; finished (exit " + c + ")"); stopStream(); });
   es.addEventListener("error", (e) => { try { logLine("✗ " + (JSON.parse(e.data).message || "stream error")); } catch { logLine("✗ stream closed"); } stopStream(); });
 }
 
@@ -39,7 +39,31 @@ async function render() {
   if (!out) return;
   let d;
   try { d = await fetch("/runpod/status").then((r) => r.json()); }
-  catch { out.innerHTML = `<div class="card"><div class="note" style="color:var(--bad)">Compute needs the ARES dev server running.</div></div>`; return; }
+  catch { out.innerHTML = `<div class="card"><div class="note" style="color:var(--bad)">Dev server not reachable.</div></div>`; return; }
+  if (!d.ok && d.needsKey) {
+    // The API key is a credential, the one input only the person has: collected here, validated
+    // and stored by the server (POST /runpod/key), never rendered back.
+    out.innerHTML = `<div class="card"><div class="cap">RunPod API key</div>
+      <div class="row" style="gap:6px;margin-top:6px;flex-wrap:wrap">
+        <input id="rpKey" class="inp" type="password" autocomplete="off" spellcheck="false" placeholder="rpa_…" style="flex:1;min-width:200px">
+        <button class="u primary" id="rpKeySave">Store</button>
+      </div>
+      <div class="note2" id="rpKeyMsg" style="margin-top:4px">Stored server-side in .runpod/runpod.key. Not sent to the browser again.</div></div>`;
+    const save = async () => {
+      const input = $("rpKey"), msg = $("rpKeyMsg");
+      const key = input.value.trim();
+      if (!key) { input.focus(); return; }
+      msg.style.color = ""; msg.textContent = "validating…";
+      let r;
+      try { r = await fetch("/runpod/key", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ key }) }).then((x) => x.json()); }
+      catch { r = { ok: false, error: "dev server not reachable" }; }
+      input.value = "";
+      if (r.ok) render(); else { msg.style.color = "var(--bad)"; msg.textContent = r.error || "rejected"; }
+    };
+    $("rpKeySave").onclick = save;
+    $("rpKey").onkeydown = (e) => { if (e.key === "Enter") save(); };
+    return;
+  }
   if (!d.ok) { out.innerHTML = `<div class="card"><div class="note" style="color:var(--bad)">RunPod: ${esc(d.error)}</div></div>`; return; }
 
   const bal = Number(d.balance || 0);
@@ -90,7 +114,7 @@ async function render() {
     try {
       const r = await fetch("/runpod/launch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "ares-sam3d" }) }).then((x) => x.json());
       if (!r.ok) { logLine("✗ launch failed: " + r.error); return; }
-      logLine("✓ launched pod " + r.pod.id + " — booting; opening logs…");
+      logLine("✓ launched pod " + r.pod.id + ": booting; opening logs…");
       setTimeout(render, 1500);
       setTimeout(() => openStream("/runpod/logs?id=" + encodeURIComponent(r.pod.id), "▶︎ logs for " + r.pod.id), 1600);
     } catch (e) { logLine("✗ launch error: " + e.message); }

@@ -1,0 +1,8 @@
+{
+ "_": "Golden vector for mask-rle-parity.test.mjs. `spans` is the pattern, as [startIndex, length] pairs of SET pixels in flattened row-major index space; `rle` is what a conforming encoder must produce for it under the edits.ts convention (alternating run lengths, 0-run first). Regenerate the `rle` field, and nothing else, by running track.py's mask_to_rle over a bitmap built from `spans` — see the header of mask-rle-parity.test.mjs. Do not hand-edit `rle` to make the test pass.",
+ "producer": "tools/sam-service/track.py mask_to_rle, byte-identical to packages/core rleEncodeMask (regenerated and cross-checked 2026-09-09)",
+ "width": 64,
+ "height": 64,
+ "spans": [[0, 3], [70, 130], [500, 1], [1000, 64], [2048, 900], [4090, 6]],
+ "rle": [0, 3, 67, 130, 300, 1, 499, 64, 984, 900, 1142, 6]
+}

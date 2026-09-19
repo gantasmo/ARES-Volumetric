@@ -1,4 +1,4 @@
-# ARES Runtime — Technical Specification
+# ARES Runtime: Technical Specification
 
 **A browser-first volumetric media runtime and container format**
 
@@ -8,27 +8,27 @@ Container extension: `.ares`
 | | |
 |---|---|
 | **Document** | ARES Runtime Technical Specification |
-| **Version** | 0.2 (Draft — consolidated master) |
-| **Status** | Working draft — for implementation planning |
+| **Version** | 0.2 (Draft: consolidated master) |
+| **Status** | Working draft: for implementation planning |
 | **Date** | July 2026 |
 | **Editors** | Project ARES |
 | **Intended audience** | Engine/runtime engineers, codec engineers, tooling authors |
-| **Supersedes** | *ARES — Browser-First Volumetric Media Runtime, Architecture and Specification, Draft 0.1* (the 57-page §1–5 document) |
+| **Supersedes** | *ARES: Browser-First Volumetric Media Runtime, Architecture and Specification, Draft 0.1* (the 57-page §1–5 document) |
 
 ### Provenance
 
 This is the consolidated, single-source master specification. It merges and supersedes three earlier
 artifacts:
 
-- **`ARES.pdf`** (Draft 0.1) — a 57-page formal document that fully developed §1–5 (Introduction,
+- **`ARES.pdf`** (Draft 0.1): a 57-page formal document that fully developed §1–5 (Introduction,
   Existing Ecosystem, Design Requirements, System Architecture, Geometry) and then stopped at §5.18
   with a note requesting a dedicated chapter on treating geometry as a video-compression problem.
   That chapter is now [§8](#8-compression-architecture)/[§8.5](#85-video-assisted-geometry-packing-attributes-into-pixels).
   Draft 0.1's conceptual depth (topology classification, temporal categorization, encoder pipelines,
   cache hierarchy, determinism/portability requirements, regional and hybrid geometry) is retained
   and folded in here.
-- **`ARES_Project_Implementation_Outline.pdf`** — the one-page objectives + comparison table.
-- **`Volumetric Video Codecs & Formats (2023–2026).pdf`** — the cited research brief that grounds
+- **`ARES_Project_Implementation_Outline.pdf`**, the one-page objectives + comparison table.
+- **`Volumetric Video Codecs & Formats (2023–2026).pdf`**, the cited research brief that grounds
   [§3](#3-survey-of-existing-formats) and [Appendix E](#appendix-e--references).
 
 Relative to Draft 0.1, this master (a) completes §6–17 and the appendices, (b) adds concrete binary
@@ -50,8 +50,8 @@ model that dominates current pipelines:
 > **Stop treating every frame as a 3D model. Treat every frame as a compressed set of
 > GPU instructions.**
 
-From that premise, ARES is designed around three ideas that legacy formats — built for
-DCC interchange — never fully exploited:
+From that premise, ARES is designed around three ideas that legacy formats: built for
+DCC interchange, never fully exploited:
 
 1. **Temporal coherence as a first-class citizen.** For most captures (especially of
    humans) 95–99% of mesh connectivity is stable frame to frame. ARES encodes a
@@ -69,7 +69,7 @@ model, the runtime architecture, and a conversion toolchain from existing format
 HoloVideo, 4DViews, Depthkit, PLY+PNG, OBJ/glTF/Alembic/USD sequences). It is written as an
 engineering specification: **assertions are distinguished from projections**, assumptions are
 called out explicitly, and all quantitative targets not yet measured are labeled
-*Projected — pending empirical validation*.
+*Projected: pending empirical validation*.
 
 ---
 
@@ -81,10 +81,10 @@ as experiments retire the open questions in [§16](#16-open-research-questions-a
 
 Notation used throughout:
 
-- **[ASSERTED]** — established technique or fact with a citation or first-principles derivation.
-- **[PROJECTED]** — a quantitative estimate pending measurement. Treat as a hypothesis.
-- **[ASSUMPTION]** — a premise the design rests on that should be validated early.
-- **[OPEN]** — an unresolved design question tracked in [§16](#16-open-research-questions-and-risks).
+- **[ASSERTED]**: established technique or fact with a citation or first-principles derivation.
+- **[PROJECTED]**: a quantitative estimate pending measurement. Treat as a hypothesis.
+- **[ASSUMPTION]**: a premise the design rests on that should be validated early.
+- **[OPEN]**: an unresolved design question tracked in [§16](#16-open-research-questions-and-risks).
 
 The key words **MUST**, **MUST NOT**, **REQUIRED**, **SHOULD**, **SHOULD NOT**, **MAY**, and
 **OPTIONAL** are to be interpreted as described in RFC 2119 / RFC 8174 when, and only when, they
@@ -114,19 +114,19 @@ integers of that width; `f16/f32` denote IEEE-754 floats; `varint` denotes LEB12
 15. [Future research: the avatar pipeline](#15-future-research-the-avatar-pipeline)
 16. [Open research questions and risks](#16-open-research-questions-and-risks)
 17. [Conclusion](#17-conclusion)
-- [Appendix A — Binary layouts](#appendix-a--binary-layouts)
-- [Appendix B — Pseudocode](#appendix-b--pseudocode)
-- [Appendix C — Core runtime data structures](#appendix-c--core-runtime-data-structures)
-- [Appendix D — Glossary](#appendix-d--glossary)
-- [Appendix E — References](#appendix-e--references)
+- [Appendix A: Binary layouts](#appendix-a--binary-layouts)
+- [Appendix B: Pseudocode](#appendix-b--pseudocode)
+- [Appendix C: Core runtime data structures](#appendix-c--core-runtime-data-structures)
+- [Appendix D: Glossary](#appendix-d--glossary)
+- [Appendix E: References](#appendix-e--references)
 
 
 ## 1. Introduction and problem statement
 
 ### 1.1 Motivation
 
-Volumetric video — free-viewpoint capture of real people and objects as a time sequence of
-3D frames — has matured on the capture side (Azure Kinect rigs, 4DViews HOLOSYS stages,
+Volumetric video: free-viewpoint capture of real people and objects as a time sequence of
+3D frames: has matured on the capture side (Azure Kinect rigs, 4DViews HOLOSYS stages,
 Depthkit, photogrammetry domes, neural reconstruction) far faster than on the *delivery* side.
 Unlike conventional video, a volumetric frame contains continuously changing **geometry** in
 addition to surface appearance: each frame may carry hundreds of thousands of vertices whose
@@ -136,8 +136,8 @@ require roughly **110 Gbps uncompressed** [1]. Even after meshing, decimation, a
 compression, volumetric sequences routinely exceed conventional video by one or more orders of
 magnitude.
 
-The web is where this content increasingly needs to live — product configurators, WebXR
-experiences, live performers, virtual try-on, telepresence, digital preservation — yet the browser is
+The web is where this content increasingly needs to live: product configurators, WebXR
+experiences, live performers, virtual try-on, telepresence, digital preservation, yet the browser is
 the most constrained delivery target: no arbitrary native codecs, a single-threaded main loop that
 must not stall, garbage collection that must not spike, a strict memory ceiling on mobile, and users
 on metered networks who abandon after a few seconds of blank screen.
@@ -177,7 +177,7 @@ inefficiencies that no amount of per-asset tuning removes:
    offloaded, competes with the render loop [29]. The pipeline is CPU-bound exactly where the browser
    is weakest.
 4. **Repeated allocation.** New mesh objects and GPU buffers per frame drive garbage collection and
-   buffer re-creation — both sources of frame-time variance.
+   buffer re-creation: both sources of frame-time variance.
 5. **Request amplification.** Thousands of small files stress connection pools and caches and make
    smooth seeking hard; there is no codec-style keyframe/GOP structure or ABR ladder.
 
@@ -189,8 +189,8 @@ production pipeline.
 ARES rejects the framing that a volumetric frame *is a 3D model that happens to be one of many*.
 Instead:
 
-> A volumetric frame is a **compressed set of GPU state changes** — new positions for a mostly
-> unchanged vertex set, a new region of a texture atlas, a handful of topology patches — applied on
+> A volumetric frame is a **compressed set of GPU state changes**: new positions for a mostly
+> unchanged vertex set, a new region of a texture atlas, a handful of topology patches: applied on
 > top of the previous frame.
 
 Under this framing the problems above dissolve into well-understood video-coding problems:
@@ -277,7 +277,7 @@ HoloVideo, and UVOL ultimately emit.
 ### 2.2 Point clouds
 
 Frames are unstructured sets of colored points (the native output of depth sensors, before
-meshing). Standardized compression exists — MPEG **V-PCC** (projects points to 2D video atlases
+meshing). Standardized compression exists: MPEG **V-PCC** (projects points to 2D video atlases
 and rides standard video codecs) and **G-PCC** (octree/predictive coding for sparse/LiDAR-like
 clouds) [39].
 
@@ -297,13 +297,13 @@ codecs [43].
 
 - **Strengths.** Photoreal appearance at low geometric complexity; no UV unwrapping; extremely
   web-friendly to *render* (a splat is just instanced/point rendering with blending) and a natural
-  fit for the "compressed GPU instructions" framing — a splat frame **is** a GPU buffer.
+  fit for the "compressed GPU instructions" framing: a splat frame **is** a GPU buffer.
 - **Weaknesses.** Per-splat attributes are heavy (SH coefficients dominate); temporal 3DGS
   (deforming splats over time) is young; sorting/blending order and mobile fill-rate need care.
 
 > ARES treats 3DGS as a **first-class geometry profile**, not an afterthought
-> ([§6.8](#68-gaussian-splat-profile)). The PackUV result — splat attributes packed into 2D video
-> tracks — aligns exactly with the ARES premise and the video-assisted geometry path
+> ([§6.8](#68-gaussian-splat-profile)). The PackUV result: splat attributes packed into 2D video
+> tracks: aligns exactly with the ARES premise and the video-assisted geometry path
 > ([§8.5](#85-video-assisted-geometry-packing-attributes-into-pixels)).
 
 ### 2.4 Neural / implicit representations
@@ -339,7 +339,7 @@ subsystem. The representation debate is settled per-capture by the encoder, not 
 
 This section surveys what exists as of mid-2026, what each format does well, where it is weak for
 *browser delivery specifically*, and the concrete lesson ARES draws. The goal is explicitly to
-learn from years of accumulated field experience — including these systems' known pain points — not
+learn from years of accumulated field experience: including these systems' known pain points; not
 to reinvent their mistakes.
 
 Each system is judged against seven criteria relevant to browser delivery:
@@ -354,12 +354,12 @@ Each system is judged against seven criteria relevant to browser delivery:
 | Extensibility | Ease of supporting new rendering techniques |
 | Production maturity | Stability of the existing pipeline |
 
-**The baseline — raw mesh sequences.** The simplest representation stores one complete mesh per
+**The baseline: raw mesh sequences.** The simplest representation stores one complete mesh per
 frame (PLY/OBJ/STL/FBX/Alembic/glTF). A 30 fps sequence contains thirty complete models per second
 regardless of how little changes. It is simple, randomly accessible, and DCC-compatible, but it
 duplicates geometry, has no temporal compression, and creates a large number of filesystem objects.
-Every other format — and ARES's projected numbers ([§13](#13-benchmark-methodology-and-projected-performance))
-— is measured against this reference.
+Every other format, and ARES's projected numbers ([§13](#13-benchmark-methodology-and-projected-performance))
+· is measured against this reference.
 
 ### 3.1 Microsoft HoloVideo / MR volumetric codec
 
@@ -389,7 +389,7 @@ Capture-stage vendor producing "lightweight" textured meshes ready for engines [
 ### 3.3 Depthkit
 
 Popular capture/reconstruction toolkit that emits textured meshes and a combined color+depth video
-layout ("CPP" — a single video frame carrying color and packed depth) [36].
+layout ("CPP": a single video frame carrying color and packed depth) [36].
 
 - **Strengths.** Accessible; the color+depth-in-one-video layout is elegant and web-friendly.
 - **Weaknesses for web.** Still fundamentally per-frame reconstruction; quality bounded by the
@@ -443,7 +443,7 @@ Commercial volumetric codec (2024) advertising near-lossless compression, **mult
 textures**, and **per-vertex motion vectors** for real-time playback and inter-frame
 interpolation [13].
 
-- **Strengths.** Explicitly uses motion vectors and multi-res textures — both directly relevant to
+- **Strengths.** Explicitly uses motion vectors and multi-res textures: both directly relevant to
   ARES; reports compressing assets to ~25% of original with negligible loss [13].
 - **Weaknesses for web.** Proprietary pipeline and runtime.
 - **Lesson for ARES.** Per-vertex motion vectors are exactly the P-frame mechanism ARES formalizes;
@@ -471,8 +471,8 @@ research claims [4][13][16][32]; the ARES row is a **[PROJECTED]** target
 
 | Format | Rel. size | CPU decode | Browser-native | Persistent topology | Temporal geometry | Random seek | Notes |
 |---|---|---|---|---|---|---|---|
-| Raw PLY + PNG | 100% | Very high | n/a | — | — | — | Reference |
-| OBJ / FBX / Alembic seq | 70–100% | High | No | — | — | — | Authoring formats |
+| Raw PLY + PNG | 100% | Very high | n/a |: |; |; | Reference |
+| OBJ / FBX / Alembic seq | 70–100% | High | No |: |; |; | Authoring formats |
 | GLB (uncompressed) | 60–90% | High | Yes | No | No | Per-asset | Interchange metadata heavy |
 | Draco GLB seq | 15–35% | High (Draco) | Yes | No | No | Per-asset | Common web baseline |
 | Meshopt GLB seq | 20–40% | Low–med | Yes | No | No | Per-asset | Faster decode than Draco |
@@ -502,13 +502,13 @@ efficiency over authoring convenience**.
 
 ### 4.1 Design goals (ranked)
 
-In priority order — when goals conflict, the higher one wins:
+In priority order: when goals conflict, the higher one wins:
 
 1. **Fast time-to-first-frame (TTFF).** The single most important user-facing metric. A capture must
    begin rendering from a small initial download, before the full asset is present.
 2. **Tiny downloads.** Aggressive size reduction versus Draco-GLB sequences, the prevailing baseline.
 3. **Extremely low CPU usage.** Decode belongs on the hardware video decoder, in Workers, or on the
-   GPU — not the main thread. The render loop must never stall.
+   GPU, not the main thread. The render loop must never stall.
 4. **GPU-first, GPU-resident frames.** The wire format maps onto GPU buffers with minimal CPU
    transformation.
 5. **Progressive streaming and random seek.** Netflix-style chunked delivery, a keyframe/GOP model
@@ -558,7 +558,7 @@ Expanded detail on the load-bearing functional requirements:
 | N1 | Core runtime (excl. WASM codecs) ≤ ~50 KB gzipped. **[PROJECTED]** |
 | N2 | No main-thread task > 8 ms during steady-state playback (headroom in a 16.6 ms frame). |
 | N3 | Deterministic, bounded GPU + CPU memory given a configured cache budget; transient allocation minimized; geometry buffers resident; reusable pools over repeated allocation. |
-| N4 | Graceful degradation: on decode/network stall, hold the last frame or drop to a lower tier — never crash or leak. |
+| N4 | Graceful degradation: on decode/network stall, hold the last frame or drop to a lower tier; never crash or leak. |
 | N5 | All multi-byte fields little-endian; format independent of host endianness. |
 | N6 | Security: never `eval`; treat all container data as untrusted (bounds-check every offset). |
 | N7 | Cross-origin isolation (COOP/COEP) required only for the `SharedArrayBuffer` fast path; a non-isolated fallback MUST exist ([§10.5](#105-threading-sharedarraybuffer-and-cross-origin-isolation)). |
@@ -579,7 +579,7 @@ minimize interaction with the unpredictable ones:
 
 ### 4.5 Performance targets
 
-All values are **[PROJECTED]** — hypotheses to be confirmed by the
+All values are **[PROJECTED]**: hypotheses to be confirmed by the
 [§13](#13-benchmark-methodology-and-projected-performance) methodology. They assume a mid-tier 2025
 laptop / recent flagship phone, a ~30 fps human capture (~30–80k triangles/frame or ~150–400k
 splats), and a good network.
@@ -641,8 +641,8 @@ is fully downloaded, refining in stages that each improve quality without interr
 
 ### 4.9 Clarifying "zero dependence on GLB"
 
-The plan states two things that appear to conflict — "zero dependence on GLB" and "convert from glTF
-sequences" — which are not in conflict:
+The plan states two things that appear to conflict: "zero dependence on GLB" and "convert from glTF
+sequences", which are not in conflict:
 
 - The **runtime** MUST NOT require a glTF/GLB parser to play an ARES file. No `GLTFLoader`, no JSON
   scene graph, no Draco decoder on the critical path unless a capture explicitly uses the Draco
@@ -657,7 +657,7 @@ An OPTIONAL `glTF-extension bridge` for interop with the Khronos Volumetric subg
 ## 5. Overall architecture
 
 ARES is organized as a **deployment pipeline**, not a single file format. It is three cooperating
-systems — an **offline encoder**, a **container**, and a **browser runtime** — meeting at two
+systems: an **offline encoder**, a **container**, and a **browser runtime**; meeting at two
 boundaries: the encoder's *intermediate representation* (IR) and the *container bitstream* on the
 wire. The guiding rule: **all expensive work happens during encoding; the runtime performs only the
 work needed to reconstruct and display each frame.**
@@ -764,15 +764,15 @@ improvement.
 
 A chunked binary file ([§11](#11-file-format-specification)), MP4/Matroska-like in spirit but
 purpose-built: a superblock header, a GOP index (time → byte range), then time-ordered **chunks**
-(typically 1–2 s). Each chunk is **independently decodable** — it carries a complete decoding context
+(typically 1–2 s). Each chunk is **independently decodable**: it carries a complete decoding context
 (one geometry keyframe + its predicted frames, the matching texture-video segment, audio/metadata for
-its span) — which is what makes streaming, seeking, ABR, and interrupted-download recovery tractable.
+its span), which is what makes streaming, seeking, ABR, and interrupted-download recovery tractable.
 Once decoding begins on a chunk, the browser does not need earlier chunks.
 
 ### 5.5 The runtime
 
 A small JS/WASM/WebGPU library ([§10](#10-runtime-architecture),
-[§12](#12-javascript--webgpu-implementation)). The decoder path performs runtime operations only — no
+[§12](#12-javascript--webgpu-implementation)). The decoder path performs runtime operations only, no
 geometry optimization ever happens during playback:
 
 ```
@@ -802,7 +802,7 @@ buffers. After playback begins, transient allocation approaches zero (N3).
 | L3 | Prefetched future chunks | 131–180 |
 
 **Rendering backend.** The runtime is renderer-independent: it exposes standardized GPU resources
-consumed by Three.js, React-Three-Fiber, Babylon.js, native WebGPU, or native WebGL2 — not
+consumed by Three.js, React-Three-Fiber, Babylon.js, native WebGPU, or native WebGL2, not
 file-specific objects.
 
 ### 5.6 Selective stream decoding
@@ -862,7 +862,7 @@ evaluates the candidate on-the-wire representations, then specifies the two ARES
 
 ### 6.1 The candidates (from the plan's Options A–D)
 
-#### Option A — GLB (baseline, for comparison only)
+#### Option A: GLB (baseline, for comparison only)
 
 - **Pros:** industry standard; Three.js/Blender support; Draco/meshopt/KTX2 available.
 - **Cons:** interchange metadata per frame; general-purpose scene graph; every frame is another
@@ -870,15 +870,15 @@ evaluates the candidate on-the-wire representations, then specifies the two ARES
 - **Verdict:** ARES keeps GLB as a **benchmark baseline**, not a runtime representation. Compatibility
   is served by the *encoder importing* GLB, not the runtime consuming it.
 
-#### Option B — Three.js object serialization (JS source emitting `BufferGeometry`)
+#### Option B: Three.js object serialization (JS source emitting `BufferGeometry`)
 
 Emitting `new THREE.BufferGeometry(); geometry.setAttribute(...)` or raw `Float32Array(...)` literals.
 
 - **Pros:** no glTF/JSON parser; no scene-graph overhead.
-- **Cons — and a correction:** shipping geometry as **JS source** is a *false economy*. JS source is
+- **Cons, and a correction:** shipping geometry as **JS source** is a *false economy*. JS source is
   UTF-8 text the engine must parse, is far larger than binary for numeric data, and cannot be
-  transferred to a Worker or uploaded to the GPU without reconstruction. The *good* part of this idea —
-  "produce a `BufferGeometry` directly, skip glTF" — is real, but it is achieved by Option C/D (binary
+  transferred to a Worker or uploaded to the GPU without reconstruction. The *good* part of this idea:
+  "produce a `BufferGeometry` directly, skip glTF": is real, but it is achieved by Option C/D (binary
   → typed array → `BufferGeometry`), not by emitting source code.
 - **Verdict:** **Rejected as a wire format.** Adopt only its *intent* (target `BufferGeometry`
   directly) via binary.
@@ -886,28 +886,28 @@ Emitting `new THREE.BufferGeometry(); geometry.setAttribute(...)` or raw `Float3
 > **[SANITY CHECK]** "Very small JS bundle" is misleading: numbers-as-text is ~2–4× larger than the
 > equivalent binary and adds parse cost. Binary buffers win on every axis that matters here.
 
-#### Option C — Binary `BufferGeometry` (custom `.bin`)
+#### Option C: Binary `BufferGeometry` (custom `.bin`)
 
 A compact binary blob: `{vertexCount, indexCount, positions, normals, uvs, indices}` → `decode(buffer)`.
 
 - **Pros:** smallest *intra* mesh representation; no parser; cache-friendly; Worker/transferable
   friendly.
 - **Cons:** custom tooling.
-- **Verdict:** This is the **intra (I-frame) geometry payload** for the mesh profile — the base on top
-  of which deltas are applied — combined with quantization + meshopt ([§8](#8-compression-architecture)).
+- **Verdict:** This is the **intra (I-frame) geometry payload** for the mesh profile; the base on top
+  of which deltas are applied: combined with quantization + meshopt ([§8](#8-compression-architecture)).
 
-#### Option D — GPU-ready binary (buffers exactly as the GPU wants them)
+#### Option D: GPU-ready binary (buffers exactly as the GPU wants them)
 
 Store interleaved vertex buffers in the target layout so decode is `createBuffer()` + copy.
 
 - **Pros:** near-zero CPU; fastest upload.
-- **Cons — and a correction:** "hardware specific" is the key risk. A truly GPU-ready blob bakes in
+- **Cons, and a correction:** "hardware specific" is the key risk. A truly GPU-ready blob bakes in
   attribute interleaving, alignment (WebGPU wants 4-byte-aligned, often 16-byte-friendly strides), and
   index width. That is fine *if the layout is canonicalized by the spec* rather than by a particular
   GPU. ARES defines **one canonical interleaved layout** per profile so "GPU-ready" is portable, not
   device-specific. A tiny normalization step covers the rare mismatch.
 - **Verdict:** ARES's I-frame layout is Option C's contents arranged in Option D's canonical
-  interleaving — cheap to upload, still portable.
+  interleaving: cheap to upload, still portable.
 
 ### 6.2 Decision: a layered geometry model
 
@@ -951,18 +951,18 @@ decides which frames can be P/B and which force an I-frame:
 
 | Class | Behavior | Examples | Preferred representation |
 |---|---|---|---|
-| **A — Static topology** | only vertex positions change | facial/body capture, rigid motion | Persistent mesh (best case) |
-| **B — Semi-static** | most topology stable; localized change | cloth folds, hair, loose accessories | Persistent mesh + regional updates (§6.6) |
-| **C — Dynamic** | connectivity changes frequently | fluid, destruction, vegetation | Hybrid encoding / frequent I-frames |
-| **D — Unknown** | no reliable correspondence | arbitrary/failed tracking | Independent keyframe meshes (fallback) |
+| **A: Static topology** | only vertex positions change | facial/body capture, rigid motion | Persistent mesh (best case) |
+| **B: Semi-static** | most topology stable; localized change | cloth folds, hair, loose accessories | Persistent mesh + regional updates (§6.6) |
+| **C: Dynamic** | connectivity changes frequently | fluid, destruction, vegetation | Hybrid encoding / frequent I-frames |
+| **D: Unknown** | no reliable correspondence | arbitrary/failed tracking | Independent keyframe meshes (fallback) |
 
 Class A/B are where ARES wins big; Class C/D degrade gracefully toward the mesh-per-frame baseline
 rather than breaking.
 
-### 6.5 Persistent topology — the core bet
+### 6.5 Persistent topology, the core bet
 
 This is the single idea that most differentiates ARES, and the plan's "one additional idea worth
-investigating." For most captures — especially humans — 95–99% of connectivity is stable across many
+investigating." For most captures: especially humans; 95–99% of connectivity is stable across many
 frames. If the encoder maintains a **stable topology** over a GOP and encodes only:
 
 - **vertex displacement** (motion), and
@@ -970,7 +970,7 @@ frames. If the encoder maintains a **stable topology** over a GOP and encodes on
 - **topology patches** when connectivity genuinely changes (occlusion, object entry/exit),
 
 then the geometry stream stops looking like a sequence of independent meshes and starts looking like
-*skeletal animation with dense per-vertex deformation* — to which the entire toolbox of video
+*skeletal animation with dense per-vertex deformation*: to which the entire toolbox of video
 compression (I/P/B frames, motion prediction, chunked GOPs) applies. Persistent information
 (connectivity, UV layout, material assignments, tangent basis, vertex ordering) is stored once;
 dynamic information (displacement, normals, visibility, texture) streams per frame.
@@ -1022,7 +1022,7 @@ residual(v)      = quantize(cur_pos(v) - predicted_pos(v))
 ```
 
 - **Delta.** Storing residuals instead of absolute positions collapses the value distribution's
-  entropy — most residuals are near zero (static regions) and entropy-code to almost nothing.
+  entropy: most residuals are near zero (static regions) and entropy-code to almost nothing.
 - **Sparse.** Only vertices whose residual exceeds a dead-zone are transmitted (index + Δ); the
   decoder preserves unchanged data. Static regions cost ~0 bytes.
 - **Regional.** Topology changes rarely affect the whole mesh at once. Instead of rebuilding the
@@ -1070,12 +1070,12 @@ Design notes:
   encoded as a video track ([§8.5](#85-video-assisted-geometry-packing-attributes-into-pixels)),
   routing splat geometry through the hardware decoder just like texture. The §8.5.1 warning applies
   in full: only colour is video-shaped. Positions fail exactly as for meshes, and rotations fail
-  worse — a quaternion is not spatially coherent, and a jittered splat has no index buffer holding
+  worse: a quaternion is not spatially coherent, and a jittered splat has no index buffer holding
   it in place. The claim that "splats tolerate lossy packing better" holds for colour, not geometry.
 - **Rendering.** Instanced quads per splat, back-to-front through an index indirection from a CPU
   counting sort (re-sorted only when the view direction moves), EWA covariance projection in the
   vertex stage, premultiplied "over" compositing. Both backends (WebGPU storage buffers; WebGL2
-  data textures) — [§12](#12-javascript--webgpu-implementation).
+  data textures): [§12](#12-javascript--webgpu-implementation).
 
 **Implementation (2026-09-07).** The intra splat profile ships: block layout in
 [§11.6.3](#1163-geometry-block--splat-profile); importers for Niantic SPZ (v1–v4), 3DGS PLY,
@@ -1124,12 +1124,12 @@ GPU-native layout, hybrid streams, regional updates, predictive coding) are trac
 
 ## 7. Texture and video encoding
 
-Texture is the larger half of most volumetric payloads. The plan's instinct — *stop shipping
-thousands of WebP files; ship one video* — is correct, but the details determine whether it works.
+Texture is the larger half of most volumetric payloads. The plan's instinct: *stop shipping
+thousands of WebP files; ship one video*: is correct, but the details determine whether it works.
 
 ### 7.1 The decision: one video track, decoded via `WebCodecs`
 
-> **[SANITY CHECK — the most important correction in this section]** The plan says "store one AV1
+> **[SANITY CHECK, the most important correction in this section]** The plan says "store one AV1
 > video; hardware decodes automatically." True for pixels, but a naïve `<video>` element is the
 > **wrong** decode path for volumetric sync. An `HTMLVideoElement` does not give frame-accurate,
 > pull-based access: `currentTime` seeking is imprecise, `requestVideoFrameCallback` is delivery- not
@@ -1160,7 +1160,7 @@ flowchart LR
 | **HEVC/H.265** | Excellent | Widespread (native) | **Inconsistent / license-gated** in browsers | Optional, opt-in only |
 | **H.264/AVC** | Modest | Universal | Universal | Last-resort lowest tier |
 
-> **[SANITY CHECK — HEVC]** The plan lists "Lossless HEVC … very fast … browser support
+> **[SANITY CHECK: HEVC]** The plan lists "Lossless HEVC … very fast … browser support
 > inconsistent." As of 2026, HEVC *hardware* decode is ubiquitous at the OS level, but **browser**
 > exposure through WebCodecs remains inconsistent and entangled with licensing (available in Safari;
 > gated/partial in Chromium depending on platform and flags). ARES therefore treats HEVC as an
@@ -1175,9 +1175,9 @@ decode or a lower profile). Capability is probed at load with
 
 > **[SANITY CHECK]** The plan's own assessment is right and worth formalizing:
 >
-> - **Animated WebP** — poor temporal compression (it is essentially independently-coded frames in a
+> - **Animated WebP**: poor temporal compression (it is essentially independently-coded frames in a
 >   loop), no random access, decoded through the image pipeline. **Not competitive.** Reject.
-> - **Animated AVIF** — backed by AV1 intra coding, so per-frame quality is good, but browser
+> - **Animated AVIF**: backed by AV1 intra coding, so per-frame quality is good, but browser
 >   *sequence* decoding is delivered through the image pipeline with weak seeking and no pull-based
 >   frame access. Interesting for *very short* loops, but the *video* path (AV1 in the container via
 >   WebCodecs) strictly dominates for streaming.
@@ -1215,7 +1215,7 @@ a small **ladder** (e.g., 2048², 1024², 512²) as independent video renditions
 ([§9](#9-streaming-architecture)) selects a rung by bandwidth and on-screen size. Rungs share the
 same timeline so switching is seamless at GOP boundaries.
 
-### 7.7 GPU-compressed textures (KTX2/Basis) — where they still fit
+### 7.7 GPU-compressed textures (KTX2/Basis): where they still fit
 
 KTX2/Basis (UASTC/ETC1S) transcodes to GPU-native block formats and saves *GPU memory and sampling
 bandwidth* [4][33]. But it is an **image** technology with weak temporal compression, so it does not
@@ -1238,7 +1238,7 @@ For motion, the AV1 video track wins on size; the runtime samples the decoded `V
 
 ## 8. Compression architecture
 
-This section specifies how bytes are actually saved, and — critically — subjects the plan's
+This section specifies how bytes are actually saved, and: critically; subjects the plan's
 "store geometry in video" idea to the precision analysis it requires before anyone builds it.
 
 ### 8.1 The compression stack (mesh profile)
@@ -1254,7 +1254,7 @@ Residuals ─ range/ANS entropy coding
 Container ─ chunk = I-frame + P/B run + texture-video segment
 ```
 
-Each stage is independently ablatable — required by Phase 0/Phase 6 benchmarking. The expected
+Each stage is independently ablatable: required by Phase 0/Phase 6 benchmarking. The expected
 contribution ordering (largest savings first) is: **temporal prediction ≫ quantization > entropy
 coding > index coding.** **[PROJECTED]**
 
@@ -1272,7 +1272,7 @@ residuals that entropy-code to almost nothing. The **GOP length** trades random-
 (shorter = faster seek, larger) against size (longer = smaller, coarser seek). Default 30–60 frames
 (1–2 s at 30 fps), matching the streaming chunk (§9) and PackUV's chunking guidance [43].
 
-> **[SANITY CHECK — "keyframe every 60 frames, delta in between"]** The plan's instinct matches
+> **[SANITY CHECK: "keyframe every 60 frames, delta in between"]** The plan's instinct matches
 > video GOP structure exactly and is correct. The subtlety the plan omits: an I-frame MUST also be
 > forced whenever **topology changes** or **tracking error exceeds threshold** (§6.5.1), not only on
 > a fixed cadence. Fixed-cadence-only keyframing would accumulate drift or break on occlusion.
@@ -1286,7 +1286,7 @@ work for free.
 
 ### 8.5 Video-assisted geometry: packing attributes into pixels
 
-The plan's most exciting — and most dangerous — idea: encode geometry into a video and let the
+The plan's most exciting, and most dangerous: idea: encode geometry into a video and let the
 hardware decoder reconstruct it ("R = vertex x, G = vertex y, B = vertex z"). Microsoft, V-PCC, and
 PackUV all prove *a* version of this works. But the naïve RGB-position mapping does **not** work, and
 understanding why is essential.
@@ -1296,14 +1296,14 @@ understanding why is essential.
 Four independent failure modes, each fatal on its own:
 
 1. **Bit depth.** 8-bit video gives **256 levels per channel**. A vertex coordinate needs ~12–16
-   bits. 256 positions across a body is centimeters-to-decimeters of quantization — visibly wrong.
+   bits. 256 positions across a body is centimeters-to-decimeters of quantization: visibly wrong.
    Even 10-bit video (1024 levels) is marginal for absolute positions. [ASSERTED]
 2. **Chroma subsampling.** Standard 4:2:0 video stores full-resolution luma but **quarter-resolution
    chroma**. If X→R, Y→G, Z→B naïvely (converted to YUV), two of your three coordinates are
    spatially downsampled and cross-contaminated. Geometry would smear. [ASSERTED]
 3. **Lossy DCT + inter prediction.** Video codecs are *perceptually* lossy: they discard
    high-frequency detail and quantize DCT coefficients. Applied to a "geometry image," this produces
-   blocking and ringing **in the geometry** — wobbling surfaces, popping vertices. [ASSERTED]
+   blocking and ringing **in the geometry**: wobbling surfaces, popping vertices. [ASSERTED]
 4. **YUV color conversion.** The codec operates in YUV and applies a color transform; treating your
    packed bytes as RGB fights the codec's own colorspace handling. [ASSERTED]
 
@@ -1324,7 +1324,7 @@ The techniques that make video-coded geometry actually work:
   (a 2D chart of the surface, à la V-PCC atlases / Depthkit depth packing) so spatial coherence in
   the map matches the codec's assumptions.
 - **Keep a residual correction stream.** Decode the video-geometry to approximate positions, then
-  apply a small entropy-coded correction to hit target precision — the video carries the bulk motion
+  apply a small entropy-coded correction to hit target precision, the video carries the bulk motion
   cheaply; the correction guarantees fidelity.
 
 #### 8.5.3 ARES position on video-geometry
@@ -1337,7 +1337,7 @@ Video-assisted geometry is a **profile**, not the default, for v1:
   correction, evaluated against the default in Phase 2. Adopt only if it beats the default on the
   size×quality×CPU Pareto front. [OPEN]
 - **Splat profile:** may use PackUV-style attribute-in-video packing [43] because splats tolerate it
-  better than meshes (no connectivity to corrupt) — evaluated in Phase 2.
+  better than meshes (no connectivity to corrupt): evaluated in Phase 2.
 
 This keeps the exciting idea alive as a measured experiment while protecting the shipping timeline
 from its risks.
@@ -1364,7 +1364,7 @@ cost and determinism), tracked in [§15](#15-future-research-the-avatar-pipeline
 
 ### 8.8 End-to-end size budget (illustrative, projected)
 
-A 10-second, 30 fps human capture, "high" tier. **[PROJECTED] — illustrative, pending measurement.**
+A 10-second, 30 fps human capture, "high" tier. **[PROJECTED]: illustrative, pending measurement.**
 
 | Component | Per second | 10 s total | Notes |
 |---|---|---|---|
@@ -1382,7 +1382,7 @@ ladder) matters as much as the geometry cleverness. Both are needed to hit the
 ## 9. Streaming architecture
 
 The plan's "think Netflix" is exactly right. ARES borrows the proven shape of HTTP adaptive
-streaming (HLS/DASH) — chunked media, a manifest, an ABR ladder — adapted for two synchronized
+streaming (HLS/DASH): chunked media, a manifest, an ABR ladder; adapted for two synchronized
 media types (geometry + texture) instead of one.
 
 ### 9.1 Chunked delivery
@@ -1512,9 +1512,9 @@ decode causes a held frame, never a blocked render.
 Three GPU buffer slots per dynamic resource (vertex/displacement buffers, and the external texture
 binding):
 
-- **Slot A** — currently displayed (frame N−1).
-- **Slot B** — ready to display (frame N).
-- **Slot C** — being written by the uploader (frame N+1).
+- **Slot A**: currently displayed (frame N−1).
+- **Slot B**: ready to display (frame N).
+- **Slot C**: being written by the uploader (frame N+1).
 
 Rotating three slots means the GPU never reads a buffer the CPU is writing, eliminating stalls and
 tearing. Double buffering is the minimum; triple absorbs jitter in decode timing. [ASSERTED]
@@ -1553,14 +1553,14 @@ For the population without WebGPU (shrinking, but non-zero in early 2026):
 
 > **[SANITY CHECK]** The plan lists "SharedArrayBuffer" as a runtime feature without noting it
 > requires cross-origin isolation. Many hosting setups can't set COOP/COEP. Hence the mandatory
-> non-isolated fallback — this is a requirement (N7), not a nice-to-have.
+> non-isolated fallback: this is a requirement (N7), not a nice-to-have.
 
 ### 10.6 Memory management and budgets
 
 - A single configurable **budget** (e.g., 256–512 MB) bounds decoded-frame cache + GPU buffers.
 - The ring buffer sizes itself to the budget and the current tier's per-frame footprint.
 - GPU buffers for dynamic data are **allocated once** (max-size for the profile) and reused across
-  frames — no per-frame allocation, no GC pressure on the hot path.
+  frames, no per-frame allocation, no GC pressure on the hot path.
 - `VideoFrame`s are `close()`d immediately after GPU import; geometry buffers return to a free-list.
 - Deterministic teardown: `dispose()` frees all GPU resources, terminates Workers, closes decoders.
 
@@ -1701,7 +1701,7 @@ Chunk
 │    gop_aabb_min[3],gop_aabb_max[3] (f32)   # local quant range
 │    block_count(u16) | block_dir[block_count]  # {type,u8; track_id,u16; offset,u32; length,u32}
 ├─ Geometry block(s)
-│    I-frame: intra mesh/splat (meshopt/draco payload) — the keyframe
+│    I-frame: intra mesh/splat (meshopt/draco payload); the keyframe
 │    P/B-frames: [frame_type(u8)][ref(u8)][residual_stream …]
 ├─ Texture block(s)  (per tier present in this chunk)
 │    one closed video GOP: [EncodedVideoChunk headers][coded bitstream]
@@ -1710,7 +1710,7 @@ Chunk
 └─ Metadata block    (markers, subtitles, per-frame bounding volumes; optional)
 ```
 
-#### 11.6.1 Geometry block — mesh I-frame
+#### 11.6.1 Geometry block: mesh I-frame
 
 | Field | Type | Notes |
 |---|---|---|
@@ -1722,7 +1722,7 @@ Chunk
 | `uvs` | meshopt(u16×2) | optional |
 | `indices` | meshopt(u32) | triangle list |
 
-#### 11.6.2 Geometry block — mesh P/B-frame
+#### 11.6.2 Geometry block: mesh P/B-frame
 
 | Field | Type | Notes |
 |---|---|---|
@@ -1733,7 +1733,7 @@ Chunk
 | `residuals` | entropy(Δquantized) | per changed vertex: index varint + Δxyz |
 
 > P/B frames are **sparse**: only vertices whose residual exceeds the dead-zone are listed. Static
-> regions cost near-zero bytes. Topology (indices) is **not** repeated — it persists from the I-frame.
+> regions cost near-zero bytes. Topology (indices) is **not** repeated: it persists from the I-frame.
 
 #### 11.6.2a Audio block (implemented 2026-09-07)
 
@@ -1753,7 +1753,7 @@ span (the last chunk also takes the audio tail):
 Media time 0 is the first audible sample: the encoder subtracts the pre-skip when timing
 packets, and the decoder receives OpusHead as its `description` so it trims the same priming.
 
-#### 11.6.3 Geometry block — splat profile
+#### 11.6.3 Geometry block: splat profile
 
 Implemented (2026-09-07; `@ares/core` splat.ts / geometry.ts, `@ares/encoder` splat-frame.ts). The
 geometry track's FourCC is `SPLT`, the header's `geometry_profile` is 1, and the superblock's
@@ -1767,7 +1767,7 @@ I-frame:
 | `sh_degree` | u8 | 0–3; the number of higher-order bands present |
 | `flags` | u8 | bit0 antialiased (mip-splatting kernel) |
 | `reserved` | u16 | |
-| `positions` | meshopt(u16×3 + pad, stride 8) | quantized over the chunk AABB with `quant_bits_pos` — the mesh layout |
+| `positions` | meshopt(u16×3 + pad, stride 8) | quantized over the chunk AABB with `quant_bits_pos`, the mesh layout |
 | `attrs` | meshopt(3×u32, stride 12) | word 0: scale bytes ×3 (`exp(s/16 − 10)`) + opacity u8; word 1: rotation, SPZ v3 "smallest three" (2-bit largest index, 3 × sign+9-bit magnitude); word 2: base colour rgb u8 (display-referred, `0.5 + C0·sh0` clamped) + reserved |
 | `sh` | meshopt(u8, stride 12 / 24 / 48) | degree ≥ 1 only: `(v − 128)/128`, coefficient-major rgb, padded to a multiple of 4 |
 
@@ -1849,7 +1849,7 @@ Three.js/React wrappers are thin and optional.
 // One VideoDecoder per active texture track. Frames are pulled, not played.
 const decoder = new VideoDecoder({
   output: (frame: VideoFrame) => {
-    // Import directly into WebGPU — no CPU pixel copy.
+    // Import directly into WebGPU, no CPU pixel copy.
     const tex = device.importExternalTexture({ source: frame });
     uploader.attachTexture(frame.timestamp, tex, frame); // frame.close() after use
   },
@@ -1902,7 +1902,7 @@ struct GopParams { aabbMin: vec3f, aabbMax: vec3f, invMax: f32 };
 fn vs(@builtin(vertex_index) vi: u32) -> @builtin(position) vec4f {
   let q = unpackU16x3(qpos, vi);                 // 0..65535 per axis
   let n = vec3f(q) * gop.invMax;                 // 0..1
-  let world = mix(gop.aabbMin, gop.aabbMax, n);  // dequantize — on the GPU, not the CPU
+  let world = mix(gop.aabbMin, gop.aabbMax, n);  // dequantize: on the GPU, not the CPU
   return camera.viewProj * vec4f(world, 1.0);
 }
 ```
@@ -2015,7 +2015,7 @@ Each mechanism must justify its complexity by an ablation that turns it off:
 - Video-geometry profile vs binary-delta profile (the §8.5 experiment).
 - Splat vs mesh profile on `splat` and `talk`.
 
-#### 13.4.1 Phase 0 intra results — **[MEASURED 2026-07-08]**
+#### 13.4.1 Phase 0 intra results: **[MEASURED 2026-07-08]**
 
 First measured fill of the intra rows (harness `ares/bench`, report at `/bench/report/`).
 Synthetic corpus per §13.2 taxonomy, geometry-only, intra-only; AMD Ryzen 7 6800H, Node 24
@@ -2023,21 +2023,21 @@ Synthetic corpus per §13.2 taxonomy, geometry-only, intra-only; AMD Ryzen 7 680
 
 | Intra codec | KB/frame | % of raw | decode ms/frame | decoder shipped |
 |---|---|---|---|---|
-| raw f32 | 1,440 | 100% | ~0 | — |
-| quantized binary (Opt C/D) | 1,200 | 83% | 0.3 | — |
-| qbin + Brotli | 494 | 34% | 5.3 | — |
+| raw f32 | 1,440 | 100% | ~0 |: |
+| quantized binary (Opt C/D) | 1,200 | 83% | 0.3 |: |
+| qbin + Brotli | 494 | 34% | 5.3 |: |
 | **meshopt** | **210** | **14.6%** | **1.1** | **≈29 KB** |
 | **meshopt + Brotli (q5)** | **92** | **6.4%** | **2.1** | **≈29 KB** |
 | Draco (edgebreaker, cl7) | 41 | 2.9% | 5.5 | ≈279 KB wasm |
 
 Quantization sweep 11→16 bits: RMS error halves per added bit (1.4×10⁻⁴ → 4.5×10⁻⁶ of bbox
 diagonal); qbin's size is bit-independent (u16 storage), so aggressive tiers save bytes only
-through the entropy-coded codecs — consistent with §8.1's expected ordering.
+through the entropy-coded codecs: consistent with §8.1's expected ordering.
 
 **§6.7 confirmed as measured:** Draco ≈2.2× smaller than meshopt+Brotli but 3–5× slower to
 decode and ~10× heavier to ship → **meshopt stays the mesh intra default**, Draco remains the
 optional high-ratio profile. meshopt+Brotli's 6.4% already sits inside §13.5's projected 5–15%
-band *before* temporal coding — the P0 exit criterion (§14) is met. Caveats (§13.6): synthetic
+band *before* temporal coding, the P0 exit criterion (§14) is met. Caveats (§13.6): synthetic
 stand-ins pending real captures in `bench/data/`; Draco geometry error reported as the analytic
 quantization bound (edgebreaker reorders vertices); timings are Node, not yet in-browser workers.
 
@@ -2048,7 +2048,7 @@ non-ARES rows carry the vendor/research claims from [§3](#3-survey-of-existing-
 
 | Format | Rel. size | CPU decode | TTFF | Seek | Notes |
 |---|---|---|---|---|---|
-| Raw PLY + PNG | 100% | Very high | Very slow | — | Reference |
+| Raw PLY + PNG | 100% | Very high | Very slow |: | Reference |
 | Draco-GLB seq | 15–35% | High | 1.5–4 s | Slow | Common baseline |
 | Meshopt-GLB seq | 20–40% | Low–med | 1–3 s | Slow | Faster decode |
 | UVOL | 15–35% | Med–high | Med | Asset | Draco+KTX2 |
@@ -2059,7 +2059,7 @@ non-ARES rows carry the vendor/research claims from [§3](#3-survey-of-existing-
 
 ### 13.6 Honesty clause
 
-If, after Phase 2, the video-geometry profile does not beat the binary-delta profile, it is dropped —
+If, after Phase 2, the video-geometry profile does not beat the binary-delta profile, it is dropped,
 not shipped for novelty. If persistent-topology tracking proves impractical on the `dance`/`two`
 clips, the fallback is per-GOP re-keyframing with meshopt intra, and the size targets are revised
 upward accordingly. Projections are commitments to *measure*, not to *hit*.
@@ -2088,7 +2088,7 @@ gantt
   P6 Hardening + v1            :15, 2
 ```
 
-### Phase 0 — Representation benchmark (de-risk the premise)
+### Phase 0: Representation benchmark (de-risk the premise)
 
 - Build the [§13](#13-benchmark-methodology-and-projected-performance) harness and corpus.
 - Benchmark Options A–D intra representations + Draco/meshopt/quantization; fill the §6.10 matrix
@@ -2097,7 +2097,7 @@ gantt
   devices via `isConfigSupported`. If A2 fails widely, re-plan the texture path.
 - **Exit criteria:** a measured intra baseline; a decision on intra codec default (expect meshopt).
 
-### Phase 1 — Vertical slice (mesh profile, no temporal yet)
+### Phase 1: Vertical slice (mesh profile, no temporal yet)
 
 - Minimal `.ares` container (header, index, chunks) carrying **intra-only** mesh frames + AV1 texture
   via WebCodecs.
@@ -2110,7 +2110,7 @@ gantt
 > once per GOP + positions per frame (§12.3). Measured (AMD 680M iGPU, ~8.8k-vert synth clip):
 > TTFF ≈ 160 ms (< 500 ms), main-thread CPU ≈ 0.35 ms/frame (< 3 ms), decode ≈ 0.3 ms/frame, 60 fps,
 > **1 request** vs a Draco-GLB sequence's per-frame requests. Deferred to later phases at the time:
-> Worker-thread decode (§10.7), WebGL2 fallback (§10.4), WebCodecs video-texture (§7.1) — P1 shipped
+> Worker-thread decode (§10.7), WebGL2 fallback (§10.4), WebCodecs video-texture (§7.1): P1 shipped
 > a still atlas (§7.7).
 >
 > **[UPDATE 2026-07-10]** All three deferred items have since shipped in the reference
@@ -2119,7 +2119,7 @@ gantt
 > worker-thread geometry decode (§10.7) is available opt-in (main-thread fallback where module
 > workers do not inherit import maps).
 
-### Phase 2 — Temporal geometry (the core bet)
+### Phase 2: Temporal geometry (the core bet)
 
 - Encoder: persistent-topology tracking (§6.5.1), I/P/B classification, delta + entropy coding.
 - Runtime: sparse delta upload (§12.5), triple buffering.
@@ -2127,19 +2127,19 @@ gantt
 - **Exit criteria:** measured size drop from temporal coding on `talk`/`dance`; re-keyframing handles
   `two`; §13.5 targets confirmed or revised with honesty clause (§13.6).
 
-### Phase 3 — Streaming, seeking, ABR
+### Phase 3: Streaming, seeking, ABR
 
 - GOP index seek; prefetch/ring buffer; multi-resolution texture ladder; tier selection; range-request
   and manifest delivery modes.
 - **Exit criteria:** smooth seek < 250 ms; ABR adapts on a throttled network; bounded memory verified.
 
-### Phase 4 — Splat profile
+### Phase 4: Splat profile
 
 - Splat intra + temporal; WebGPU instanced/compute-sorted renderer; optional PackUV-style
   attribute-in-video.
 - **Exit criteria:** `splat` clip plays; splat-vs-mesh trade-off documented per capture type.
 
-### Phase 5 — Encoders and conversion tooling
+### Phase 5: Encoders and conversion tooling
 
 Converters, each landing in the shared IR (§5.2) so every coder improvement applies to all inputs:
 
@@ -2148,7 +2148,7 @@ Converters, each landing in the shared IR (§5.2) so every coder improvement app
 - A `gltf-transform`-style CLI: `ares encode ./frames --profile mesh --tier 1024,512 -o out.ares`.
 - **Exit criteria:** one-command conversion for PLY+PNG and Depthkit; documented importer matrix.
 
-### Phase 6 — Hardening and v1.0
+### Phase 6: Hardening and v1.0
 
 - Security pass (untrusted-input fuzzing of the demuxer, N6); WebGL2 fallback polish; live-streaming
   hooks stubbed; spec frozen at v1.0; docs + examples.
@@ -2198,11 +2198,11 @@ flowchart TB
 ### 15.2 Where it connects to ARES
 
 - **Retopology → persistent topology.** A retopologized humanoid mesh is *already* a stable-topology
-  base — exactly what the mesh profile (§6.5) wants. A generated avatar is the ideal ARES input
+  base: exactly what the mesh profile (§6.5) wants. A generated avatar is the ideal ARES input
   because correspondence is free.
 - **Blendshapes → morph targets.** Blendshapes map onto the container's morph/motion blocks, so a
   rigged avatar can be delivered as a compact base mesh + animation rather than baked per-frame
-  geometry — a different, even smaller, encoding mode. [OPEN]
+  geometry: a different, even smaller, encoding mode. [OPEN]
 - **Neural reconstruction → splat or mesh profile.** Whichever the reconstructor emits, the encoder
   ingests it; the runtime does not care.
 
@@ -2218,7 +2218,7 @@ flowchart TB
 | Mocap attachment / physics | Mature | Standard DCC/engine tech |
 
 The early stages are the least certain and the most valuable to invest research in; the later stages
-are largely integration of existing tech. None of it blocks the ARES runtime — the runtime ships
+are largely integration of existing tech. None of it blocks the ARES runtime, the runtime ships
 against real captures (PLY+PNG, Depthkit, 4DViews) long before this pipeline is complete.
 
 
@@ -2226,7 +2226,7 @@ against real captures (PLY+PNG, Depthkit, 4DViews) long before this pipeline is 
 
 These are the load-bearing unknowns. Each is tagged with the phase
 ([§14](#14-development-roadmap)) that resolves it and a fallback if it fails. Nothing in the shipping
-path (mesh profile, Phases 0–3) depends on an unresolved *research* question — the risky ideas are
+path (mesh profile, Phases 0–3) depends on an unresolved *research* question, the risky ideas are
 isolated behind profiles.
 
 ### 16.1 Open questions
@@ -2238,7 +2238,7 @@ isolated behind profiles.
 | Q3 | Is AV1 hardware decode via WebCodecs broad enough on target devices (A2)? | P0 | VP9 primary; AV1 opportunistic; document device matrix |
 | Q4 | What GOP length best balances size vs seek across the corpus? | P3 | Per-capture adaptive GOP from tracking error |
 | Q5 | Splat vs mesh: which per capture type, and can they share one runtime cleanly? | P4 | Ship mesh first; splat as a second profile |
-| Q6 | Temporal 3DGS attribute deltas — stable enough to code as P/B frames? | P4 | Intra splat frames per GOP |
+| Q6 | Temporal 3DGS attribute deltas: stable enough to code as P/B frames? | P4 | Intra splat frames per GOP |
 | Q7 | Blendshape/morph delivery mode for generated avatars (§15.2)? | Post-v1 | Bake to standard geometry frames |
 | Q8 | Is a Matroska/MP4 mapping worth the interop for tooling (§11.9)? | Post-v1 | Keep bespoke container only |
 | Q9 | Live/low-latency profile shape (§9.6)? | Post-v1 | On-demand only in v1 |
@@ -2273,8 +2273,8 @@ Draco-GLB, VVglTF), or temporally smart but proprietary and non-browser (Microso
 4DViews, Arcturus). **No open format combines browser-native decode, persistent topology, and
 temporal geometry compression.** ARES targets exactly that gap.
 
-The design rests on one inversion — *a frame is a compressed set of GPU state changes, not a 3D
-model* — and three mechanisms that follow from it: persistent topology with I/P/B geometry frames,
+The design rests on one inversion: *a frame is a compressed set of GPU state changes, not a 3D
+model*, and three mechanisms that follow from it: persistent topology with I/P/B geometry frames,
 hardware `WebCodecs` decode for texture (and, experimentally, geometry), and GPU-resident
 triple-buffered playback. Around that core sits a conventional, proven streaming model (chunked GOPs,
 a seek index, an ABR ladder) so the novel parts are contained and the risky ideas are firewalled
@@ -2283,18 +2283,18 @@ behind optional profiles.
 This document is deliberately falsifiable. The headline numbers are labeled **[PROJECTED]** and tied
 to a benchmark methodology and an honesty clause; the load-bearing unknowns are enumerated with
 fallbacks; the assumptions are registered and scheduled for validation in Phase 0 before anything is
-built on them. Even in the worst case — persistent topology proving impractical at scale — ARES
+built on them. Even in the worst case: persistent topology proving impractical at scale; ARES
 degrades to "one chunked container of meshopt-intra geometry plus a hardware-decoded video texture
 with real seeking and ABR," which already beats the mesh-per-frame status quo on request count, CPU,
-and seek. The upside case — temporal geometry working as well for humans as video prediction works
-for pixels — is a genuinely new compression model for browser-native volumetric media, and a concrete,
+and seek. The upside case: temporal geometry working as well for humans as video prediction works
+for pixels: is a genuinely new compression model for browser-native volumetric media, and a concrete,
 shipping counterpart to the standardization the Khronos glTF Volumetric subgroup is beginning.
 
 The next step is not more design. It is **Phase 0**: build the harness, benchmark the
 representations, and validate A1/A2 on real devices.
 
 
-## Appendix A — Binary layouts
+## Appendix A: Binary layouts
 
 Consolidated, byte-exact reference for implementers. Little-endian; `varint` = LEB128.
 
@@ -2383,7 +2383,7 @@ struct SplatIFrame {
 
 ---
 
-## Appendix B — Pseudocode
+## Appendix B: Pseudocode
 
 ### B.1 Encoder: GOP segmentation via tracking error
 
@@ -2439,7 +2439,7 @@ pos_buf[i] = pos_buf[i] + residual[gid]   # in quantized space; dequant in verte
 
 ---
 
-## Appendix C — Core runtime data structures
+## Appendix C: Core runtime data structures
 
 ```ts
 interface GopIndexEntry {
@@ -2463,7 +2463,7 @@ interface Scheduler { ensurePrefetch(now: number): void; onThroughput(bps: numbe
 
 ---
 
-## Appendix D — Glossary
+## Appendix D: Glossary
 
 | Term | Definition |
 |---|---|
@@ -2482,25 +2482,25 @@ interface Scheduler { ensurePrefetch(now: number): void; onThroughput(bps: numbe
 
 ---
 
-## Appendix E — References
+## Appendix E: References
 
 Sources informing this specification (carried from the project research brief; bracket numbers match
 in-text citations). Retrieval as of mid-2026.
 
-1. Fraunhofer HHI — volumetric capture bitrate figures ("Dimitri" sequence, ~110 Gbps uncompressed).
-4. Universal Volumetric (UVOL) — per-frame Draco mesh + KTX2/Basis textures + JSON manifest.
-7. Khronos — glTF Volumetric subgroup launch (2026); notes Gaussian Splatting.
-13. Arcturus AVV / HoloSuite (2024) — near-lossless compression, multi-resolution textures, per-vertex
+1. Fraunhofer HHI: volumetric capture bitrate figures ("Dimitri" sequence, ~110 Gbps uncompressed).
+4. Universal Volumetric (UVOL): per-frame Draco mesh + KTX2/Basis textures + JSON manifest.
+7. Khronos: glTF Volumetric subgroup launch (2026); notes Gaussian Splatting.
+13. Arcturus AVV / HoloSuite (2024): near-lossless compression, multi-resolution textures, per-vertex
     motion vectors; ~25% of original size claims.
-16. VVglTF (2025) — streaming glTF segments over HTTP with frame-rate adaptation.
-25. Google — WebP vs PNG size comparison (~26% smaller lossless; ~3× smaller lossy at similar SSIM).
-29. Three.js docs — DRACOLoader / Web Worker decoding guidance.
-32. glTF-Transform / Pixyz — Draco makes `.glb` "much lighter" (~10–20% of original geometry).
-33. KTX2 / Basis Universal — GPU-compressed texture transcoding (UASTC/ETC1S).
-36. Depthkit — capture toolkit; combined color+depth video layout.
-37. 4DViews HOLOSYS — lightweight textured mesh capture; engine-ready runtimes.
-39. MPEG — V-PCC (video-atlas) and G-PCC (octree/predictive) point-cloud coding standards.
-43. Brown University "PackUV" (CVPR 2026) — mapping 3D Gaussian-splat frames into 2D video tracks;
+16. VVglTF (2025): streaming glTF segments over HTTP with frame-rate adaptation.
+25. Google: WebP vs PNG size comparison (~26% smaller lossless; ~3× smaller lossy at similar SSIM).
+29. Three.js docs: DRACOLoader / Web Worker decoding guidance.
+32. glTF-Transform / Pixyz: Draco makes `.glb` "much lighter" (~10–20% of original geometry).
+33. KTX2 / Basis Universal: GPU-compressed texture transcoding (UASTC/ETC1S).
+36. Depthkit: capture toolkit; combined color+depth video layout.
+37. 4DViews HOLOSYS: lightweight textured mesh capture; engine-ready runtimes.
+39. MPEG: V-PCC (video-atlas) and G-PCC (octree/predictive) point-cloud coding standards.
+43. Brown University "PackUV" (CVPR 2026): mapping 3D Gaussian-splat frames into 2D video tracks;
     chunking long sequences to reset stream state and handle object entry/exit.
 
 > Citation numbers are inherited from the source research brief and are intentionally

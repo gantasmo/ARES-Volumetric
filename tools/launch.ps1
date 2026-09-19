@@ -45,7 +45,7 @@ if (-not $node) {
 }
 if (-not $node) {
     Start-Process "https://nodejs.org/en/download"
-    Fail "Node.js is required and could not be installed automatically. The download page has been opened - install the LTS build, then start ARES again."
+    Fail "Node.js absent: the automatic install failed. The Node.js download page is open (LTS build)."
 }
 if (-not (Test-Path $LaunchJs)) { Fail "Cannot find $LaunchJs" }
 

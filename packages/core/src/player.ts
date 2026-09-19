@@ -12,11 +12,11 @@ import { decodeGeometryBlock, decodePFrameBlock, decodeSplatBlock, decodeSplatPB
 import { BlockType, GeometryProfile } from "./format.js";
 import { dequantScale, type Aabb } from "./quant.js";
 import { WebGPURenderer } from "./renderer.js";
-import { WebGL2Renderer, type AresRenderer, type SplatParams } from "./renderer-gl2.js";
+import { WebGL2Renderer, reliefFromMeta, type AresRenderer, type SplatParams, type ReliefDiscard } from "./renderer-gl2.js";
 import { WorkerGeometryDecoder, type WorkerDecodeResult } from "./worker-decode.js";
 import { keepPredicateAt, filterIndicesByPredicate, type EditList } from "./edits.js";
 import { rasterizeIds, type IdBuffer } from "./raster.js";
-import { orbitViewProj, orbitMatrices, orbitViewHeight, multiply, type OrbitState } from "./camera.js";
+import { orbitViewProj, orbitMatrices, orbitViewHeight, multiply, ORBIT_FOV_DEG, type OrbitState } from "./camera.js";
 import { SplatSorter } from "./splat-sort.js";
 import type { DecodedSplat } from "./splat.js";
 import { FX_DEFAULTS, packFx, mergeFx, evalFxTrack, type FxParams, type FxTrack } from "./fx.js";
@@ -65,6 +65,24 @@ export interface PlayerStats {
 }
 
 interface FrameRef { block: Uint8Array; type: BlockType; keyframeIndex: number; gopBox: Aabb; ptsUs: number; }
+
+/**
+ * Frame index → playback clock (µs) at a clip's fps. Exported as a free function because this is the
+ * arithmetic that has actually been wrong in the wild (see the epsilon in clockUsToFrame) and it is
+ * the only part of the seek path that can be exercised in a test: AresPlayer itself needs a document,
+ * navigator.gpu and requestAnimationFrame, so it cannot be constructed under `node --test`.
+ */
+export function frameToClockUs(frame: number, fps: number): number {
+  return (Math.max(0, Math.round(frame)) * 1e6) / fps;
+}
+
+/** Playback clock (µs) → frame index at a clip's fps. Exact inverse of frameToClockUs. */
+export function clockUsToFrame(clockUs: number, fps: number): number {
+  const usPerFrame = 1e6 / fps;
+  // +1e-6 frames: k/fps seconds is not exactly representable — without the guard, seek(40/30)
+  // computes 39.999999999999986 and floors to frame 39 (an off-by-one on ~half of all frames).
+  return Math.floor(clockUs / usPerFrame + 1e-6);
+}
 
 export class AresPlayer {
   private raf = 0;
@@ -135,6 +153,7 @@ export class AresPlayer {
     this.splat = file.header.geometryProfile === GeometryProfile.SplatIPB;
     this.autoOrbit = opts.autoOrbit !== false;
     this.frameToAabb(file.superblock.aabb);
+    this.frameRelief();
     // Size the origin tripod to the clip. A capture is a person either way, but "a person" is ~1700
     // world units in a mm clip and ~1.7 in a metre one; the old fixed 300 was invisible in one and a
     // set of arms across the whole scene in the other.
@@ -161,16 +180,18 @@ export class AresPlayer {
   isOrtho(): boolean { return !!this.orbit.ortho; }
 
   /** Snapshot the orbit camera (for carrying a viewpoint across source switches / A-B compares). */
-  getCamera(): { azimuth: number; elevation: number; distance: number; target: [number, number, number]; ortho?: boolean } {
+  getCamera(): { azimuth: number; elevation: number; distance: number; target: [number, number, number]; ortho?: boolean; fov?: number } {
     const o = this.orbit;
-    // `ortho` rides along: hosts feed this straight back into orbitViewProj (the crop guides do),
-    // and dropping it there would silently project through a different camera than the renderer.
-    return { azimuth: o.azimuth, elevation: o.elevation, distance: o.distance, target: [o.target[0], o.target[1], o.target[2]], ortho: !!o.ortho };
+    // `ortho` and `fov` ride along: hosts feed this straight back into orbitViewProj (the crop
+    // guides and every mask2d volume do), and dropping either there would silently project through
+    // a different camera than the renderer.
+    return { azimuth: o.azimuth, elevation: o.elevation, distance: o.distance, target: [o.target[0], o.target[1], o.target[2]], ortho: !!o.ortho, ...(o.fov != null ? { fov: o.fov } : {}) };
   }
 
-  /** Restore a camera snapshot. Does not touch autoOrbit — set `player.autoOrbit = false` to hold it. */
-  setCamera(c: { azimuth: number; elevation: number; distance: number; target: [number, number, number]; ortho?: boolean }): void {
-    this.orbit = { azimuth: c.azimuth, elevation: c.elevation, distance: c.distance, target: [c.target[0], c.target[1], c.target[2]], ortho: c.ortho ?? this.orbit.ortho };
+  /** Restore a camera snapshot. Does not touch autoOrbit — set `player.autoOrbit = false` to hold it.
+   *  A snapshot without `ortho` or `fov` keeps the current value of each. */
+  setCamera(c: { azimuth: number; elevation: number; distance: number; target: [number, number, number]; ortho?: boolean; fov?: number }): void {
+    this.orbit = { azimuth: c.azimuth, elevation: c.elevation, distance: c.distance, target: [c.target[0], c.target[1], c.target[2]], ortho: c.ortho ?? this.orbit.ortho, fov: c.fov ?? this.orbit.fov };
   }
 
   /** The clip's world-space bounding box (superblock AABB) — the mesh editor's crop range. */
@@ -221,9 +242,92 @@ export class AresPlayer {
     this.orbit.target = c;
     // orbitViewHeight(d) is the world height on screen at distance d; solve it for "the bounding
     // sphere fits", with a little margin so the subject isn't jammed against the frame edge.
-    this.orbit.distance = (radius * 2.3) / (2 * Math.tan((50 * Math.PI) / 180 / 2));
+    this.orbit.fov = undefined;
+    this.orbit.distance = (radius * 2.3) / orbitViewHeight(1);
     this.baseDistance = this.orbit.distance;
+    this.frameRelief();
     this.renderCurrent();
+  }
+
+  /** Largest sway half-angle of a relief's auto-orbit, radians; a deep relief sways less (frameRelief). */
+  static readonly RELIEF_SWAY = 0.2;
+  /** Parallax, radians, between the relief's nearest 5 % and its pivot at the end of a sway. */
+  static readonly RELIEF_PARALLAX = 0.06;
+  private relief: ReliefDiscard | null = null;
+  private reliefSway = AresPlayer.RELIEF_SWAY;
+  /** The FOV (degrees) that fits a relief's whole picture in the canvas: the wheel zooms from it. */
+  private reliefFov = ORBIT_FOV_DEG;
+  private swayPhase = 0;
+  private swayApplied = 0;
+
+  /**
+   * A 2D-to-2.5D relief is a surface seen from ONE camera. Framed like a capture (from outside its
+   * bounding box, turntable orbit) it is viewed from where no pixel of it was ever observed: the
+   * perspective is wrong, the silhouette cuts face the viewer, and half the turntable shows its
+   * missing back. It opens AT the camera that shot it instead, pivoting about the midpoint in
+   * disparity of its surface (`relief.pivot`) so that orbiting reads as parallax, and its
+   * auto-orbit is a sway about that axis.
+   *
+   * The eye sits exactly on the capture camera, with the capture FOV widened only as far as the
+   * canvas needs to show the whole picture (`relief.aspect` against the canvas aspect), and the
+   * wheel zooms by FOV (zoomRelief). Any other point on the axis changes the perspective: stepping
+   * back shrinks near content more than far content, so the characters of a shot turn small against
+   * a background that turns large, and the gap each silhouette cut leaves behind a near subject
+   * opens into a halo.
+   *
+   * Orbiting by an angle a about the pivot p moves content at depth z by a * (p / z - 1) against
+   * the pivot, so the sway is sized to give the nearest 5 % of the surface RELIEF_PARALLAX at its
+   * ends: a shallow scene sways the full RELIEF_SWAY, a deep one less, and the gaps the cuts leave
+   * behind near subjects stay narrow.
+   */
+  private frameRelief(): void {
+    const r = reliefFromMeta(this.file.superblock.meta);
+    this.relief = r;
+    if (!r) return;
+    const b = this.file.superblock.aabb;
+    const diag = Math.hypot(b.max[0] - b.min[0], b.max[1] - b.min[1], b.max[2] - b.min[2]) || 1;
+    const pivot = r.pivot > 0 ? r.pivot : diag * 0.35;
+    const lever = r.near > 0 && pivot > r.near ? pivot / r.near - 1 : 0;
+    this.reliefSway = lever > 0 ? Math.min(AresPlayer.RELIEF_SWAY, Math.max(0.02, AresPlayer.RELIEF_PARALLAX / lever)) : AresPlayer.RELIEF_SWAY;
+    const f = r.forward;
+    const canvasAspect = this.opts.canvas.width / Math.max(1, this.opts.canvas.height);
+    const tanHalf = Math.tan(((r.fov > 0 ? r.fov : ORBIT_FOV_DEG) * Math.PI) / 360);
+    const widen = r.aspect > 0 ? Math.max(1, r.aspect / canvasAspect) : 1;
+    this.reliefFov = (2 * Math.atan(tanHalf * widen) * 180) / Math.PI;
+    this.orbit = {
+      azimuth: Math.atan2(-f[0], -f[2]),
+      elevation: Math.asin(Math.max(-1, Math.min(1, -f[1]))),
+      distance: pivot,
+      target: [r.camera[0] + f[0] * pivot, r.camera[1] + f[1] * pivot, r.camera[2] + f[2] * pivot],
+      ortho: this.orbit.ortho,
+      fov: this.reliefFov,
+    };
+    this.baseDistance = this.orbit.distance;
+  }
+
+  /**
+   * Wheel zoom on a relief: the FOV narrows or widens about the capture camera, from an eighth of
+   * the fitted picture's tangent to three times it, and the perspective the picture was shot with
+   * holds at every zoom.
+   */
+  private zoomRelief(direction: number): void {
+    const t0 = Math.tan((this.reliefFov * Math.PI) / 360);
+    const t = Math.tan(((this.orbit.fov ?? this.reliefFov) * Math.PI) / 360) * (1 + direction * 0.08);
+    const clamped = Math.min(Math.min(3 * t0, Math.tan((150 * Math.PI) / 360)), Math.max(t0 / 8, t));
+    this.orbit.fov = (2 * Math.atan(clamped) * 180) / Math.PI;
+  }
+
+  /** The capture-camera description of a relief clip, or null for any other clip. */
+  getRelief(): ReliefDiscard | null { return this.relief; }
+
+  /** Auto-orbit step: a turntable for a capture, a bounded sway about the capture axis for a relief. */
+  private autoOrbitStep(dt: number): void {
+    if (!this.relief) { this.orbit.azimuth += dt * this.orbitSpeed; return; }
+    // Additive, so a drag composes with the sway instead of fighting it.
+    this.swayPhase += dt * this.orbitSpeed * 3;
+    const s = this.reliefSway * Math.sin(this.swayPhase);
+    this.orbit.azimuth += s - this.swayApplied;
+    this.swayApplied = s;
   }
 
   /** Live crop preview (world space); null disables. Rendering only — bake via the encoder. */
@@ -332,7 +436,7 @@ export class AresPlayer {
   /** Recompute the grid's LOD from the live camera. Called once per render — that per-frame
    *  recompute IS the feature: it is what lets one shader cover every zoom without popping. */
   private updateGridParams(): void {
-    const viewHeight = orbitViewHeight(this.orbit.distance);
+    const viewHeight = orbitViewHeight(this.orbit.distance, this.orbit.fov);
     const pxPerUnit = this.opts.canvas.height / Math.max(1e-9, viewHeight);
     const lod = gridLod(pxPerUnit, 12, this.gridStep);
     this.gridLast = lod;
@@ -374,6 +478,24 @@ export class AresPlayer {
     return { buf, triCentroid };
   }
 
+  /**
+   * The presented frame's topology in its QUANTIZED form, with the two values that dequantize it: the
+   * GOP AABB and the position scale. This is exactly what rasterizeIds (raster.ts) takes — exportFrame()
+   * returns dequantized Float32Array positions and cannot feed it — and it is the shape a worker wants,
+   * since every member is a transferable typed array. Null for splat clips (no triangles) or before the
+   * first frame is decoded, matching pickRaster.
+   *
+   * These are the player's LIVE buffers, not copies: structured-clone them (postMessage with no transfer
+   * list) or .slice() first. TRANSFERRING them detaches the arrays the renderer is still drawing from.
+   */
+  frameGeomQ(): { positionsQ: Uint16Array; indices: Uint32Array; box: Aabb; invLevels: number; frameIndex: number } | null {
+    if (this.splat || !this.curPosQ || !this.curIndices || this.presented < 0) return null;
+    return {
+      positionsQ: this.curPosQ, indices: this.curIndices,
+      box: this.frames[this.presented]!.gopBox, invLevels: this.invLevels, frameIndex: this.presented,
+    };
+  }
+
   /** The canvas aspect used for rendering/picking (mask2d volumes serialize it with the camera). */
   getViewAspect(): number {
     return this.opts.canvas.width / Math.max(1, this.opts.canvas.height);
@@ -386,16 +508,40 @@ export class AresPlayer {
    * side; the mask maps back to full-viewport NDC regardless of capture scale.
    */
   captureFrame(maxDim = 1024): { dataUrl: string; width: number; height: number } {
+    const { off, width, height } = this.captureToCanvas(maxDim);
+    return { dataUrl: off.toDataURL("image/png"), width, height };
+  }
+
+  /** The render-then-drawImage half both capture methods share. Kept in one place because the
+   *  long-side scale rule IS the coordinate frame every stored mask is expressed in: if the click
+   *  path and a propagation sweep ever computed it differently, their mask pixels would silently
+   *  mean different things. */
+  private captureToCanvas(maxDim: number): { off: HTMLCanvasElement; width: number; height: number } {
     this.renderCurrent();
     const c = this.opts.canvas;
     const scale = Math.min(1, maxDim / Math.max(1, Math.max(c.width, c.height)));
-    const w = Math.max(1, Math.round(c.width * scale));
-    const h = Math.max(1, Math.round(c.height * scale));
+    const width = Math.max(1, Math.round(c.width * scale));
+    const height = Math.max(1, Math.round(c.height * scale));
     const off = document.createElement("canvas");
-    off.width = w; off.height = h;
-    const ctx = off.getContext("2d")!;
-    ctx.drawImage(c, 0, 0, w, h);
-    return { dataUrl: off.toDataURL("image/png"), width: w, height: h };
+    off.width = width; off.height = height;
+    off.getContext("2d")!.drawImage(c, 0, 0, width, height);
+    return { off, width, height };
+  }
+
+  /**
+   * captureFrame's batch form: the same render-then-drawImage copy, but resolved as a Blob instead of
+   * a data URL. A per-frame sweep cannot afford captureFrame — a PNG data URL costs 15–30 ms of
+   * main-thread deflate per frame and carries a base64 string ~1.37× the byte size, which over a
+   * 272-frame clip is hundreds of MB of string the GC then has to walk. JPEG at 0.95 over loopback is
+   * bytes nobody pays for.
+   *
+   * Returns the capture's own dimensions with the blob: maxDim caps the LONG side, so a portrait
+   * viewport scales x and y by different factors and any caller mapping coordinates into this image
+   * needs both numbers, not just the width. Null when the canvas cannot encode the requested type.
+   */
+  captureFrameBlob(maxDim = 1008, type = "image/jpeg", quality = 0.95): Promise<{ blob: Blob; width: number; height: number } | null> {
+    const { off, width, height } = this.captureToCanvas(maxDim);
+    return new Promise((resolve) => off.toBlob((b) => resolve(b ? { blob: b, width, height } : null), type, quality));
   }
 
   /** Auto-frame the orbit camera on the clip's bounding box (any scale/origin). */
@@ -442,6 +588,7 @@ export class AresPlayer {
       : await WebGPURenderer.create(opts.canvas);
     renderer.resize(opts.canvas.width, opts.canvas.height);
     renderer.setNormalEncoding(file.superblock.normalEncoding); // 0 = legacy i8×4, 1 = oct16
+    renderer.setRelief(reliefFromMeta(file.superblock.meta));   // sheet reliefs: silhouettes cut at draw time
 
     // Texture: video track (spec §7.1) if present, else still atlas (§7.7).
     let textureVideo: TextureVideo | null = null;
@@ -848,7 +995,24 @@ export class AresPlayer {
 
   /** Seek to seconds via the GOP index (spec §9.2). */
   seek(seconds: number): void {
-    this.clockUs = Math.max(0, seconds * 1e6);
+    this.seekClockUs(Math.max(0, seconds * 1e6));
+  }
+
+  /**
+   * Seek by FRAME INDEX. Identical to seek(idx / getClipFps()) because it is literally the same
+   * body over the same clock (seekClockUs below) — but a sweep that visits every frame of a clip
+   * should not round-trip its index through a float division and back through the epsilon guard in
+   * clockUsToFrame.
+   */
+  seekFrame(idx: number): void {
+    this.seekClockUs(frameToClockUs(idx, this.file.header.fps));
+  }
+
+  /** The seek body, shared so seek() and seekFrame() cannot drift: every scrub, arrow key and
+   *  timeline click in the demo now enters through seekFrame, so anything added to one of these
+   *  tails and not the other would silently miss half the app. */
+  private seekClockUs(us: number): void {
+    this.clockUs = us;
     const idx = this.frameIndexForClock();
     this.present(idx);
     this.renderCurrent();
@@ -856,6 +1020,10 @@ export class AresPlayer {
     this.opts.onFrame?.((this.frames[idx]?.ptsUs ?? 0) / 1e6, idx);
     if (this.playing) this.audioAnchor(); else this.audio?.stop();
   }
+
+  /** The CLIP's frame rate (header fps) — what every frame↔seconds conversion has to divide by.
+   *  Not PlayerStats.fps, which is the rolling RENDER-rate EMA and has nothing to do with the clip. */
+  getClipFps(): number { return this.file.header.fps; }
 
   setTier(_t: "auto" | number): void { /* single tier in P1 (spec §7.6 ladder is P3) */ }
 
@@ -885,10 +1053,7 @@ export class AresPlayer {
   }
 
   private frameIndexForClock(): number {
-    const usPerFrame = 1e6 / this.file.header.fps;
-    // +1e-6 frames: k/fps seconds is not exactly representable — without the guard, seek(40/30)
-    // computes 39.999999999999986 and floors to frame 39 (an off-by-one on ~half of all frames).
-    const raw = Math.floor(this.clockUs / usPerFrame + 1e-6);
+    const raw = clockUsToFrame(this.clockUs, this.file.header.fps);
     const { in: lo, out: hi } = this.getTrim();
     const span = hi - lo + 1;
     // At or before the out point the clock maps straight through — that keeps a seek to ANY frame
@@ -910,7 +1075,7 @@ export class AresPlayer {
    */
   tick(dtSec: number): void {
     this.clockUs += dtSec * 1e6;
-    if (this.autoOrbit && !this.dragging) this.orbit.azimuth += dtSec * this.orbitSpeed;
+    if (this.autoOrbit && !this.dragging) this.autoOrbitStep(dtSec);
     const idx = this.frameIndexForClock();
     if (idx !== this.presented) {
       this.present(idx, true); this.opts.onFrame?.(this.frames[idx]!.ptsUs / 1e6, idx);
@@ -924,7 +1089,7 @@ export class AresPlayer {
     const dt = Math.min(0.05, (now - this.lastNow) / 1000);
     this.lastNow = now;
     if (this.playing) this.clockUs += dt * 1e6;
-    if (this.autoOrbit && !this.dragging) this.orbit.azimuth += dt * this.orbitSpeed;
+    if (this.autoOrbit && !this.dragging) this.autoOrbitStep(dt);
 
     // Audio-led clock: when the track is running, its context time replaces the accumulator above.
     if (this.audio && this.playing && this.audio.isRunning) {
@@ -960,9 +1125,23 @@ export class AresPlayer {
     this.renderCurrent();
   }
 
-  /** Diagnostics for the texture path (frames applied, decoder error). */
-  textureDebug(): { hasVideo: boolean; applied: number; error: string | null } {
-    return { hasVideo: !!this.textureVideo, applied: this.texApplied, error: this.textureVideo?.error ?? null };
+  /**
+   * Diagnostics for the texture path (frames applied, which one, decoder error).
+   *
+   * `settled` is the one a batch consumer needs: seek/seekFrame present geometry synchronously, but
+   * pumpTexture converges the atlas over up to 30 rAF retries because VideoDecoder emission is async.
+   * Without it, anything that seeks and immediately reads the canvas (a capture sweep, a still export)
+   * silently gets frame N's mesh wearing frame N−k's atlas. A clip with no video track is settled by
+   * definition — its still atlas never changes.
+   */
+  textureDebug(): { hasVideo: boolean; applied: number; appliedIdx: number; settled: boolean; error: string | null } {
+    return {
+      hasVideo: !!this.textureVideo,
+      applied: this.texApplied,
+      appliedIdx: this.texAppliedIdx,
+      settled: !this.textureVideo || this.texAppliedIdx === this.presented,
+      error: this.textureVideo?.error ?? null,
+    };
   }
   private texApplied = 0;
 
@@ -1026,7 +1205,7 @@ export class AresPlayer {
         const rx = Math.cos(a), rz = -Math.sin(a);                          // camera right (world)
         const ux = -se * Math.sin(a), uy = ce, uz = -se * Math.cos(a);      // camera up (world)
         const h = (c as HTMLCanvasElement).clientHeight || 1;
-        const k = (2 * this.orbit.distance * Math.tan((50 * Math.PI) / 180 / 2)) / h; // world units / pixel
+        const k = orbitViewHeight(this.orbit.distance, this.orbit.fov) / h; // world units / pixel
         this.orbit.target[0] += (-rx * dx + ux * dy) * k;
         this.orbit.target[1] += (uy * dy) * k;
         this.orbit.target[2] += (-rz * dx + uz * dy) * k;
@@ -1039,7 +1218,12 @@ export class AresPlayer {
     });
     // Middle button on some browsers still tries autoscroll on mousedown; cancel it there too.
     c.addEventListener("mousedown", (e) => { if (e.button === 1) e.preventDefault(); });
-    c.addEventListener("wheel", (e) => { e.preventDefault(); this.orbit.distance = Math.max(this.baseDistance * 0.15, Math.min(this.baseDistance * 5, this.orbit.distance * (1 + Math.sign(e.deltaY) * 0.08))); this.renderIfIdle(); }, { passive: false });
+    c.addEventListener("wheel", (e) => {
+      e.preventDefault();
+      if (this.relief) this.zoomRelief(Math.sign(e.deltaY));
+      else this.orbit.distance = Math.max(this.baseDistance * 0.15, Math.min(this.baseDistance * 5, this.orbit.distance * (1 + Math.sign(e.deltaY) * 0.08)));
+      this.renderIfIdle();
+    }, { passive: false });
   }
 
   /**

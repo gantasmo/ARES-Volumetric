@@ -134,6 +134,24 @@
   /* Thin vertical divider between button groups inside a cluster row. */
   .vdiv { width: 1px; height: 16px; background: var(--border-st); margin: 0 2px; flex: none; }
   .ctlGrid input[type="range"] { flex: 1; min-width: 48px; height: var(--ctl); }
+  /* Tool palette: mutually-exclusive tools drawn as ONE segmented control, so they cannot be
+     mistaken for the independent toggles that used to share their row. */
+  .toolbar { display: flex; width: max-content; border: 1px solid var(--border-st);
+    border-radius: var(--r); overflow: hidden; }
+  .toolbar > .u.ico { border: 0; border-radius: 0; width: 27px; height: 26px; font-size: 14px; background: var(--surface); }
+  .toolbar > .u.ico + .u.ico { border-left: 1px solid var(--border-st); }
+  .toolbar > .u.ico:hover:not(:disabled) { background: var(--surface-h); }
+  .toolbar > .u.ico[aria-pressed="true"] { background: var(--accent); border-color: var(--accent); color: var(--accent-ink); }
+  /* Group caption. The rail used to have rows whose meaning depended on remembering which row a
+     slider was in; every group is named now. */
+  .grpLbl { font-size: 9.5px; text-transform: uppercase; letter-spacing: .4px;
+    color: var(--text-faint); margin: 8px 0 3px; }
+  /* Options for the active tool only. */
+  .optRow { display: flex; align-items: center; gap: 5px; min-height: 24px; margin-top: 5px; font-size: 11px; }
+  .optRow[hidden] { display: none; }
+  .optRow > input[type="range"] { flex: 1; min-width: 48px; height: var(--ctl); }
+  .optRow .num { font: 10px ui-monospace, monospace; color: var(--text-mid); min-width: 42px; text-align: right; }
+  .optRow .hint { color: var(--text-faint); font-size: 10.5px; }
   /* One accent for every slider in the rails — no stray browser-default blue/lavender. */
   .rail input[type="range"] { accent-color: var(--accent); height: var(--ctl); }
   #view { position: fixed; inset: 0; width: 100%; height: 100%; display: block; touch-action: none; cursor: grab; }
@@ -439,7 +457,59 @@
     min-height: 0; width: 100%; }
   /* Each overlay page is a bounded column — its dynamic region is the internal scroller, so the
      page itself never scrolls wholesale. */
-  #convertOut { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
+  #convertOut { flex: 0 1 auto; min-height: 0; overflow-y: auto; }
+  /* ---- Convert tab: two-column control surface -------------------------------------------
+     Everything explanatory is a title= tooltip or lives behind the ⋯ button, and every
+     secondary parameter group is a collapsed <details>, so the card fits one viewport. The
+     only scrollers are the log, the batch queue and the history list. */
+  #tab-convert .wrap { max-width: 1120px; }
+  .tbar { display: flex; align-items: center; gap: 6px; margin: 2px 0 8px; }
+  .tbar h2 { margin: 0; flex: none; }
+  .tbar .sp { flex: 1 1 auto; }
+  .pop { margin: 0 0 8px; padding: 7px 10px; background: var(--bg-panel); border: 1px solid var(--border);
+    border-radius: var(--r); font-size: 12px; }
+  .pop .fmt { display: grid; grid-template-columns: 132px 1fr auto; gap: 2px 10px; padding: 2px 0; align-items: baseline; }
+  .pop .fmt > span:first-of-type { color: var(--text-dim); }
+  .pop .fmt > span:last-child { font-size: 10.5px; text-transform: uppercase; letter-spacing: .3px; color: var(--text-faint); }
+  #convertDrop { padding: 7px 12px; }
+  #convertDrop .big { display: block; font-size: 12.5px; color: var(--text-dim); margin: 0; }
+  /* Two columns of controls, then full-width rows for the action bar, queue, log and result. */
+  .cv2 { display: grid; grid-template-columns: 1.15fr 1fr; gap: 0 22px; align-items: start; }
+  .cv2 > .full { grid-column: 1 / -1; }
+  .cvcol { min-width: 0; }
+  .fld { display: grid; grid-template-columns: 74px 1fr; align-items: center; gap: 0 8px;
+    min-height: 26px; font-size: 12px; }
+  .fld > .k { color: var(--text-dim); }
+  .fld .row { flex-wrap: wrap; min-width: 0; }
+  .fld .row > .k { flex: none; }
+  .fld .row > .inp { min-width: 0; }
+  .fld .suf { color: var(--text-dim); font-size: 11.5px; }
+  .stats { display: grid; grid-template-columns: 74px 1fr; gap: 1px 8px; margin: 3px 0 5px; font-size: 12px; }
+  .stats dt { color: var(--text-dim); }
+  .stats dd { margin: 0; color: var(--text); font-variant-numeric: tabular-nums;
+    overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+  details.sec { border-top: 1px solid var(--border); }
+  details.sec > summary { cursor: pointer; list-style: none; padding: 5px 0; font-size: 10px;
+    text-transform: uppercase; letter-spacing: .3px; color: var(--text-dim); user-select: none; }
+  details.sec > summary::-webkit-details-marker { display: none; }
+  details.sec > summary::before { content: "▸ "; color: var(--text-faint); }
+  details.sec[open] > summary::before { content: "▾ "; }
+  details.sec > summary:hover { color: var(--text); }
+  details.sec > .body { padding: 0 0 7px; }
+  details.sec .prog { margin-top: 6px; }
+  .cvfoot { display: flex; gap: 8px; align-items: center; margin-top: 8px; padding-top: 8px;
+    border-top: 1px solid var(--border); }
+  .cvfoot .prog { flex: 1 1 auto; margin: 0; display: block; }
+  .cvlog { margin: 0; max-height: 168px; overflow: auto; background: var(--surface); border-radius: var(--r);
+    padding: 5px 8px; font: 11px ui-monospace, monospace; color: var(--text-mid); white-space: pre-wrap; }
+  .note2 { color: var(--text-dim); font-size: 11.5px; }
+  /* The settings card sizes to its content; History absorbs whatever height is left, so the
+     leftover space becomes a longer list rather than a dead band above the fold. */
+  #convertHistory { flex: 1 1 auto; min-height: 96px; display: flex; flex-direction: column; }
+  #convertHistory .card { margin-top: 8px; flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
+  #convertHistory .histList { flex: 1 1 auto; min-height: 0; max-height: none; }
+  #convertHistory .card > h3, #convertHistory .card > div:first-child { flex: none; }
+  @media (max-width: 900px) { .cv2 { grid-template-columns: 1fr; } }
   #depsOut { flex: 1 1 auto; min-height: 0; overflow-y: auto; }
   #rpOut { flex: 1 1 auto; min-height: 0; display: flex; flex-direction: column; }
   .tool h2 { margin: 4px 0 4px; font-size: 18px; }
@@ -579,42 +649,42 @@
 <canvas id="view"></canvas>
 
 <div class="panel" id="tabs" role="tablist">
-  <button role="tab" data-tab="viewer" aria-selected="true" title="3D playback viewport — orbit, scrub, and edit the volumetric clip">Viewer</button>
-  <button role="tab" data-tab="compare" aria-selected="false" title="A/B two clips side-by-side at the same frame — check a re-bake against the original">Compare</button>
+  <button role="tab" data-tab="viewer" aria-selected="true" title="3D playback viewport: orbit, scrub, and edit the volumetric clip">Viewer</button>
+  <button role="tab" data-tab="compare" aria-selected="false" title="A/B two clips side-by-side at the same frame: check a re-bake against the original">Compare</button>
   <button role="tab" data-tab="convert" aria-selected="false" title="import a capture folder (OBJ/PLY + atlas) and encode it into a .ares clip">Convert</button>
   <button role="tab" data-tab="settings" aria-selected="false" title="models, tools, and downloads">Settings</button>
-  <button role="tab" data-tab="compute" aria-selected="false" title="RunPod compute — launch, watch, run experiments">Compute</button>
+  <button role="tab" data-tab="compute" aria-selected="false" title="RunPod compute: launch, watch, run experiments">Compute</button>
   <!-- Viewport shading lives in the ONE header bar (owner ask #15). Segmented = mutually
        exclusive, like the reference shot's MESH|WIRED|X-RAY. Icons carry it; the tooltip
        carries the explanation (never inline prose). -->
   <span class="hdrSep viewer-only"></span>
   <div class="seg viewer-only" id="shadeSeg" role="group" aria-label="viewport shading">
-    <button data-shade="shaded" aria-pressed="true" title="Shaded — the baked texture on the mesh, lit. The delivery look: judge colour, seams and texture sharpness here. Z cycles shading, W toggles wireframe.">◍</button>
-    <button data-shade="unlit" aria-pressed="false" title="Unlit — the texture verbatim, no lighting applied. The honest view for video-textured captures (Depthkit) whose footage already carries the room's real lighting: lit shading double-lights them and reads blown out. Z cycles shading.">◌</button>
-    <button data-shade="clay" aria-pressed="false" title="Untextured clay — same lighting, texture off, so you judge FORM alone: dents, melts and wrong-surface snaps the texture hides. Z cycles shading.">◑</button>
-    <button data-shade="wire" aria-pressed="false" title="Wireframe — triangle edges only. Read topology + density, and spot stretched/torn edges across a coherent run. W toggles it, Z cycles shading.">▦</button>
-    <button data-shade="normals" aria-pressed="false" title="Normals — surface orientation as colour (x,y,z → r,g,b). Shows shading seams, flipped patches and the effect of smoothing at a glance. Z cycles shading.">◭</button>
-    <button data-shade="uv" aria-pressed="false" title="UV checker — a 32×32 checker sampled through the atlas coordinates. Stretched or squashed squares mean stretched texels; seams show where charts meet. Z cycles shading.">▩</button>
-    <button data-shade="depth" aria-pressed="false" title="Depth — distance from the camera as a gradient over the clip's extent. Reads relief and stray geometry behind the subject. Z cycles shading.">◔</button>
-    <button data-shade="points" aria-pressed="false" title="Points — the vertices alone as a point cloud, textured, unlit. The honest view of a capture's sampling density; the point size is in Edit ▸ Tools. Z cycles shading.">⁘</button>
+    <button data-shade="shaded" aria-pressed="true" title="Shaded, the baked texture on the mesh, lit. The delivery look: judge colour, seams and texture sharpness here. Z cycles shading, W toggles wireframe.">◍</button>
+    <button data-shade="unlit" aria-pressed="false" title="Unlit, the texture verbatim, no lighting applied. The honest view for video-textured captures (Depthkit) whose footage already carries the room's real lighting: lit shading double-lights them and reads blown out. Z cycles shading.">◌</button>
+    <button data-shade="clay" aria-pressed="false" title="Untextured clay: same lighting, texture off, so you judge FORM alone: dents, melts and wrong-surface snaps the texture hides. Z cycles shading.">◑</button>
+    <button data-shade="wire" aria-pressed="false" title="Wireframe: triangle edges only. Read topology + density, and spot stretched/torn edges across a coherent run. W toggles it, Z cycles shading.">▦</button>
+    <button data-shade="normals" aria-pressed="false" title="Normals: surface orientation as colour (x,y,z → r,g,b). Shows shading seams, flipped patches and the effect of smoothing at a glance. Z cycles shading.">◭</button>
+    <button data-shade="uv" aria-pressed="false" title="UV checker: a 32×32 checker sampled through the atlas coordinates. Stretched or squashed squares mean stretched texels; seams show where charts meet. Z cycles shading.">▩</button>
+    <button data-shade="depth" aria-pressed="false" title="Depth: distance from the camera as a gradient over the clip's extent. Reads relief and stray geometry behind the subject. Z cycles shading.">◔</button>
+    <button data-shade="points" aria-pressed="false" title="Points, the vertices alone as a point cloud, textured, unlit. The honest view of a capture's sampling density; the point size is in Edit ▸ Tools. Z cycles shading.">⁘</button>
   </div>
   <span class="hdrSep"></span>
   <!-- Projection. Perspective is for looking, ortho is for measuring: it kills the wide-angle
        distortion and makes axis-aligned crop planes read as exact straight lines. Glyphs say it
        without words — a trapezoid converges, a rectangle doesn't. -->
   <div class="seg viewer-only" id="projSeg" role="group" aria-label="camera projection">
-    <button data-proj="persp" aria-pressed="true" title="Perspective (P) — how a real lens sees: far things shrink, parallel edges converge. Natural for judging a capture, but it bends straight edges toward the frame corners.">⏢</button>
-    <button data-proj="ortho" aria-pressed="false" title="Orthographic (P) — no perspective divide, no wide-angle fisheye: parallel edges stay parallel and scale is constant everywhere. Use it to crop and to judge alignment — it's the only projection where an axis-aligned crop plane is an exact straight line.">▭</button>
+    <button data-proj="persp" aria-pressed="true" title="Perspective (P): how a real lens sees: far things shrink, parallel edges converge. Natural for judging a capture, but it bends straight edges toward the frame corners.">⏢</button>
+    <button data-proj="ortho" aria-pressed="false" title="Orthographic (P), no perspective divide, no wide-angle fisheye: parallel edges stay parallel and scale is constant everywhere. Use it to crop and to judge alignment: it's the only projection where an axis-aligned crop plane is an exact straight line.">▭</button>
   </div>
   <span class="hdrSep viewer-only"></span>
   <!-- Ground grid. NOT an edit tool — it is a viewport REFERENCE, so it lives in the header beside
        shading/projection and is ON by default. The increment select carries its own units, and the
        readout beside it says the cell size actually being drawn (which "auto" changes as you zoom). -->
   <div class="seg viewer-only" id="gridSeg" role="group" aria-label="ground grid">
-    <button id="gridToggle" aria-pressed="true" title="Ground grid + origin axes (G) — the floor plane and the 0,0,0 tripod. It extends forever and fades into the distance, so you can always read where the ground is, which way the capture faces, and whether it actually stands on the floor instead of hovering.">⊞</button>
+    <button id="gridToggle" aria-pressed="true" title="Ground grid + origin axes (G), the floor plane and the 0,0,0 tripod. It extends forever and fades into the distance, so you can always read where the ground is, which way the capture faces, and whether it actually stands on the floor instead of hovering.">⊞</button>
     <select id="gridStep" title="Grid cell size. Auto resizes the cells to the zoom, so the floor stays readable whether you are looking at a whole room or a fingertip; the finer lines cross-fade as you pull out. Pick a fixed increment to measure against a known size instead. The readout to the right always shows the cell you are actually seeing."></select>
   </div>
-  <span class="gridRead viewer-only" id="gridRead" title="the grid cell size currently on screen, in real-world units">—</span>
+  <span class="gridRead viewer-only" id="gridRead" title="the grid cell size currently on screen, in real-world units">· </span>
   <span class="hdrSep"></span>
   <button id="themeBtn" class="u ico lg" title="Light / dark theme. Dark is the default; your choice is remembered on this machine.">◐</button>
 </div>
@@ -641,7 +711,7 @@
 <div class="panel viewer-only rail" id="hud">
   <div class="railHandle" id="hudHandle"></div>
   <div class="railHead">
-    <button id="hudCollapse" class="railChevron" title="collapse — click the strip to expand">‹</button>
+    <button id="hudCollapse" class="railChevron" title="collapse: click the strip to expand">‹</button>
     <span class="railTitle">Media</span>
     <div class="railMini" id="hudMini"><b class="fps" id="hudMiniFps">--</b><b class="mb" id="hudMiniMB">--</b></div>
   </div>
@@ -675,23 +745,23 @@
   <div id="tlHead">
     <div class="tlZone">
       <span id="time">0/0 · 0.00s</span>
-      <span id="lockTag" style="display:none;font-size:10px;font-weight:600;color:var(--warn)" title="view locked — rotation &amp; auto-orbit disabled; scrub, zoom, pan, and selection tools still work. Press L (or the Lock-view button in Edit → Tools) to release.">view locked</span>
+      <span id="lockTag" style="display:none;font-size:10px;font-weight:600;color:var(--warn)" title="view locked; rotation &amp; auto-orbit disabled; scrub, zoom, pan, and selection tools still work. Press L (or the Lock-view button in Edit → Tools) to release.">view locked</span>
     </div>
     <div class="tlZone center">
-      <button id="play" class="u ico lg" title="play / pause — Space">⏸︎</button>
-      <button id="loopMode" class="u ico lg" title="at the clip end: Loop / Ping-pong / Once — click to cycle">⟳</button>
-      <button id="orbit" class="u ico lg toggle" title="auto-orbit on/off — O (disabled while the view is locked)">◍</button>
+      <button id="play" class="u ico lg" title="play / pause: Space">⏸︎</button>
+      <button id="loopMode" class="u ico lg" title="at the clip end: Loop / Ping-pong / Once; click to cycle">⟳</button>
+      <button id="orbit" class="u ico lg toggle" title="auto-orbit on/off: O (disabled while the view is locked)">◍</button>
       <!-- Audio transport: only shown for clips that carry an Opus track (spec §11.5). -->
-      <button id="mute" class="u ico lg toggle" aria-pressed="false" style="display:none" title="mute / unmute the clip's audio — U">♪</button>
+      <button id="mute" class="u ico lg toggle" aria-pressed="false" style="display:none" title="mute / unmute the clip's audio; U">♪</button>
       <input id="vol" type="range" min="0" max="100" value="100" style="display:none;width:64px" title="volume">
     </div>
     <div class="tlZone right">
       <!-- Clip trim. The two brackets ARE the in/out points; everything outside them is dimmed on the
            strip, playback loops between them, and a Bake encodes only that window (encoder
            --trim-in/--trim-out) — so the dimmed frames are really gone, not just hidden. -->
-      <button id="trimIn" class="u ico" title="Set the clip IN point at the playhead ( [ ) — everything before it is trimmed off: dimmed on the strip, skipped by playback, and dropped by a bake. Drag the bracket on the strip to adjust it.">⇥</button>
-      <button id="trimOut" class="u ico" title="Set the clip OUT point at the playhead ( ] ) — everything after it is trimmed off: dimmed on the strip, skipped by playback, and dropped by a bake. Drag the bracket on the strip to adjust it.">⇤</button>
-      <button id="trimReset" class="u ico" title="Clear the trim — the whole clip plays and bakes again. Nothing was destroyed; a trim only chooses which frames survive the next bake.">⭯</button>
+      <button id="trimIn" class="u ico" title="Set the clip IN point at the playhead ( [ ): everything before it is trimmed off: dimmed on the strip, skipped by playback, and dropped by a bake. Drag the bracket on the strip to adjust it.">⇥</button>
+      <button id="trimOut" class="u ico" title="Set the clip OUT point at the playhead ( ] ): everything after it is trimmed off: dimmed on the strip, skipped by playback, and dropped by a bake. Drag the bracket on the strip to adjust it.">⇤</button>
+      <button id="trimReset" class="u ico" title="Clear the trim, the whole clip plays and bakes again. Nothing was destroyed; a trim only chooses which frames survive the next bake.">⭯</button>
       <span id="trimRead" title="the trimmed clip: surviving frames and duration">full</span>
     </div>
   </div>
@@ -706,7 +776,7 @@
 <div class="panel viewer-only rail" id="editPanel">
   <div class="railHandle" id="railHandle"></div>
   <div class="railHead">
-    <button id="railCollapse" class="railChevron" title="collapse — click the strip to expand">›</button>
+    <button id="railCollapse" class="railChevron" title="collapse: click the strip to expand">›</button>
     <span class="railTitle">Edit</span>
   </div>
   <div class="railBody" id="railBody">
@@ -720,8 +790,8 @@
       <div class="secHead"><span class="tw">▾</span>Crop<small>guides</small></div>
       <div class="secBody">
         <div class="cropRow">
-          <button id="cropGuidesToggle" class="u ico" aria-pressed="false" title="Crop rulers &amp; guides (R) — rulers along the top and left edges read the two axes currently facing you. The four guide lines ARE the crop planes: drag one to move that plane. The third axis points into the screen and can't be dragged from here — orbit (or press 1/3/7) to bring it round.">⌗</button>
-          <button id="cropReset" class="u ico" title="Reset the crop — clears all six planes and shows the full captured volume again. Nothing is destroyed by cropping; it only trims what you see and what a bake would keep.">⭯</button>
+          <button id="cropGuidesToggle" class="u ico" aria-pressed="false" title="Crop rulers &amp; guides (R): rulers along the top and left edges read the two axes currently facing you. The four guide lines ARE the crop planes: drag one to move that plane. The third axis points into the screen and can't be dragged from here: orbit (or press 1/3/7) to bring it round.">⌗</button>
+          <button id="cropReset" class="u ico" title="Reset the crop: clears all six planes and shows the full captured volume again. Nothing is destroyed by cropping; it only trims what you see and what a bake would keep.">⭯</button>
           <div id="cropRead"></div>
         </div>
       </div>
@@ -730,22 +800,22 @@
          geometry (encoder --up-axis/--center/--scale/--rotate/--translate, same core evaluator).
          Unity hotkeys: W move · E rotate · R scale · F focus. -->
     <section class="railSec" data-sec="xform">
-      <div class="secHead" title="Orient an imported capture: which way is up, where the origin sits, and what units it's in. Captures don't agree — a Microsoft/SVF export is Y-up millimetres, most scanner/DCC exports are Z-up, a 4DViews bake is metres. The preview here is exactly what a Bake writes into the geometry.">
+      <div class="secHead" title="Orient an imported capture: which way is up, where the origin sits, and what units it's in. Captures don't agree: a Microsoft/SVF export is Y-up millimetres, most scanner/DCC exports are Z-up, a 4DViews bake is metres. The preview here is exactly what a Bake writes into the geometry.">
         <span class="tw">▾</span>Transform<small>W/E/R</small>
       </div>
       <div class="secBody">
         <div class="row">
-          <span class="k" title="Which axis of the SOURCE capture points up. It gets rotated so that axis becomes +Y (the runtime's up). Proper rotations only — never a mirror, which would flip the model and reverse any text on it.">up</span>
+          <span class="k" title="Which axis of the SOURCE capture points up. It gets rotated so that axis becomes +Y (the runtime's up). Proper rotations only, never a mirror, which would flip the model and reverse any text on it.">up</span>
           <div class="seg" id="upSeg" role="group" aria-label="source up axis">
             <button data-up="x" title="The source's +X is up.">X</button>
-            <button data-up="y" aria-pressed="true" title="The source's +Y is up — Microsoft/SVF exports and anything already upright.">Y</button>
-            <button data-up="z" title="The source's +Z is up — most scanner and DCC exports.">Z</button>
+            <button data-up="y" aria-pressed="true" title="The source's +Y is up: Microsoft/SVF exports and anything already upright.">Y</button>
+            <button data-up="z" title="The source's +Z is up: most scanner and DCC exports.">Z</button>
           </div>
         </div>
         <div class="row">
-          <span class="k" title="Where the model's origin lands after the up-axis fix. Computed once over the WHOLE clip, never per frame — per-frame centring would re-centre the subject every frame and a walk would moonwalk in place.">origin</span>
+          <span class="k" title="Where the model's origin lands after the up-axis fix. Computed once over the WHOLE clip, never per frame: per-frame centring would re-centre the subject every frame and a walk would moonwalk in place.">origin</span>
           <div class="seg" id="ctrSeg" role="group" aria-label="centring">
-            <button data-ctr="bottom" title="Stand it on the ground: centred in X/Z with its lowest point exactly on y=0, on the grid. This is the right default for an import — the ground plane is the one reference every capture shares — and it's what a bake uses as soon as any transform is set.">⊥</button>
+            <button data-ctr="bottom" title="Stand it on the ground: centred in X/Z with its lowest point exactly on y=0, on the grid. This is the right default for an import, the ground plane is the one reference every capture shares, and it's what a bake uses as soon as any transform is set.">⊥</button>
             <button data-ctr="mass" title="Centre through the middle: the bounding box's centre goes to the origin.">✛</button>
             <button data-ctr="none" aria-pressed="true" title="Leave the source coordinates exactly where they are. The resting state, so loading a clip never silently moves it.">∅</button>
           </div>
@@ -753,7 +823,7 @@
         <div class="row">
           <span class="k" title="Uniform scale. 0.001 takes a millimetre capture to metres.">scale</span>
           <input id="xfScale" class="inp xf3" type="number" step="0.001" value="1">
-          <button id="xfMm2M" class="u" title="Set scale to 0.001 — millimetres to metres. The daniel/Microsoft captures are mm (a person is ~1700 units tall); 4DViews bakes are already metres.">mm→m</button>
+          <button id="xfMm2M" class="u" title="Set scale to 0.001: millimetres to metres. The daniel/Microsoft captures are mm (a person is ~1700 units tall); 4DViews bakes are already metres.">mm→m</button>
         </div>
         <div class="row">
           <span class="k" title="Extra rotation in degrees, applied after the up-axis fix. E arms the rotate tool; the ±90 buttons step a quarter turn.">rot°</span>
@@ -768,65 +838,82 @@
           <input id="xfPosZ" class="inp xf3" type="number" step="1" value="0" title="translate Z, world units">
         </div>
         <div class="ctlGrid" style="margin-top:4px">
-          <button class="u ico xtool" data-xtool="move" aria-pressed="false" title="Move (W) — drag in the viewport to translate the model. Hold X / Y / Z to constrain to one axis; Shift for fine steps.">✥</button>
-          <button class="u ico xtool" data-xtool="rotate" aria-pressed="false" title="Rotate (E) — drag in the viewport to rotate the model. Hold X / Y / Z to constrain to one axis; Shift for fine steps.">⟲</button>
-          <button class="u ico xtool" data-xtool="scale" aria-pressed="false" title="Scale (R) — drag in the viewport to scale the model uniformly. Shift for fine steps.">⤢</button>
+          <button class="u ico xtool" data-xtool="move" aria-pressed="false" title="Move (W): drag in the viewport to translate the model. Hold X / Y / Z to constrain to one axis; Shift for fine steps.">✥</button>
+          <button class="u ico xtool" data-xtool="rotate" aria-pressed="false" title="Rotate (E): drag in the viewport to rotate the model. Hold X / Y / Z to constrain to one axis; Shift for fine steps.">⟲</button>
+          <button class="u ico xtool" data-xtool="scale" aria-pressed="false" title="Scale (R): drag in the viewport to scale the model uniformly. Shift for fine steps.">⤢</button>
           <span class="vdiv"></span>
-          <button id="xfFocus" class="u ico" title="Focus (F) — frame the subject: point the camera at the model's bounds and pull back to fit.">◎</button>
-          <button id="xfReset" class="u ico" title="Reset the transform — back to the capture's own raw coordinates.">⭯</button>
+          <button id="xfFocus" class="u ico" title="Focus (F): frame the subject: point the camera at the model's bounds and pull back to fit.">◎</button>
+          <button id="xfReset" class="u ico" title="Reset the transform: back to the capture's own raw coordinates.">⭯</button>
         </div>
         <div class="row" style="margin-top:2px">
-          <span class="k" id="xfRead" style="flex:1" title="the clip's size and floor height as the viewer currently sees it, with the transform applied">—</span>
+          <span class="k" id="xfRead" style="flex:1" title="the clip's size and floor height as the viewer currently sees it, with the transform applied">· </span>
         </div>
       </div>
     </section>
     <section class="railSec" data-sec="tools">
-      <div class="secHead"><span class="tw">▾</span>Tools</div>
+      <div class="secHead"><span class="tw">▾</span>Tools<small>V M A B S T</small></div>
       <div class="secBody">
         <!-- The ground grid used to sit here. It is not a tool — it is a viewport reference, like
              shading and projection — so it moved to the header bar and is on by default. -->
-        <!-- ONE cluster row: selection tools | view modifiers, divided like the Transform tools row —
-             two stacked two-button rows read as clutter at this density. -->
-        <div class="ctlGrid">
-          <button class="u ico tool" data-tool="nav" aria-pressed="true" title="Navigate (V) — camera only, no selection. Esc returns here from any tool.">✥</button>
-          <button class="u ico tool" data-tool="sbox" aria-pressed="false" title="Box select (M) — drag a screen-space rectangle to mark geometry for deletion, keyframed at the current frame. Pair with X-ray to cut through the body.">▢</button>
-          <button class="u ico tool" data-tool="brush" aria-pressed="false" title="Brush (B) — paint directly on the surface to mark geometry for deletion. Radius slider sits beside it (mm).">✎</button>
-          <button class="u ico tool" data-tool="sam" aria-pressed="false" title="SAM select (S) — click an object and the segmentation model selects the whole thing. Shift-click excludes a region. Commit it below as Delete / Recolor / Copy; the Del key always commits as a delete.">✂</button>
-          <button class="u ico tool" data-tool="lasso" aria-pressed="false" title="Lasso select (A) — draw a free shape around geometry to mark it, keyframed at the current frame. Respects X-ray like the box: off = only what is visible inside the loop.">◠</button>
-          <button class="u ico tool" data-tool="measure" aria-pressed="false" title="Measure (T) — click two points on the surface to read the straight-line distance between them in real units. Esc clears.">⟷</button>
-          <span class="vdiv"></span>
-          <button id="xray" class="u ico" aria-pressed="false" title="X-ray (X) — Blender-style: selections cut THROUGH the mesh, hitting back-facing surfaces too. Off = only what you can actually see is selected. Turn on to delete something inside or behind the body.">◫</button>
-          <button id="viewLock" class="u ico" aria-pressed="false" title="Lock view (L) — freezes rotation and auto-orbit so you can scrub the whole timeline and select/delete from one exact angle without the camera drifting. Middle-drag pan and wheel zoom still work.">🔒︎</button>
-          <input id="brushR" type="range" min="5" max="150" value="35" title="Brush radius in millimetres — how wide a patch each stroke marks; also the step Grow/Shrink use.">
+        <!-- One active tool at a time. Icons are unique across the whole rail: ✥ stays with Move in
+             Transform, so Navigate is the hand every DCC uses for camera-only; ⧉ is X-ray
+             (see-through), leaving ◫ to the FX clip plane it already meant. -->
+        <div class="toolbar" role="radiogroup" aria-label="selection tool">
+          <button class="u ico tool" data-tool="nav" aria-pressed="true" role="radio" aria-checked="true" title="Navigate (V): camera only, no selection. Esc returns here from any tool.">✋</button>
+          <button class="u ico tool" data-tool="sbox" aria-pressed="false" role="radio" aria-checked="false" title="Box select (M): drag a screen-space rectangle to select geometry, keyframed at the current frame. Pair with X-ray to cut through the body.">⬚</button>
+          <button class="u ico tool" data-tool="lasso" aria-pressed="false" role="radio" aria-checked="false" title="Lasso select (A): draw a free shape around geometry to select it, keyframed at the current frame. Respects X-ray like the box: off = only what is visible inside the loop.">➰</button>
+          <button class="u ico tool" data-tool="brush" aria-pressed="false" role="radio" aria-checked="false" title="Brush (B): paint directly on the surface to select geometry. Radius is in the options strip below.">✎</button>
+          <button class="u ico tool" data-tool="sam" aria-pressed="false" role="radio" aria-checked="false" title="Smart select (S): click an object and the segmentation model selects the whole thing. Shift-click excludes a region. The selection is a mask until you choose what to do with it.">✨</button>
+          <button class="u ico tool" data-tool="measure" aria-pressed="false" role="radio" aria-checked="false" title="Measure (T): click two points on the surface to read the straight-line distance between them in real units. Esc clears.">⟷</button>
         </div>
-        <!-- Selection operators act on the ▶ active range's regions; camera bookmarks are camera-only. -->
-        <div class="ctlGrid" style="margin-top:4px">
-          <button id="selGrow" class="u ico" title="Grow (=) — expand the active range's regions by one brush radius: boxes per face, brush radii, marquee rects, and SAM/lasso masks by the matching pixels. Shift = 5×.">⊕</button>
-          <button id="selShrink" class="u ico" title="Shrink (−) — contract the active range's regions by one brush radius. Shift = 5×.">⊖</button>
-          <button id="selInvert" class="u ico" title="Invert (I) — flip the active delete range between delete-inside and keep-inside (everything outside is deleted instead).">⇋</button>
-          <button id="selMirror" class="u ico" title="Mirror — duplicate the active range's box and brush regions across the clip's centre X plane (left ⇄ right). Screen-space masks cannot be mirrored and are left as they are.">⇔</button>
+        <!-- Options for the ACTIVE tool only. -->
+        <div class="optRow" data-tool-opt="brush" hidden>
+          <span class="k" title="Brush radius in millimetres: how wide a patch each stroke marks; also the step Grow and Shrink use.">radius</span>
+          <input id="brushR" type="range" min="5" max="150" value="35" title="Brush radius in millimetres.">
+          <span class="num" id="brushRVal">35 mm</span>
+        </div>
+        <div class="optRow" data-tool-opt="nav sbox lasso sam measure">
+          <span class="hint" id="toolHint"></span>
+        </div>
+
+        <div class="grpLbl">view</div>
+        <div class="ctlGrid">
+          <button id="xray" class="u ico" aria-pressed="false" title="X-ray (X): Blender-style: selections cut THROUGH the mesh, hitting back-facing surfaces too. Off = only what you can actually see is selected. Turn on to reach something inside or behind the body.">⧉</button>
+          <button id="viewLock" class="u ico" aria-pressed="false" title="Lock view (L): freezes rotation and auto-orbit so you can scrub the whole timeline and select from one exact angle without the camera drifting. Middle-drag pan and wheel zoom still work.">🔒︎</button>
           <span class="vdiv"></span>
+          <span class="k" title="Point size for the Points shading mode, in pixels.">points</span>
+          <input id="pointSize" type="range" min="1" max="12" value="2" style="flex:0 0 62px" title="Point size for the Points view, in pixels.">
+        </div>
+
+        <div class="grpLbl">selection</div>
+        <div class="ctlGrid">
+          <button id="selGrow" class="u ico" title="Grow (=): expand the active range's regions by one brush radius: boxes per face, brush radii, marquee rects, and mask regions by the matching pixels. Shift = 5×.">⊕</button>
+          <button id="selShrink" class="u ico" title="Shrink (−): contract the active range's regions by one brush radius. Shift = 5×.">⊖</button>
+          <button id="selInvert" class="u ico" title="Invert (I): flip the active range between delete-inside and keep-inside (everything outside is removed instead).">⇋</button>
+          <button id="selMirror" class="u ico" title="Mirror: duplicate the active range's box and brush regions across the clip's centre X plane (left ⇄ right). Screen-space masks cannot be mirrored and are left as they are.">⇔</button>
+        </div>
+
+        <div class="grpLbl">camera</div>
+        <div class="ctlGrid">
           <button id="camSave" class="u ico" title="Bookmark this camera (C cycles bookmarks). Click a number to return to it; Shift-click a number to remove it. Stored on this machine per clip.">◈</button>
           <span id="camChips" style="display:flex;gap:3px;flex-wrap:wrap"></span>
-          <span class="vdiv"></span>
-          <input id="pointSize" type="range" min="1" max="12" value="2" title="Point size for the Points view, in pixels." style="width:56px">
         </div>
       </div>
     </section>
     <section class="railSec" data-sec="ranges">
-      <div class="secHead" title="Edits that span time. Click a row to make it ▶ active; Delete/Backspace removes the active row (not while typing) — but with a pending SAM selection those keys commit it as a delete instead. Ctrl+S saves immediately.">
+      <div class="secHead" title="Edits that span time. Click a row to make it ▶ active; Delete/Backspace removes the active row (not while typing), but with a pending SAM selection those keys commit it as a delete instead. Ctrl+S saves immediately.">
         <span class="tw">▾</span>Ranges<small>over time</small>
       </div>
       <div class="secBody">
         <!-- range lifecycle | undo/redo — one uniform icon row; undo/redo used to ride the section
              header as odd-sized chevron buttons, the one non-uniform button pair in the rail. -->
         <div class="ctlGrid">
-          <button id="rangeStart" class="u ico" title="Start a range at the current frame — the edit applies from here onward. Then shape the selection (it auto-keyframes here), scrub elsewhere and reshape to add keyframes, and press End to close it. The range tweens between keyframes.">⬤</button>
+          <button id="rangeStart" class="u ico" title="Start a range at the current frame, the edit applies from here onward. Then shape the selection (it auto-keyframes here), scrub elsewhere and reshape to add keyframes, and press End to close it. The range tweens between keyframes.">⬤</button>
           <button id="rangeKey" class="u ico" disabled title="Add a keyframe at the current frame so the edit's shape can change across the range. The shape interpolates between neighbouring keyframes.">◆</button>
-          <button id="rangeEnd" class="u ico" disabled title="End the range at the current frame — closes the open range so it applies only up to here.">■</button>
+          <button id="rangeEnd" class="u ico" disabled title="End the range at the current frame: closes the open range so it applies only up to here.">■</button>
           <span class="vdiv"></span>
-          <button id="undoBtn" class="u ico" disabled title="Undo the last edit — Ctrl+Z">↶</button>
-          <button id="redoBtn" class="u ico" disabled title="Redo — Ctrl+Shift+Z or Ctrl+Y">↷</button>
+          <button id="undoBtn" class="u ico" disabled title="Undo the last edit: Ctrl+Z">↶</button>
+          <button id="redoBtn" class="u ico" disabled title="Redo: Ctrl+Shift+Z or Ctrl+Y">↷</button>
         </div>
         <!-- The range STRIP lives in the bottom timeline dock now (#rangeTrack, see #controls) —
              time belongs on the timeline, not in a 270px-wide side rail. This section keeps the
@@ -835,7 +922,7 @@
       </div>
     </section>
     <section class="railSec" data-sec="sam">
-      <div class="secHead" title="Click-to-select via the local SAM segmentation service. Multi-frame: each commit keyframes the mask at the current frame — scrub elsewhere, re-run SAM and commit again to add another keyframe; the range tweens between them. Text prompts segment by description instead of a click.">
+      <div class="secHead" title="Click-to-select via the local SAM segmentation service. Multi-frame: each commit keyframes the mask at the current frame; scrub elsewhere, re-run SAM and commit again to add another keyframe; the range tweens between them. Text prompts segment by description instead of a click.">
         <span class="tw">▾</span>SAM<small>local service</small>
       </div>
       <div class="secBody">
@@ -845,30 +932,68 @@
         </div>
         <div id="samTextRow" class="row" style="margin-top:4px">
           <input id="samTextInput" class="inp" type="text" placeholder="describe an object…" disabled maxlength="200"
-            style="flex:1;min-width:0" title="text/concept prompt — Enter to segment (SAM tool) — Esc clears">
+            style="flex:1;min-width:0" title="text/concept prompt; Enter to segment (SAM tool); Esc clears">
           <button id="samTextGo" class="u" disabled title="Segment by text description (Enter). Captures the current view and asks the concept model for every matching instance.">Go</button>
         </div>
         <div id="samTextHint" style="display:none;margin-top:3px;font:10px ui-monospace,monospace;color:var(--text-faint)"></div>
         <div id="samTextChips" style="display:none;gap:4px;flex-wrap:wrap;margin-top:5px"></div>
         <div id="samSelRow" class="row" style="display:none;margin-top:4px;flex-wrap:wrap">
           <span id="samSelInfo" style="flex:1;min-width:90px;font:10px ui-monospace,monospace;color:var(--text-dim)"></span>
-          <select id="samActSel" class="inp" title="the action the commit button below performs on this selection">
-            <option value="delete">Delete</option>
+          <select id="samActSel" class="inp" title="what the button beside it does with this selection. Isolate keeps only the selection and is the default: selecting an object does not presume you want it deleted.">
+            <option value="isolate">Isolate</option>
             <option value="recolor">Recolor…</option>
             <option value="paint">Paint…</option>
             <option value="sculpt">Sculpt…</option>
             <option value="copy">Copy…</option>
+            <option value="delete">Delete</option>
           </select>
           <button id="samApply" class="u primary" title="Commit this selection as the action chosen beside it, keyframed at the current frame. The Del key always commits as a delete.">Commit</button>
           <button id="samClear" class="u" title="Discard the pending SAM selection and start over (Esc).">Clear</button>
         </div>
+        <!-- Propagation rows (docs/sam-propagation-plan.md steps 5/6). THREE rows, mutually
+             exclusive by state, because .railBody (:201) is the rail's one scrolling container and
+             the rail is clamped to 220-480 px: a pending selection gets the track controls, a live
+             run gets progress + Cancel, a tracked active range gets the correction loop. At most
+             FOUR controls per row, and syncTrackRows (main.js) picks exactly one row from one state
+             variable. The rows are exclusive of each other, NOT of #samSelRow above: a pending
+             selection is what #trackRow is gated on, so its three controls are on screen too. -->
+        <div id="trackRow" class="row" style="display:none;margin-top:4px;flex-wrap:wrap">
+          <button id="trackGo" class="u primary" title="propagate the pending selection across the span with the SAM video tracker (K)">Track</button>
+          <select id="trackDir" class="inp" title="propagation direction from the seed frame">
+            <option value="forward">forward</option>
+            <option value="reverse">reverse</option>
+            <option value="bidirectional">bidirectional</option>
+          </select>
+          <select id="trackSpan" class="inp" title="frame span to track">
+            <option value="clip">clip</option>
+            <option value="range">range</option>
+          </select>
+          <select id="trackMaskRes" class="inp" title="stored bitmap long side; the tracker input edge is fixed at 1008">
+            <option value="512">512</option>
+            <option value="768" selected>768</option>
+            <option value="1024">1024</option>
+          </select>
+        </div>
+        <div id="trackRunRow" class="row" style="display:none;margin-top:4px;flex-wrap:wrap">
+          <span id="trackInfo" style="flex:1;min-width:90px;font:10px ui-monospace,monospace;color:var(--text-dim)"></span>
+          <button id="trackCancel" class="u" style="display:none" title="stop the track; keyframes already written are kept (Esc)">Cancel</button>
+          <button id="trackResume" class="u primary" style="display:none" title="replay this clip's live track session into the sidecar; the ranges it already wrote are rebuilt from the service's own event log">Resume</button>
+          <button id="trackDrop" class="u" style="display:none" title="close the session and keep its frames retired for a retrack">Discard</button>
+        </div>
+        <div id="trackFixRow" class="row" style="display:none;margin-top:4px;flex-wrap:wrap">
+          <span id="trackFixInfo" style="flex:1;min-width:90px;font:10px ui-monospace,monospace;color:var(--text-dim)"></span>
+          <button id="trackNudge" class="u" title="add a click at this frame and re-propagate to the next user keyframe">Nudge</button>
+          <button id="trackReseed" class="u" title="new object id at this frame and re-propagate to the next user keyframe">Re-seed</button>
+          <button id="trackAnchor" class="u" style="display:none" title="rebuild the session from every seed and re-propagate the window">Re-anchor</button>
+          <button id="trackWorst" class="u ico" title="jump to the lowest-confidence frame of the active track (N)">⌄</button>
+        </div>
       </div>
     </section>
     <section class="railSec" data-sec="fx">
-      <div class="secHead" title="Playback effects — evaluated in the renderer, never baked into the geometry. Keyframe them on the timeline (◆) and they interpolate between keys; the track is saved in the clip's sidecar."><span class="tw">▾</span>FX<small>playback · keyframed</small></div>
+      <div class="secHead" title="Playback effects: evaluated in the renderer, never baked into the geometry. Keyframe them on the timeline (◆) and they interpolate between keys; the track is saved in the clip's sidecar."><span class="tw">▾</span>FX<small>playback · keyframed</small></div>
       <div class="secBody">
         <div class="row">
-          <span class="k" title="Clip plane — hides everything on one side of a world-aligned plane: a cross-section or a reveal. The slider moves the plane through the clip's extent along the chosen axis.">clip</span>
+          <span class="k" title="Clip plane: hides everything on one side of a world-aligned plane: a cross-section or a reveal. The slider moves the plane through the clip's extent along the chosen axis.">clip</span>
           <button id="fxClipOn" class="u ico" aria-pressed="false" title="clip plane on / off">◫</button>
           <div class="seg" id="fxClipAxis" role="group" aria-label="clip axis">
             <button data-ax="0" title="plane normal along X">X</button><button data-ax="1" aria-pressed="true" title="plane normal along Y">Y</button><button data-ax="2" title="plane normal along Z">Z</button>
@@ -877,28 +1002,28 @@
           <input id="fxClipOff" type="range" min="0" max="100" value="50" style="flex:1;min-width:40px" title="plane position across the clip's extent">
         </div>
         <div class="row">
-          <span class="k" title="Dissolve — burns the surface away through 3D noise; the rim of the burn takes the edge colour. Scale sets the grain.">dissolve</span>
+          <span class="k" title="Dissolve: burns the surface away through 3D noise; the rim of the burn takes the edge colour. Scale sets the grain.">dissolve</span>
           <input id="fxDissolve" type="range" min="0" max="100" value="0" style="flex:1;min-width:40px" title="how much has dissolved, 0–100%">
           <input id="fxDissolveScale" class="inp" type="number" min="0.1" step="0.5" value="4" style="width:44px" title="grain: noise cells per world unit">
           <input id="fxEdge" type="color" value="#c99a5a" title="burn-edge colour" style="width:var(--ctl);height:var(--ctl);padding:0;border:0;background:none;cursor:pointer">
         </div>
         <div class="row">
-          <span class="k" title="Tint — multiply the surface by a colour, mixed in by the slider.">tint</span>
+          <span class="k" title="Tint: multiply the surface by a colour, mixed in by the slider.">tint</span>
           <input id="fxTint" type="color" value="#ffffff" title="tint colour" style="width:var(--ctl);height:var(--ctl);padding:0;border:0;background:none;cursor:pointer">
           <input id="fxTintMix" type="range" min="0" max="100" value="0" style="flex:1;min-width:40px" title="tint mix, 0–100%">
         </div>
         <div class="row">
-          <span class="k" title="Rim — a fresnel edge light from the camera's point of view (meshes).">rim</span>
+          <span class="k" title="Rim: a fresnel edge light from the camera's point of view (meshes).">rim</span>
           <input id="fxRimColor" type="color" value="#c99a5a" title="rim colour" style="width:var(--ctl);height:var(--ctl);padding:0;border:0;background:none;cursor:pointer">
           <input id="fxRim" type="range" min="0" max="100" value="0" style="flex:1;min-width:40px" title="rim strength, 0–100%">
         </div>
         <div class="row">
-          <span class="k" title="Scanlines — hologram bands along world Y; the number is bands per metre-scale unit.">scan</span>
+          <span class="k" title="Scanlines: hologram bands along world Y; the number is bands per metre-scale unit.">scan</span>
           <input id="fxScan" type="range" min="0" max="100" value="0" style="flex:1;min-width:40px" title="scanline strength, 0–100%">
           <input id="fxScanFreq" class="inp" type="number" min="1" step="5" value="40" style="width:48px" title="bands per world unit">
         </div>
         <div class="row">
-          <span class="k" title="Wobble — sinusoidal displacement of the surface (holo-glitch). Amplitude is a percentage of the clip's height; frequency in waves per world unit.">wobble</span>
+          <span class="k" title="Wobble: sinusoidal displacement of the surface (holo-glitch). Amplitude is a percentage of the clip's height; frequency in waves per world unit.">wobble</span>
           <input id="fxWobble" type="range" min="0" max="100" value="0" style="flex:1;min-width:40px" title="wobble amplitude, % of clip height ÷ 20">
           <input id="fxWobbleFreq" class="inp" type="number" min="0.1" step="0.5" value="2" style="width:44px" title="waves per world unit">
         </div>
@@ -909,7 +1034,7 @@
           <input id="fxSplatOpacity" type="range" min="0" max="100" value="100" style="flex:1;min-width:30px" title="splat opacity, 0–100%">
         </div>
         <div class="ctlGrid" style="margin-top:4px">
-          <button id="fxKey" class="u ico" title="Keyframe (◆) — store the current effect values at this frame; the track interpolates between keys and holds outside them.">◆</button>
+          <button id="fxKey" class="u ico" title="Keyframe (◆): store the current effect values at this frame; the track interpolates between keys and holds outside them.">◆</button>
           <button id="fxKeyDel" class="u ico" title="Remove the keyframe at this frame.">◇</button>
           <button id="fxTrackClear" class="u ico" title="Clear the whole effects track.">✕</button>
           <button id="fxReset" class="u ico" title="Reset the live values (the track is kept).">⭯</button>
@@ -933,7 +1058,7 @@
       <div class="secHead" title="Take things out of the viewer: the presented frame's mesh, a still, or a turntable clip. All local, nothing uploaded."><span class="tw">▾</span>Export<small>frame · still · turntable</small></div>
       <div class="secBody">
         <div class="ctlGrid">
-          <button id="exportObj" class="u" title="Write the presented frame as a Wavefront OBJ (positions, UVs, normals, faces) — the frame exactly as decoded, before any edit preview. The atlas is a video track and is not written; use ares export for a PNG-free PLY.">Frame → OBJ</button>
+          <button id="exportObj" class="u" title="Write the presented frame as a Wavefront OBJ (positions, UVs, normals, faces), the frame exactly as decoded, before any edit preview. The atlas is a video track and is not written; use ares export for a PNG-free PLY.">Frame → OBJ</button>
           <button id="exportPng" class="u" title="Save the viewport as a PNG at up to 4096 px on the long side (current shading, grid and overlays as shown).">Still → PNG</button>
           <button id="exportTurn" class="u" title="Record one full auto-orbit revolution (8 s) of the playing clip as a WebM video from this viewport. Uses the browser's MediaRecorder; the orbit speed is restored afterwards.">Turntable → WebM</button>
         </div>
@@ -965,15 +1090,15 @@
       <select id="cmpA" class="inp"></select>
       <span style="color:var(--text-faint);font-size:12px">vs</span>
       <select id="cmpB" class="inp"></select>
-      <button id="cmpPlay" class="u primary" title="play / pause both clips together — Space">Pause</button>
+      <button id="cmpPlay" class="u primary" title="play / pause both clips together: Space">Pause</button>
       <button id="cmpOrbit" class="u toggle" title="auto-orbit both clips in sync so you compare from the same angle">Orbit</button>
-      <button id="cmpMode" class="u" title="switch between split-screen and overlaid A/B — click to cycle">Split view</button>
+      <button id="cmpMode" class="u" title="switch between split-screen and overlaid A/B: click to cycle">Split view</button>
       <!-- Same shading modes as the Viewer, driving BOTH players in lockstep — an A/B is only fair
            if both sides are shaded identically (owner ask: Compare needs these too). -->
       <div class="seg" id="cmpShadeSeg" role="group" aria-label="viewport shading (both clips)">
-        <button data-shade="shaded" aria-pressed="true" title="Shaded — the baked texture, lit. Judge colour, seams and texture sharpness. Applies to BOTH clips.">◍</button>
-        <button data-shade="clay" aria-pressed="false" title="Untextured clay — texture off, same lighting, so you judge FORM alone: dents, melts and wrong-surface snaps the texture hides. Applies to BOTH clips.">◑</button>
-        <button data-shade="wire" aria-pressed="false" title="Wireframe — triangle edges only. Compare topology and spot stretched/torn edges. Applies to BOTH clips.">▦</button>
+        <button data-shade="shaded" aria-pressed="true" title="Shaded, the baked texture, lit. Judge colour, seams and texture sharpness. Applies to BOTH clips.">◍</button>
+        <button data-shade="clay" aria-pressed="false" title="Untextured clay: texture off, same lighting, so you judge FORM alone: dents, melts and wrong-surface snaps the texture hides. Applies to BOTH clips.">◑</button>
+        <button data-shade="wire" aria-pressed="false" title="Wireframe: triangle edges only. Compare topology and spot stretched/torn edges. Applies to BOTH clips.">▦</button>
       </div>
       <input type="range" id="cmpScrub" min="0" max="1000" value="0" style="width:220px;accent-color:var(--accent)">
       <span id="cmpTime" style="color:var(--text-dim);font-size:12px;font-variant-numeric:tabular-nums;min-width:74px"></span>
@@ -993,26 +1118,32 @@
 <!-- Convert tab — unified import: a frames folder (Microsoft volcap / PLY sequences / DepthKit
      exports) analyses + converts; a single .ares/.4ds file is structurally probed instead (the
      former standalone Inspect tab was merged in here 2026-07-11 — same probe, same findings,
-     now the first step of "can I convert this" rather than a separate destination). -->
+     now the first step of "can I convert this" rather than a separate destination).
+     The panel is a control surface: the format matrix and the pipeline notes that used to run
+     down the page live in the ⋯ menu and in title= tooltips, so the card fits one viewport and
+     only the log, the batch queue and the history list scroll. -->
 <div class="tool" id="tab-convert">
   <div class="wrap">
-    <h2>Convert to .ares</h2>
-    <p class="lead">Convert a capture folder — per-frame OBJ/PLY meshes with PNG or JPG atlases — into a
-      single .ares clip. Encoding runs locally. A single .ares or .4ds file is probed structurally
-      instead: only the container layout is read, never mesh or texture content.</p>
-    <div class="note" style="margin:0 0 10px">Formats: <b>Microsoft volcap</b> OBJ+PNG <span class="good">✓ converts</span>
-      · <b>PLY sequences</b> <span class="good">✓ converts</span>
-      · <b>DepthKit</b> Textured Geometry Sequence (OBJ/PLY + PNG/JPG, one of each per frame) <span class="good">✓ converts</span>
-      · <b>4DViews</b> <code>.4ds</code> <span class="good">✓ converts</span> (DXT1 desktop captures, ~2 fps decode; needs the
-      codec DLL — <a href="#" id="fourdsSettingsLink">Settings</a> if missing)</div>
-    <div style="display:flex;gap:10px;align-items:center;margin-bottom:10px;flex-wrap:wrap">
-      <button class="u primary" id="convertPick" title="pick the capture folder to import — a sequence of per-frame OBJ/PLY meshes + atlas PNGs">Choose folder…</button>
-      <label class="u" for="convertProbeFile">Choose .ares/.4ds…</label>
+    <div class="tbar">
+      <h2>Convert to .ares</h2>
+      <span class="sp"></span>
+      <button class="u primary" id="convertPick" title="Pick a capture folder: per-frame OBJ/PLY meshes plus atlas-*.png textures, or per-frame splats">Folder…</button>
+      <label class="u" for="convertProbeFile" title="Pick a single .ares or .4ds container to probe its structure">File…</label>
       <input type="file" id="convertProbeFile" accept=".4ds,.ares" style="display:none">
+      <button class="u" id="convertVideo" title="Pick a 2D video (mp4, webm, mov, mkv): monocular depth estimation per frame, unprojected into a video-textured relief mesh">Video…</button>
+      <button class="u ico" id="convertInfo" aria-expanded="false" aria-controls="convertFormats" title="Supported formats">⋯</button>
+    </div>
+    <div class="pop" id="convertFormats" hidden>
+      <div class="fmt"><b>Microsoft volcap</b><span>OBJ + PNG</span><span class="good">converts</span></div>
+      <div class="fmt"><b>PLY sequence</b><span>mesh or 3DGS</span><span class="good">converts</span></div>
+      <div class="fmt"><b>DepthKit</b><span>Textured Geometry Sequence: OBJ/PLY + PNG/JPG</span><span class="good">converts</span></div>
+      <div class="fmt"><b>Splat sequence</b><span>SPZ / .splat / SOG / glTF</span><span class="good">converts</span></div>
+      <div class="fmt"><b>4DViews .4ds</b><span>DXT1 desktop captures, ~2 fps decode; the licensed codec DLL is located with a file dialog on first use</span><span class="good">converts</span></div>
+      <div class="fmt"><b>2D video</b><span>mp4 / webm / mov / mkv: Depth-Anything V2 depth per frame, pinhole relief mesh, textured by the video (2.5D)</span><span class="good">converts</span></div>
+      <div class="fmt"><b>.ares</b><span>container layout only, no mesh or texture content is read</span><span>probes</span></div>
     </div>
     <label class="drop" id="convertDrop">
-      <div class="big">Drop a capture folder or a .ares/.4ds file</div>
-      <div class="small">Folders are analysed for conversion; single files are probed.</div>
+      <span class="big">Drop capture folder, .ares / .4ds, or a 2D video</span>
       <input type="file" id="convertFile" multiple webkitdirectory>
     </label>
     <div id="convertOut"></div>
@@ -1024,16 +1155,16 @@
      gates the app from opening; features warn at the point of use with a pointer back to this tab. -->
 <div class="tool" id="tab-settings">
   <div class="wrap">
-    <h2>Settings — models and tools</h2>
-    <p class="lead">Optional models, tools, and data. Each row shows what the component enables and
-      how to install it. Features that need a missing component warn at the point of use.</p>
+    <h2>Settings: models and tools</h2>
+    <p class="lead">Models, tools, and data. Each row shows what the component enables. A job installs
+      the components it requires when it starts; this tab installs them ahead of time.</p>
     <div id="depsOut"><div class="card"><div class="note">checking…</div></div></div>
   </div>
 </div>
 
 <div class="tool" id="tab-compute">
   <div class="wrap">
-    <h2>Compute — RunPod</h2>
+    <h2>Compute: RunPod</h2>
     <p class="lead">Launch and monitor RunPod GPU pods and run registration experiments. The API key
       stays on the dev server.</p>
     <div id="rpOut"><div class="card"><div class="note">checking…</div></div></div>
@@ -1041,7 +1172,7 @@
 </div>
 
 <!-- Orientation gizmo: world XYZ as the camera sees them; click a ball to snap to that view (gizmo.js) -->
-<svg id="axisGizmo" class="viewer-only" viewBox="0 0 68 68" width="68" height="68" aria-label="orientation gizmo — click an axis to snap the view"></svg>
+<svg id="axisGizmo" class="viewer-only" viewBox="0 0 68 68" width="68" height="68" aria-label="orientation gizmo: click an axis to snap the view"></svg>
 
 <!-- Crop rulers + guides: the crop is authored HERE, over the model, the way Photoshop/AE do it —
      not by six sliders in a rail. Container is pointer-events:none so orbit and every tool keep
@@ -1067,7 +1198,7 @@
 <div class="panel" id="err"></div>
 <!-- Shortcuts were a paragraph pinned across the viewport (owner: no prose in the chrome).
      Now one hoverable ? — the full list lives in its tooltip. -->
-<button id="hint" class="u ico viewer-only" aria-label="keyboard &amp; mouse shortcuts" title="NAVIGATE — left-drag orbit · middle-drag pan · scroll zoom · 1/3/7 snap front/right/top (Ctrl = opposite face) · P ortho/perspective · L lock view · F focus the subject · tools stay live: right/middle-drag &amp; wheel still navigate&#10;&#10;TRANSFORM (Unity keys) — W move · E rotate · R scale · F focus · hold X/Y/Z while dragging to constrain to one axis · Shift for fine steps&#10;&#10;PLAYBACK — Space play/pause · ←/→ step 1 frame (Shift = 10) · Home/End first/last&#10;&#10;TIMELINE — [ set clip IN at playhead · ] set clip OUT · drag the brackets to adjust · drag anywhere on the strip to scrub&#10;&#10;VIEWPORT — Z cycle shading · Shift+W wireframe · G grid · Shift+R crop guides · X x-ray&#10;&#10;EDIT — Shift+E collapse/expand the rail · Q/V nav · M box · B brush · S SAM · Ctrl+Z undo · Ctrl+Shift+Z or Ctrl+Y redo · Ctrl+S save now · Del commits a pending SAM selection as a delete, otherwise removes the active range">?</button>
+<button id="hint" class="u ico viewer-only" aria-label="keyboard &amp; mouse shortcuts" title="NAVIGATE: left-drag orbit · middle-drag pan · scroll zoom · 1/3/7 snap front/right/top (Ctrl = opposite face) · P ortho/perspective · L lock view · F focus the subject · tools stay live: right/middle-drag &amp; wheel still navigate&#10;&#10;TRANSFORM (Unity keys): W move · E rotate · R scale · F focus · hold X/Y/Z while dragging to constrain to one axis · Shift for fine steps&#10;&#10;PLAYBACK: Space play/pause · ←/→ step 1 frame (Shift = 10) · Home/End first/last&#10;&#10;TIMELINE: [ set clip IN at playhead · ] set clip OUT · drag the brackets to adjust · drag anywhere on the strip to scrub&#10;&#10;VIEWPORT: Z cycle shading · Shift+W wireframe · G grid · Shift+R crop guides · X x-ray&#10;&#10;EDIT: Shift+E collapse/expand the rail · Q/V nav · M box · B brush · S SAM · K track the SAM selection across the span · N jump to the lowest-confidence frame of the active track · Ctrl+Z undo · Ctrl+Shift+Z or Ctrl+Y redo · Ctrl+S save now · Del commits a pending SAM selection as a delete, otherwise removes the active range · Esc cancels a live track">?</button>
 
 <script type="importmap">
 {

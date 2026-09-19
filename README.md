@@ -28,7 +28,8 @@ Two companion documents summarize the project at different depths:
   spec/                  Specification source, one file per chapter; spec/build.py
                          assembles ARES-Runtime-Specification.md + .html
   apps/phase0-probe/     Capability probe: WebGPU adapters, WebCodecs HW decode, isolation
-  apps/demo/             Four-tab app: Viewer | Compare | Inspect | Convert (+ mesh editor)
+  apps/demo/             The app: Viewer | Compare | Convert | Settings | Compute (+ mesh editor);
+                         depth-card.js + depth-worker.js + depth-browser.js: 2D video → 2.5D
   packages/core/         @ares/core    container demux, geometry decode, WebGPU + WebGL2
                                        renderers, WebCodecs texture, edits, AresPlayer
   packages/encoder/      @ares/encoder OBJ/PLY importers, splat importers (SPZ, 3DGS PLY, .splat,
@@ -37,7 +38,10 @@ Two companion documents summarize the project at different depths:
   packages/three/        @ares/three   AresObject (THREE.Object3D wrapper)
   packages/react/        @ares/react   <Ares/> for @react-three/fiber
   tools/serve.mjs        Zero-dependency dev server: COOP/COEP headers + local GUI endpoints
-  tools/sam-service/     Local FastAPI SAM segmentation service (editor assist)
+  tools/installer.mjs    Component catalog + installers behind the Settings tab (GPU-aware)
+  tools/shell-integration.mjs, tools/msix/   Windows right-click "Convert to .ares" verb
+  tools/sam-service/     Local FastAPI service: SAM segmentation (editor assist), SAM 3 video
+                         tracking, Depth-Anything-V2 depth engine (depth.py, 2D video → 2.5D)
   tools/4ds/             .4ds decode host for a locally licensed 4DViews codec DLL (not included)
   tools/coherent/        Coherent-GOP pre-pass: stable-template registration + atlas rebake
   tools/sam3d/           Multiview SAM-3D-Body pose tools + RunPod pod orchestration
@@ -48,7 +52,7 @@ Two companion documents summarize the project at different depths:
 ```
 
 Toolchain: npm workspaces (npm ships with Node; pnpm and yarn are not used here),
-TypeScript 7.x (`tsc -b` project references), Node 22.15 or newer (tested on 24 LTS) — the SPZ
+TypeScript 7.x (`tsc -b` project references), Node 22.15 or newer (tested on 24 LTS), the SPZ
 importer uses zstd from `node:zlib`. The browser packages themselves need no particular Node.
 
 ## Status
@@ -98,7 +102,7 @@ after lossless vertex reorder, 49.6 MB after oct16 normals + AV1, and `daniel-s0
 One launcher, four modes. On Windows, double-click **`ARES.vbs`** at the repo root: it finds
 Node (installing the LTS build via winget if the machine has none), installs dependencies and
 builds when they are stale, synthesizes a demo clip if the checkout has no `.ares` file, starts
-the COOP/COEP dev server or reuses a running one, and opens the browser — all windowless.
+the COOP/COEP dev server or reuses a running one, and opens the browser: all windowless.
 Every step is logged to `tools/launch.log`, and `ARES-console.cmd` runs the same flow with a
 visible console.
 
@@ -120,7 +124,7 @@ npm run serve                    # just the dev server: no build, no browser
 ```
 
 The demo lives at `http://127.0.0.1:8137/apps/demo/` (the server walks up to port 8147 if
-8137 is taken). Capture data and `.ares` clips are not tracked in this repo — the tools that
+8137 is taken). Capture data and `.ares` clips are not tracked in this repo, the tools that
 read the reference capture take its path from `ARES_SRC_DIR`. A synth clip can be generated
 without any capture data, and is all the demo needs to run:
 
@@ -162,12 +166,12 @@ preview, box marquee, surface brush, and SAM click-to-select with a Blender-styl
 toggle, wireframe, and timeline ranges whose keyframed regions interpolate over time. The
 SAM tool captures the held frame on click, requests a mask from the local SAM 3 service
 (Shift-click adds exclusion points), previews it as a tint, and applies it as an RLE-coded
-bitmap region keyframed into the active range — the same evaluator drives the live preview
+bitmap region keyframed into the active range, the same evaluator drives the live preview
 and the bake. Edits persist as a non-destructive `.edits.json` sidecar and bake to a new
 `.ares` through the encoder. The panel's SAM row starts and monitors the service without
 leaving the app. Beyond selection: a lasso, a measure tool, grow / shrink / invert / mirror of
 the active range, camera bookmarks, per-range mute, names and keyframe interpolation (linear,
-hold, smooth), a bake-side sculpt action (move, inflate, smooth, flatten, pinch — weld-aware and
+hold, smooth), a bake-side sculpt action (move, inflate, smooth, flatten, pinch: weld-aware and
 feathered like paint), analysis views (normals, UV checker, depth, point cloud), and an Export
 section (frame to OBJ, still to PNG, turntable to WebM). An FX section applies playback effects to
 meshes and splats alike (clip plane, dissolve, tint, rim, scanlines, wobble, splat jitter and size),
@@ -201,8 +205,18 @@ auto-launches a local Forge install headless. Jobs can queue as a batch. Known l
 the default Real-ESRGAN model invents artifacts on skin, documented in
 [docs/whitepaper.md](docs/whitepaper.md) under Known limitations.
 
-Both tabs share a searchable history of every volcap touched — folders analysed, files
-inspected, encodes and enhances produced — persisted server-side; entries re-open with one
+The Convert tab also takes a plain 2D video (`Video…`, or drop an mp4/webm/mov/mkv) and
+produces a 2.5D clip: a monocular depth model (Depth-Anything-V2) estimates a depth map per
+frame, the encoder unprojects each map through a pinhole ray table into a relief mesh with
+silhouette cuts at depth discontinuities, and the video frame itself is the texture. Two depth
+engines share one run contract: the local Python service on CUDA (batched, float output, any
+model size, several times faster than real time on a mid-range GPU) or the browser worker ported
+from VJ-9000 (transformers.js on WebGPU, no Python needed). Temporal stabilization aligns every
+frame's scale and shift to its neighbour and smooths static pixels without smearing moving ones.
+See [docs/depth-2d-to-25d.md](docs/depth-2d-to-25d.md).
+
+Both tabs share a searchable history of every volcap touched: folders analysed, files
+inspected, encodes and enhances produced: persisted server-side; entries re-open with one
 click (replay an inspection, re-analyse a folder, play an encode). A Settings tab (gear
 icon) reports every optional component: what is installed, what each piece enables, and
 either a download link (for gated or manual downloads such as the SAM 3 weights) or a
@@ -246,6 +260,12 @@ node packages/encoder/dist/cli.js encode <frames-dir> -o out.ares
                                          [--meta-extra-file f.json]
                                          splat input: [--sh-degree 0..3] [--splat-min-alpha a]
                                          [--splat-box-alpha a] [--splat-order morton|none] [--quant-bits 8..16]
+node packages/encoder/dist/cli.js depth  <video> --depth <run-dir> -o out.ares
+                                         [--fov 55] [--near 0.5] [--far 6] [--grid 256] [--edge 0.08]
+                                         [--sheets] [--stabilize 0.7] [--gop 30] [--tex-size 1024]
+                                         [--texture-codec vp9|av1] [--crf 30] [--no-texture]
+                                         [--no-audio] [--audio file] [--smooth-temporal N]
+                                         [--center bottom|mass|none] [--meta-extra-file f.json]
 node packages/encoder/dist/cli.js export file.ares -o out.(obj|ply|spz|glb|splat) [--frame N]
 node packages/encoder/dist/cli.js info   file.ares
 ```
@@ -257,7 +277,7 @@ automatically; `--track` forces persistent topology via nearest-point surface tr
 per-frame UV transfer; everything else falls back to intra frames. `--smooth` applies
 weld-aware Taubin smoothing (safe on atlased meshes; plain per-vertex filters crack UV
 seams). `--repack-detect image` detects atlas repacks by image difference instead of
-topology hash — required for stable-layout content, where the topology heuristic
+topology hash: required for stable-layout content, where the topology heuristic
 false-positives every frame. `--trim-in/--trim-out` cut frames while rebasing the edit
 list; the transform flags (`--up-axis`, `--center`, `--scale`, `--rotate`, `--translate`)
 bake the same evaluator the viewer previews with, so preview and bake cannot drift.
@@ -270,15 +290,24 @@ layout.
 WebCodecs into Web Audio and lets the audio clock lead the video; the transport gains a mute
 (U) and a volume slider, and the Convert tab has an audio row with a native file picker.
 
-**Gaussian splats.** A folder of one splat file per frame — Niantic SPZ (Scaniverse, World Labs
+**Gaussian splats.** A folder of one splat file per frame: Niantic SPZ (Scaniverse, World Labs
 Marble), 3DGS PLY (any trainer, Polycam, Luma), `.splat`, glTF/GLB carrying
-`KHR_gaussian_splatting`, or PlayCanvas SOG (`.sog` bundle or directory) — encodes as the splat
+`KHR_gaussian_splatting`, or PlayCanvas SOG (`.sog` bundle or directory): encodes as the splat
 profile automatically; a lone SOG directory is one frame. `--sh-degree` caps the spherical
 harmonic bands carried (0 is the view-independent fast path), `--splat-min-alpha` drops the
 near-transparent outlier haze generated captures carry before the quantization box is fitted,
 and `--quant-bits` sets the fixed-point precision per axis over each chunk's box. `export`
 writes any frame back out as SPZ, 3DGS PLY, glTF/GLB or `.splat` (meshes: OBJ or PLY), so the
 container is no longer write-only.
+
+**2D video → 2.5D.** `depth <video> --depth <run-dir>` consumes a depth run (`depth.json` +
+`depth.f32`, one float32 map per sampled frame, written by the Python engine
+`tools/sam-service/depth.py` or by the browser engine through the dev server), stabilizes it,
+unprojects every map into a relief mesh (`--fov`, `--near`/`--far` hyperbolic disparity mapping,
+`--grid` columns, `--edge` silhouette cut, `--sheets` for a fixed full-grid topology that codes as
+I+P deltas), extracts the texture frames from the video with the same sampling, carries the
+video's own audio unless `--no-audio`, and muxes. The contract and the tuning notes are in
+[docs/depth-2d-to-25d.md](docs/depth-2d-to-25d.md).
 
 ## Documentation
 
@@ -301,12 +330,12 @@ container is no longer write-only.
 Beyond encoding well-formed mesh sequences, two pipelines rebuild difficult source
 material into good `.ares` input:
 
-- **Targeted temporal** ([docs/targeted-temporal.md](docs/targeted-temporal.md)) — for
+- **Targeted temporal** ([docs/targeted-temporal.md](docs/targeted-temporal.md)): for
   per-frame-reconstructed captures whose topology resets every frame: motion-metric span
   selection, per-span registration (nearest-pull for static spans, ARAP for moving ones),
   gated boundary transitions, and image-based repack detection so coherent spans
   inter-code their texture (−28 % texture at identical settings on the reference clip).
-- **RGBD rebuild** ([docs/rgbd-rebuild-pipeline.md](docs/rgbd-rebuild-pipeline.md)) — for
+- **RGBD rebuild** ([docs/rgbd-rebuild-pipeline.md](docs/rgbd-rebuild-pipeline.md)): for
   legacy 2.5D depth-sensor captures: hue-depth decode, subject masking (black background
   before any depth estimation), photoreal video upscale, video-consistent depth fused to
   metric sensor scale by a tiled locally-affine robust fit, shading detail integrated
@@ -317,21 +346,21 @@ material into good `.ares` input:
 
 The near-term queue (owner-steered):
 
-1. **LOD ladder** — one-command multi-tier export (one source → N tiers via `--decimate`,
+1. **LOD ladder**, one-command multi-tier export (one source → N tiers via `--decimate`,
    `--tex-size`, `--crf`) plus a playback tier picker (2-tier minimal version of spec
    9.3; the container GOP index already supports it).
-2. **SVF/HoloVideo texture passthrough** — a byte-level teardown of a licensed capture
+2. **SVF/HoloVideo texture passthrough**: a byte-level teardown of a licensed capture
    showed its texture is standard H.264 with the mesh riding in type-24 NAL units:
    stripping those yields a pure video track the runtime can carry natively (zero
    transcode; geometry still goes through the Unity exporter until the mesh NAL format
    is reversed).
-3. **In-scene sculpt + texture-paint ops** — two new op kinds in the existing edit-op
+3. **In-scene sculpt + texture-paint ops**, two new op kinds in the existing edit-op
    system; world-anchored (never texel-coordinate) so they survive per-frame atlas
    repacks. First acceptance target: healing residual face defects in registered spans.
-4. **RGBD track continuation** — full first take, then the remaining takes as a batch;
+4. **RGBD track continuation**: full first take, then the remaining takes as a batch;
    a watertight per-take asset (PSHuman-class) to replace the projected back texture;
    multi-frame UV texture accumulation on takes where the subject rotates.
-5. **Reference-guided texture restoration** — re-unwrap to a stable atlas, then temporal
+5. **Reference-guided texture restoration**: re-unwrap to a stable atlas, then temporal
    restoration conditioned on reference photos of the subject (the capture textures are
    irreversibly AI-upscaled; reference photos are obtainable ground truth).
 

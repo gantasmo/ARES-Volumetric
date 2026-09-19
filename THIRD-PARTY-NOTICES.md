@@ -5,25 +5,25 @@ below carry their own terms and are **not** covered by the repository license.
 
 ## Bundled or linked at runtime
 
-- **meshoptimizer** (MIT, Arseny Kapoulkine) — the vertex/index codecs and the simplifier.
+- **meshoptimizer** (MIT, Arseny Kapoulkine), the vertex/index codecs and the simplifier.
   `npm run bundle` inlines its JavaScript and WASM into `packages/*/dist/bundle/*`; those
   bundles carry a banner naming it, and the MIT text must accompany any redistribution.
-- **draco3d** (Apache-2.0, Google) — used by the Phase 0 benchmark only (`bench/`). Not part
+- **draco3d** (Apache-2.0, Google): used by the Phase 0 benchmark only (`bench/`). Not part
   of the runtime or the bundles. If a DRAC intra codec path is ever wired into `@ares/core`, the
   Apache-2.0 license text and NOTICE must ship with it.
-- **three**, **react**, **@react-three/fiber** — peer dependencies of the wrapper packages,
+- **three**, **react**, **@react-three/fiber**: peer dependencies of the wrapper packages,
   installed by the host application under their own MIT licenses; never bundled here.
-- **esbuild** (MIT), **typescript** (Apache-2.0) — build-time only.
+- **esbuild** (MIT), **typescript** (Apache-2.0): build-time only.
 
 ## Invoked as external programs
 
-- **ffmpeg** — shelled out to (never linked) by the encoder for VP9/AV1 texture video, Opus
+- **ffmpeg**: shelled out to (never linked) by the encoder for VP9/AV1 texture video, Opus
   audio, PNG decode, WebP decode (SOG import) and repack detection. ffmpeg builds are LGPL-2.1+
   or GPL-2.0+ depending on their configuration; redistributing a bundled ffmpeg binary alongside
   this software would bring that build's license with it. This repository does not distribute one.
-- **realesrgan-ncnn-vulkan** (BSD-3-Clause) — fetched separately into the git-ignored
+- **realesrgan-ncnn-vulkan** (BSD-3-Clause): fetched separately into the git-ignored
   `tools/bin/` directory by the Settings tab; not distributed with this repository.
-- **Stable Diffusion WebUI Forge** — an optional local install the enhance tier launches; its
+- **Stable Diffusion WebUI Forge**: an optional local install the enhance tier launches; its
   own license (AGPL-3.0) and the licenses of whatever checkpoints it loads apply to that install.
 
 ## Python service (`tools/sam-service`)
@@ -36,11 +36,28 @@ Installed into a git-ignored virtual environment from `requirements.txt`:
 
 Model weights the service loads are downloaded by the user and are governed by their own terms:
 
-- **SAM 3 / SAM ViT-H** weights — Meta's SAM License.
-- **Real-ESRGAN** weights (`tools/sam-service/models/`, git-ignored) — BSD-3-Clause.
-- **Lykon/dreamshaper-8** (default checkpoint of the optional `/detail` endpoint) —
+- **SAM 3 / SAM ViT-H** weights: Meta's SAM License.
+- **Real-ESRGAN** weights (`tools/sam-service/models/`, git-ignored): BSD-3-Clause.
+- **Lykon/dreamshaper-8** (default checkpoint of the optional `/detail` endpoint):
   CreativeML OpenRAIL-M, a use-restricted license: outputs may not be used for the purposes
   it lists. Anyone deploying that endpoint takes on those terms.
+- **Depth-Anything-V2** weights (`depth-anything/Depth-Anything-V2-*-hf`, fetched into the
+  Hugging Face cache by the 2D video → 2.5D conversion, `tools/sam-service/depth.py`): per the
+  upstream project, the **Small** checkpoints are Apache-2.0 and the **Base** and **Large**
+  checkpoints are **CC-BY-NC-4.0** (non-commercial). On the Hub, `Depth-Anything-V2-Small-hf`
+  and `Depth-Anything-V2-Metric-Outdoor-Large-hf` carry an Apache-2.0 tag, `Base-hf` and
+  `Large-hf` a CC-BY-NC-4.0 tag, and the other metric repos no license tag at all (checked
+  2026-09-18); treat the untagged ones under the upstream rule for their size.
+
+## Browser depth engine (`apps/demo/depth-worker.js`)
+
+`apps/demo/depth-worker.js` and `apps/demo/depth-browser.js` are ported from the author's own
+VJ-9000 application (github.com/gantasmo/VJ-9000, `src/akvj/depthWorker.ts` and
+`src/useDepthCloud.ts`; that repository ships without a license file). At runtime the worker
+loads **@huggingface/transformers** (Apache-2.0) and, through it, **onnxruntime-web** (MIT) from
+the jsDelivr CDN; nothing from either is vendored here. The ONNX checkpoints it downloads into
+the browser cache, `onnx-community/depth-anything-v2-{small,base,large}`, carry the
+Depth-Anything-V2 terms above (Small Apache-2.0; Base and Large CC-BY-NC-4.0).
 
 ## Notebooks and interop tools
 

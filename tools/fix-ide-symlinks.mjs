@@ -23,7 +23,7 @@ const ROOT = dirname(dirname(fileURLToPath(import.meta.url))); // ares/
 const SCOPE = join(ROOT, "node_modules", "@ares");
 
 if (!existsSync(SCOPE)) {
-  console.log("[fix-ide-symlinks] node_modules/@ares missing (run npm install first) — nothing to do");
+  console.log("[fix-ide-symlinks] node_modules/@ares missing (run npm install first): nothing to do");
   process.exit(0);
 }
 

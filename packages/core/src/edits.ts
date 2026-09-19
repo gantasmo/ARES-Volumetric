@@ -30,7 +30,20 @@ export interface Mask2dVolume {
   rect?: [number, number, number, number];
   /** Row-major bitmap covering the captured viewport; rle alternates 0-run/1-run lengths, 0-run first. */
   mask?: { width: number; height: number; rle: number[] };
-  camera?: { azimuth: number; elevation: number; distance: number; target: [number, number, number]; aspect: number };
+  camera?: {
+    azimuth: number; elevation: number; distance: number; target: [number, number, number]; aspect: number;
+    /**
+     * Orthographic capture (camera.ts OrbitState.ortho). MUST reach orbitViewProj below or the
+     * region is tested through a projection the mask was never drawn in — under ortho an
+     * axis-aligned plane projects to a line and under perspective to a region, so the two
+     * disagree by more than a rounding. The demo has serialized this field since the SAM tool
+     * shipped (player.getCamera → samSel.cam, P toggles it live) while this type dropped it.
+     */
+    ortho?: boolean;
+    /** Vertical field of view in degrees (camera.ts OrbitState.fov); absent is the orbit default.
+     *  A relief is viewed through its own FOV, and a mask drawn there must be tested through it. */
+    fov?: number;
+  };
   /** NDC z band captured from the pick buffer (visible-only approximation, design §5.2) */
   depth?: { zmin: number; zmax: number };
   [k: string]: unknown;
@@ -224,6 +237,89 @@ export function parseEditList(json: unknown): EditList {
   return o;
 }
 
+/**
+ * Deep-validate every mask2d in the document. Returns human-readable issues; NEVER throws, so a
+ * caller can warn and bake anyway.
+ *
+ * parseEditList above checks the document's SHAPE and nothing inside a volume, and prepareVolume
+ * below returns null — "never matches" — for anything it does not recognise. So a mask2d with no
+ * `kind`, a truncated RLE, or a camera whose aspect does not match its bitmap bakes as a SILENT
+ * no-op: the range sits in the timeline, the encoder reports success, and not one triangle moves.
+ * That failure is invisible per-volume and fatal per-clip once a range carries a keyframe per
+ * frame, which is why it is checked loudly here. Cost is one pass over each RLE (no decode).
+ */
+export function validateMasks(list: EditList): string[] {
+  const issues: string[] = [];
+  list.ranges.forEach((r, ri) => {
+    const rid = r.id ?? `#${ri}`;
+    if (!Array.isArray(r.keyframes)) { issues.push(`range ${rid} has no keyframes array`); return; }
+    const seen = new Set<number>();
+    const kfs = r.keyframes;
+    kfs.forEach((kf, j) => {
+      // Two keyframes on one frame: bracket() can only ever reach one of them, so the other is
+      // authored, saved, drawn on the timeline and never evaluated.
+      if (seen.has(kf.frame)) issues.push(`range ${rid} has two keyframes at frame ${kf.frame} — only one is ever evaluated`);
+      seen.add(kf.frame);
+      // NOT "outside the span": a keyframe past either edge is normal and load-bearing — dragging
+      // a range handle moves startFrame/endFrame and deliberately leaves the keyframes put, and
+      // bracket() clamps before-first/after-last, so an out-of-span keyframe is still the anchor
+      // half the in-span frames lerp from. The real fault is UNREACHABLE: bracket() hands out
+      // keyframe j for f ∈ [kfs[j-1].frame, kfs[j+1].frame) (open-ended at either end of the
+      // list), so when that window misses the span entirely nothing ever evaluates it.
+      const lo = j > 0 ? kfs[j - 1]!.frame : -Infinity;
+      const hi = j < kfs.length - 1 ? kfs[j + 1]!.frame : Infinity;
+      const firstReached = Math.max(r.startFrame, lo);
+      if (!(firstReached <= r.endFrame && firstReached < hi))
+        issues.push(`range ${rid} kf ${kf.frame} is unreachable — no frame in [${r.startFrame}, ${r.endFrame}] brackets it, so it is never evaluated`);
+      // prepareKeyframe does `kf.volumes.map(...)` unguarded. Unlike everything else here this one
+      // does not bake as a silent no-op — it THROWS, one frame into the encode.
+      if (!Array.isArray(kf.volumes)) issues.push(`range ${rid} kf ${kf.frame} has no volumes array — prepareKeyframe throws on it`);
+      const at = `mask2d at ${rid} kf ${kf.frame}`;
+      for (const v of kf.volumes ?? []) {
+        if (v.type !== "mask2d") continue;
+        const cam = v.camera;
+        const aspect = cam && Number.isFinite(cam.aspect) && cam.aspect > 0 ? cam.aspect : 0;
+        if (!cam) issues.push(`${at} has no camera — the region cannot be projected and never matches`);
+        else if (!aspect) issues.push(`${at} camera.aspect is ${cam.aspect} — prepareVolume silently substitutes 1`);
+        // `kind` selects which payload prepareVolume reads: rect volumes (the marquee) carry no
+        // mask and bitmap volumes carry no rect, so the checks below CANNOT be shared.
+        if (v.kind === "rect") {
+          const rect = v.rect;
+          if (!Array.isArray(rect) || rect.length !== 4 || !rect.every((n) => Number.isFinite(n)))
+            issues.push(`${at} kind:"rect" needs rect [x0, y0, x1, y1]`);
+          else {
+            if (!(rect[0]! < rect[2]!) || !(rect[1]! < rect[3]!))
+              issues.push(`${at} rect [${rect.join(", ")}] is not ordered x0<x1, y0<y1 — it selects nothing`);
+            // Only WHOLLY outside is a fault. prepareVolume's rect test is a max of four
+            // half-planes, so a bound past ±1 just means "everything on that side of the screen" —
+            // exactly what growKeyframe writes when a marquee at the viewport edge is grown
+            // (it re-centres and expands with no clamp).
+            if (rect[2]! < -1 || rect[0]! > 1 || rect[3]! < -1 || rect[1]! > 1)
+              issues.push(`${at} rect [${rect.join(", ")}] lies wholly outside NDC [-1, 1] — it selects nothing`);
+          }
+        } else if (v.kind === "bitmap") {
+          const m = v.mask;
+          if (!m || !Array.isArray(m.rle)) issues.push(`${at} kind:"bitmap" has no mask`);
+          else {
+            // rleEncodeMask always closes the final run, so the runs sum to width*height exactly.
+            // A short sum means a truncated write; a long one means the bitmap was re-sized under it.
+            const size = m.width * m.height;
+            let sum = 0;
+            for (const run of m.rle) sum += run;
+            if (sum !== size) issues.push(`${at} rle runs sum to ${sum}, not ${m.width}x${m.height} = ${size}`);
+            const want = m.height > 0 ? m.width / m.height : 0;
+            if (aspect && want && Math.abs(aspect - want) > want * 0.01)
+              issues.push(`${at} camera.aspect ${aspect.toFixed(4)} is not the bitmap's ${m.width}x${m.height} = ${want.toFixed(4)} — the mask projects stretched`);
+          }
+        } else {
+          issues.push(`${at} has ${v.kind === undefined ? "no kind" : `unknown kind ${JSON.stringify(v.kind)}`} and will never match`);
+        }
+      }
+    });
+  });
+  return issues;
+}
+
 /* ------------------------------- region evaluation ------------------------------- */
 
 /** Signed distance to one brush volume: min over add-strokes of (|x−p|−r); subtract strokes carve. */
@@ -260,9 +356,19 @@ function prepareVolume(v: EditVolume): SdfFn | null {
   if (v.type === "brushStrokes") return (x, y, z) => brushSdf(v, x, y, z);
   if (v.type === "mask2d" && v.camera && (v.kind === "rect" ? v.rect : v.kind === "bitmap" && v.mask)) {
     const m = orbitViewProj(
-      { azimuth: v.camera.azimuth, elevation: v.camera.elevation, distance: v.camera.distance, target: v.camera.target },
+      // `ortho` travels with the rest of the OrbitState: a mask captured in orthographic that is
+      // re-projected through a perspective frustum tests the wrong pixels for every point off the
+      // view axis (camera.ts orbitMatrices branches on it).
+      { azimuth: v.camera.azimuth, elevation: v.camera.elevation, distance: v.camera.distance, target: v.camera.target, ortho: v.camera.ortho, fov: v.camera.fov },
       v.camera.aspect || 1);
     const depth = v.depth;
+    // An ortho matrix's bottom row is [0,0,0,1] (camera.ts orthographic sets m[11]=0, m[15]=1, and
+    // lookAt's is already that), so `cw` below is exactly 1 everywhere and the behind-the-camera
+    // guard can NEVER fire for an ortho capture. Its replacement is the clip window itself, which
+    // is the same [0,1] near/far test the renderer applies — without it an ortho mask with no
+    // depth band (every X-ray capture: main.js only attaches `depth` when X-ray is off) is an
+    // infinite prism in BOTH directions instead of a forward one.
+    const ortho = !!v.camera.ortho;
     const r = v.rect;
     let bits: Uint8Array | null = null, mw = 0, mh = 0;
     if (v.kind === "bitmap" && v.mask) {
@@ -276,9 +382,10 @@ function prepareVolume(v: EditVolume): SdfFn | null {
       const inv = 1 / cw;
       const nx = (m[0]! * x + m[4]! * y + m[8]! * z + m[12]!) * inv;
       const ny = (m[1]! * x + m[5]! * y + m[9]! * z + m[13]!) * inv;
-      if (depth) {
+      if (ortho || depth) {
         const nz = (m[2]! * x + m[6]! * y + m[10]! * z + m[14]!) * inv;
-        if (nz < depth.zmin || nz > depth.zmax) return 1;   // outside the visible-only depth band
+        if (ortho && (nz < 0 || nz > 1)) return 1;           // outside the captured near/far window
+        if (depth && (nz < depth.zmin || nz > depth.zmax)) return 1;   // outside the visible-only depth band
       }
       if (bits) {
         // Bitmap lookup: the mask covers the full captured viewport (NDC [-1,1]², y flips to rows).
@@ -314,9 +421,15 @@ function bracket(r: EditRange, f: number): { a: EditKeyframe; b: EditKeyframe; t
   const first = kfs[0]!, last = kfs[kfs.length - 1]!;
   if (f <= first.frame) return { a: first, b: first, t: 0 };
   if (f >= last.frame) return { a: last, b: last, t: 0 };
+  // Half-open [a.frame, b.frame): an EXACT keyframe hit must land as `a` with t=0, never as `b`
+  // with t=1. Closed-on-b was harmless while keyframes were sparse and hand-authored, but a
+  // propagated range carries one keyframe per frame, and there every frame is an exact hit:
+  // prepareRangeSdfAt would compile and probe BOTH bracketing keyframes per centroid (2× the
+  // work and 2× the resident decoded-mask memory), and worse, `interp:"hold"` forces t=0 BELOW
+  // this — pinning a dense hold range to the PREVIOUS frame's region at every frame.
   for (let i = 0; i < kfs.length - 1; i++) {
     const a = kfs[i]!, b = kfs[i + 1]!;
-    if (f >= a.frame && f <= b.frame) {
+    if (f >= a.frame && f < b.frame) {
       return { a, b, t: b.frame === a.frame ? 0 : (f - a.frame) / (b.frame - a.frame) };
     }
   }

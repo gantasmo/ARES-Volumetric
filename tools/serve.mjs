@@ -13,13 +13,15 @@
 import { createServer, request as httpRequest } from "node:http";
 import { stat, readFile, writeFile, appendFile, readdir, mkdir, link, copyFile, unlink, rename, mkdtemp, rm, statfs, open } from "node:fs/promises";
 import { totalmem, freemem, homedir } from "node:os";
-import { statSync, existsSync } from "node:fs";
+import { statSync, existsSync, createReadStream } from "node:fs";
 import { spawn } from "node:child_process";
 import { join, normalize, extname, dirname, basename, sep } from "node:path";
 import zlib from "node:zlib";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { catalog, gpuProbe, installOne, preflight, profiles, recommend, resolve } from "./installer.mjs";
+import { catalog, encoderState, ensurePrivatePython, findFfmpeg, findGit, FORGE_PYTHON, gpuProbe, hfTokenPresent, installOne, paths as installPaths, preflight, profiles, recommend, resolve, saveHfToken } from "./installer.mjs";
+import { shellRegister, shellStatus, shellUnregister } from "./shell-integration.mjs";
+import { install as msixInstall, msixStatus, uninstall as msixUninstall } from "./msix/build.mjs";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url))); // ares/
 
@@ -283,7 +285,7 @@ async function analyseDir(dir0) {
   const splatFiles = names.filter((f) => SPLAT_RE.test(f));
   const atlases = names.filter((f) => ATLAS_RE.test(f)), pngs = names.filter((f) => PNG_RE.test(f));
   let meshes = objs.length ? objs : plys;
-  let kind = objs.length ? "OBJ" : plys.length ? "PLY" : "—";
+  let kind = objs.length ? "OBJ" : plys.length ? "PLY" : "·";
   // Splat sequences (spec §6.8): a 3DGS PLY folder, or one SPZ/.splat/SOG/glTF file per frame, or
   // a single SOG directory (meta.json + webp images).
   let splat = false, splatCount = 0;
@@ -307,7 +309,133 @@ async function analyseDir(dir0) {
 // ---- standalone Real-ESRGAN (ncnn-vulkan): the no-server, low-VRAM upscale tier -----------
 const REALESRGAN_DIR = join(ROOT, "tools", "bin", "realesrgan-ncnn-vulkan");
 const REALESRGAN_EXE = join(REALESRGAN_DIR, "realesrgan-ncnn-vulkan.exe");
-const FFMPEG = process.env.FFMPEG || "ffmpeg";
+// The vendored weights (realesrgan-x4plus, -anime) are fixed-4× nets, and the binary's -s flag
+// only picks a stride — it does not switch weights — so any value but 4 misplaces every output
+// tile. Never pass a different ratio here; resample afterwards instead.
+const NCNN_NATIVE_SCALE = 4;
+const NCNN_TILE = process.env.REALESRGAN_TILE || "256";   // 256 keeps peak VRAM ~1 GB
+// -g picks the Vulkan device; unset means the binary's own auto-select, which is the right
+// default on machines whose device 0 is an iGPU.
+const NCNN_GPU = process.env.REALESRGAN_GPU ? ["-g", process.env.REALESRGAN_GPU] : [];
+
+// ---- CUDA batch upscaler (tools/sr/upscale_dir.py) ----------------------------------------
+// One process for the whole folder, one model replica per CUDA device. It exists because the
+// ncnn path paid a Vulkan init + weight load PER FRAME. Measured on 2 x RTX 2080 Ti, one
+// 2048² atlas -> 8192²: ncnn per-frame 21908 ms, ncnn directory mode both GPUs 9974 ms,
+// this worker with x4plus 12300 ms, this worker with the compact general net 674 ms.
+const SR_WORKER = join(ROOT, "tools", "sr", "upscale_dir.py");
+// Weights are spandrel-loaded, so the architecture comes from the checkpoint: adding a newer
+// model (SPAN, DAT, RealPLKSR …) is a catalog entry and a file, never a code change here.
+const SR_TIERS = {
+  fast:    { ckpt: "realesr-general-x4v3.pth", label: "Real-ESRGAN Compact x4v3 (CUDA)" },
+  quality: { ckpt: "RealESRGAN_x4plus.pth",    label: "Real-ESRGAN x4plus (CUDA)" },
+};
+
+// ---- ffmpeg / ffprobe: ONE resolver --------------------------------------------------------
+// installer.mjs findFfmpeg() owns the search order (FFMPEG override, tools/bin/ffmpeg, the legacy
+// C:\FFmpeg\bin, PATH) and rejects a build without libvpx-vp9 / libsvtav1 / libopus. Nothing in
+// this file spawns a bare "ffmpeg": the resolved absolute paths go to every child through toolEnv()
+// (the encoder CLI reads FFMPEG / FFPROBE) and to the Python service in the /depth/run body.
+// A miss is never cached, so the path appears the moment ensureComponents(["ffmpeg"]) installs it.
+let ffToolsCache = null;
+function ffTools({ fresh = false } = {}) {
+  if (fresh || !ffToolsCache) ffToolsCache = findFfmpeg(ROOT);
+  return ffToolsCache;
+}
+function toolEnv(extra = {}) {
+  const ff = ffTools();
+  return {
+    ...process.env,
+    ...(ff ? { FFMPEG: ff.ffmpeg, FFMPEG_PATH: ff.ffmpeg, FFPROBE: ff.ffprobe, FFPROBE_PATH: ff.ffprobe } : {}),
+    ...extra,
+  };
+}
+
+// ---- component ensure: every work route calls this before it starts ------------------------
+// The rule it implements: a job never stops to tell the person that something is absent. It
+// resolves the component ids the job needs through the catalog's `requires` graph, installs what
+// is absent inside the route's own SSE stream ("[setup] …" log lines plus `setup` events), and
+// returns so the job carries on. The one thing it cannot supply is a credential: a gated
+// Hugging Face repository comes back as { gated, needsToken, url } and the client raises its
+// access prompt, then re-issues the same request.
+//   ensureComponents(ids: string[], send?: (event, data) => void)
+//     -> { ok: true, installed: string[] }
+//      | { ok: false, error, id?, label?, gated?, needsToken?, url? }
+let gpuCache = null, gpuCacheAt = 0;
+async function gpuCached() {
+  if (!gpuCache || Date.now() - gpuCacheAt > 60000) { gpuCache = await gpuProbe(); gpuCacheAt = Date.now(); }
+  return gpuCache;
+}
+const ensureInFlight = new Map();   // component id -> running install, shared by concurrent routes
+async function ensureComponents(ids, send) {
+  const say = (t) => { if (send) send("log", "[setup] " + t); };
+  const want = [...new Set(ids.filter(Boolean))];
+  let items = catalog(ROOT, await gpuCached());
+  const unknown = want.filter((id) => !items.some((i) => i.id === id));
+  if (unknown.length) return { ok: false, error: `unknown component: ${unknown.join(", ")}` };
+  const installable = (it) => it.install && it.install.kind !== "route" && !it.statusOnly;
+  const todo = resolve(items, want).filter((it) => installable(it) && !it.present);
+  if (!todo.length) return { ok: true, installed: [] };
+  say(`absent: ${todo.map((t) => t.label).join(", ")}`);
+  if (send) send("setup", { state: "plan", todo: todo.map((t) => ({ id: t.id, label: t.label, sizeMB: t.sizeMB || 0 })) });
+  for (const [index, it] of todo.entries()) {
+    if (send) send("setup", { state: "start", id: it.id, label: it.label, index, total: todo.length, sizeMB: it.sizeMB || 0 });
+    say(`${it.label}${it.sizeMB ? ` (${it.sizeMB} MB)` : ""}`);
+    let job = ensureInFlight.get(it.id);
+    if (job) say(`${it.label}: install already running, waiting for it`);
+    else {
+      job = installOne(ROOT, it, (l) => say("  " + l)).catch((e) => ({ ok: false, error: String((e && e.message) || e) }))
+        .finally(() => ensureInFlight.delete(it.id));
+      ensureInFlight.set(it.id, job);
+    }
+    const r = await job;
+    if (it.id === "ffmpeg") ffTools({ fresh: true });
+    if (!r.ok) {
+      say(`${it.label}: ${r.error}`);
+      return { ok: false, id: it.id, label: it.label, error: r.error, gated: !!r.gated, needsToken: !!r.needsToken, url: it.gated?.url || null };
+    }
+    if (send) send("setup", { state: "done", id: it.id, label: it.label, index: index + 1, total: todo.length });
+    say(`${it.label}: ready`);
+  }
+  // Judge by detection, never by the installer's own word: the job is about to depend on it.
+  items = catalog(ROOT, await gpuCached());
+  const still = todo.filter((t) => !items.find((i) => i.id === t.id)?.present);
+  if (still.length) return { ok: false, id: still[0].id, label: still[0].label, error: `${still[0].label}: not detected after installation` };
+  return { ok: true, installed: todo.map((t) => t.id) };
+}
+/** The `error` event a route sends when ensureComponents could not finish. */
+const ensureErrorPayload = (r) => ({
+  message: r.error, stage: "setup", component: r.id || null, label: r.label || null,
+  gated: !!r.gated, needsToken: !!r.needsToken, url: r.url || null,
+});
+/** ensureComponents for an SSE route: on failure the error event is sent and the stream closed.
+ *  Resolves true when the job may proceed. */
+async function ensureOrEnd(ids, send, res) {
+  const r = await ensureComponents(ids, send);
+  if (r.ok) return true;
+  send("error", ensureErrorPayload(r));
+  res.end();
+  return false;
+}
+/** Depth model key (tools/sam-service/depth.py) -> the catalog component that holds its weights.
+ *  A `subject` prompt adds SAM 3, which produces the subject mask. */
+const DEPTH_MODEL_COMPONENT = {
+  small: "depth-small", base: "depth-base", large: "depth-large",
+  "video-small": "vda-small", "video-base": "vda-base", "video-large": "vda-large",
+};
+function depthComponents(model, subject) {
+  const id = DEPTH_MODEL_COMPONENT[model]
+    || (/^metric-indoor-/.test(model) ? "depth-metric-indoor" : /^metric-outdoor-/.test(model) ? "depth-metric-outdoor" : null);
+  return [...(id ? [id] : []), ...(subject ? ["sam3"] : [])];
+}
+/** Components the /enhance tiers run on. */
+const ENHANCE_COMPONENTS = {
+  fast: ["python-env", "esrgan-general"],
+  quality: ["python-env", "esrgan-x4plus"],
+  ncnn: ["esrgan-ncnn", "ffmpeg"],
+  sd: ["forge"],
+};
+
 // Run a child to completion; resolve on exit 0. onChild exposes it so /enhance can cancel it.
 function runProc(exe, args, opts, onChild) {
   return new Promise((resolve, reject) => {
@@ -320,13 +448,75 @@ function runProc(exe, args, opts, onChild) {
   });
 }
 
+/** Like runProc, but relays whole stdout/stderr LINES to `onLine` and resolves with the exit
+ *  code instead of rejecting. Used for workers whose progress is their stdout. */
+function runProcLines(exe, args, opts, onChild, onLine) {
+  return new Promise((resolve) => {
+    const c = spawn(exe, args, { windowsHide: true, ...opts });
+    if (onChild) onChild(c);
+    let buf = "";
+    const feed = (d) => {
+      buf += d;
+      const lines = buf.split(/\r?\n/);
+      buf = lines.pop() ?? "";                       // keep the partial line for the next chunk
+      for (const l of lines) if (l.trim()) onLine(l.trim().slice(0, 400));
+    };
+    c.stdout?.on("data", feed);
+    c.stderr?.on("data", feed);
+    c.on("error", (e) => { onLine("ERROR " + e.message); resolve(1); });
+    c.on("close", (code) => { if (buf.trim()) onLine(buf.trim().slice(0, 400)); resolve(code ?? 1); });
+  });
+}
+
+// ---- elevation without a terminal -----------------------------------------------------------
+// The few steps that need administrator rights (machine certificate store, Developer Mode, an
+// ACL the account cannot change) run through Start-Process -Verb RunAs: Windows shows its own
+// consent dialog, the elevated shell is hidden, and nothing is pasted anywhere. The script rides
+// in as -EncodedCommand so no quoting survives to be got wrong. Resolves with the elevated exit
+// code, or 1223 (ERROR_CANCELLED) when the dialog was declined.
+function runElevated(script) {
+  const enc = Buffer.from(script, "utf16le").toString("base64");
+  const outer = `try { $p = Start-Process powershell.exe -Verb RunAs -WindowStyle Hidden -Wait -PassThru ` +
+    `-ArgumentList '-NoProfile','-ExecutionPolicy','Bypass','-EncodedCommand','${enc}'; exit $p.ExitCode } catch { exit 1223 }`;
+  return runProcLines("powershell.exe", ["-NoProfile", "-Command", outer], {}, null, () => {});
+}
+/** Read + traverse for the current account on one folder tree, nothing wider. */
+function grantReadAccess(dir) {
+  const who = `${process.env.USERDOMAIN ? process.env.USERDOMAIN + "\\" : ""}${process.env.USERNAME || ""}`;
+  const q = (v) => "'" + String(v).replace(/'/g, "''") + "'";
+  const grant = `& icacls.exe ${q(dir)} /grant ${q(who + ":(OI)(CI)RX")} /t /c | Out-Null`;
+  // Ownership moves only when the plain grant is refused, which is the case of files copied off
+  // another machine whose owner SID does not exist here.
+  return runElevated(`${grant}; if ($LASTEXITCODE -ne 0) { & takeown.exe /f ${q(dir)} /a /r /d y | Out-Null; ${grant} }; exit $LASTEXITCODE`);
+}
+
 // ---- Forge (generative "hero" tier only) — auto-launched headless, no terminal ------------
-const FORGE_ROOT = process.env.FORGE_ROOT || join(homedir(), "webui_forge");            // set FORGE_ROOT to your install
-const FORGE_PY = join(FORGE_ROOT, "system", "python", "python.exe");
-const FORGE_WEBUI = join(FORGE_ROOT, "webui");
-const FORGE_CKPT_DIR = process.env.FORGE_CKPT_DIR || join(FORGE_ROOT, "webui", "models", "Stable-diffusion");
+// Two layouts run here. A PACKAGED install (the one-click archive: system/python + webui/) is
+// used as it is when FORGE_ROOT or ~/webui_forge holds one. Otherwise the catalog's `forge`
+// component is a git clone under tools/ext/webui_forge, and forgeEnsure() builds that clone its
+// own virtual environment on a private CPython 3.10 (Forge's pinned wheels stop at 3.10), lets
+// launch.py install its packages on the first start, and marks the venv ready afterwards.
+const FORGE_CLONE = join(ROOT, "tools", "ext", "webui_forge");
 const FORGE_URL = process.env.FORGE_URL || "http://127.0.0.1:7861";
-const FORGE_PATH_PREPEND = [join(FORGE_ROOT, "system", "git", "bin"), join(FORGE_ROOT, "system", "python"), join(FORGE_ROOT, "system", "python", "Scripts")].join(";");
+function forgeLayout() {
+  const packaged = [process.env.FORGE_ROOT, join(homedir(), "webui_forge")].filter(Boolean)
+    .find((d) => existsSync(join(d, "system", "python", "python.exe")));
+  if (packaged) {
+    return {
+      kind: "packaged", root: packaged, cwd: join(packaged, "webui"), py: join(packaged, "system", "python", "python.exe"), ready: true,
+      path: [join(packaged, "system", "git", "bin"), join(packaged, "system", "python"), join(packaged, "system", "python", "Scripts")],
+      ckptDir: process.env.FORGE_CKPT_DIR || join(packaged, "webui", "models", "Stable-diffusion"),
+    };
+  }
+  const root = process.env.FORGE_ROOT && existsSync(join(process.env.FORGE_ROOT, "launch.py")) ? process.env.FORGE_ROOT : FORGE_CLONE;
+  const git = findGit(ROOT);
+  return {
+    kind: "clone", root, cwd: root, py: join(root, "venv", "Scripts", "python.exe"),
+    ready: existsSync(join(root, "venv", ".ares-ready")),
+    path: [join(root, "venv", "Scripts"), ...(git ? [dirname(git)] : [])],
+    ckptDir: process.env.FORGE_CKPT_DIR || join(root, "models", "Stable-diffusion"),
+  };
+}
 let forgeChild = null;
 function forgeHealthy(timeoutMs = 1500) {
   return new Promise((resolve) => {
@@ -337,31 +527,59 @@ function forgeHealthy(timeoutMs = 1500) {
     rq.end();
   });
 }
-// Ensure Forge's API is up: health-check, else spawn it detached+hidden and poll. `send` streams
-// SSE status. Mirrors the repo's hidden-PowerShell launcher path (tools/launch.ps1).
+// Ensure Forge's API is up: health-check, else install what is absent, spawn it hidden and poll.
+// `send` streams SSE status. Resolves true, or { error, ...ensure failure fields }.
 async function forgeEnsure(send) {
+  const log = (t) => { if (send) send("log", t); };
   if (await forgeHealthy()) return true;
-  if (!existsSync(FORGE_PY)) { send && send("log", `Forge not found at ${FORGE_ROOT} — set FORGE_ROOT to your webui_forge install`); return false; }
-  if (!forgeChild || forgeChild.exitCode !== null) {
-    send && send("log", "starting Forge (headless API, cold start ~30–60 s)…");
-    const args = ["launch.py", "--nowebui", "--skip-install"];
-    if (existsSync(FORGE_CKPT_DIR)) args.push("--ckpt-dir", FORGE_CKPT_DIR);
-    forgeChild = spawn(FORGE_PY, args, {
-      cwd: FORGE_WEBUI,
-      env: { ...process.env, PATH: FORGE_PATH_PREPEND + ";" + process.env.PATH },
-      detached: true, stdio: "ignore", windowsHide: true,
-    });
-    forgeChild.unref();
-  } else {
-    send && send("log", "waiting for Forge to finish starting…");
+  let lay = forgeLayout();
+  if (lay.kind === "clone" && !existsSync(join(lay.root, "launch.py"))) {
+    const r = await ensureComponents(["forge"], send);
+    if (!r.ok) return r;
+    lay = forgeLayout();
   }
-  const deadline = Date.now() + 120000;
+  if (lay.kind === "clone" && !existsSync(lay.py)) {
+    const py = await ensurePrivatePython(ROOT, (l) => log("[setup]   " + l), FORGE_PYTHON);
+    if (py.error) return { ok: false, error: py.error };
+    log("[setup] Forge: creating its virtual environment");
+    const code = await runProcLines(py.exe, ["-m", "venv", join(lay.root, "venv")], { cwd: lay.root }, null, (l) => log("[setup]   " + l));
+    if (code !== 0 || !existsSync(lay.py)) return { ok: false, error: `Forge venv creation failed (exit ${code})` };
+  }
+  const firstRun = !lay.ready;
+  if (!forgeChild || forgeChild.exitCode !== null) {
+    log(firstRun ? "Forge: first start, installing its packages (several GB, tens of minutes)…" : "Forge: starting (headless API, cold start 30 to 60 s)…");
+    const args = ["launch.py", "--nowebui", ...(firstRun ? [] : ["--skip-install"])];
+    if (existsSync(lay.ckptDir)) args.push("--ckpt-dir", lay.ckptDir);
+    const env = { ...process.env, PATH: lay.path.join(";") + ";" + process.env.PATH };
+    // Forge pins a cu121 torch, which has no kernels for Blackwell (sm_120): give it a build that does.
+    const gpu = await gpuCached();
+    if (firstRun && gpu.cc >= 12) env.TORCH_COMMAND = "pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128";
+    if (firstRun) {
+      // Piped so the package install is visible in the job log; the reader stays attached for the
+      // life of the child, whether or not the browser is still listening.
+      forgeChild = spawn(lay.py, args, { cwd: lay.cwd, env, windowsHide: true });
+      const relay = (d) => String(d).split(/\r?\n/).forEach((l) => l.trim() && log("[forge] " + l.trim().slice(0, 300)));
+      forgeChild.stdout.on("data", relay);
+      forgeChild.stderr.on("data", relay);
+      forgeChild.on("error", () => { /* surfaced by the health deadline below */ });
+    } else {
+      forgeChild = spawn(lay.py, args, { cwd: lay.cwd, env, detached: true, stdio: "ignore", windowsHide: true });
+      forgeChild.on("error", () => { /* surfaced by the health deadline below */ });
+      forgeChild.unref();
+    }
+  } else log("Forge: start already in progress, waiting");
+  const limitS = firstRun ? 3600 : 180;
+  const deadline = Date.now() + limitS * 1000;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 2000));
-    if (await forgeHealthy()) { send && send("log", "Forge API ready"); return true; }
+    if (await forgeHealthy()) {
+      if (firstRun && lay.kind === "clone") { try { await writeFile(join(lay.root, "venv", ".ares-ready"), new Date().toISOString()); } catch { /* next start repeats the install check */ } }
+      log("Forge API ready");
+      return true;
+    }
+    if (forgeChild && forgeChild.exitCode !== null) return { ok: false, error: `Forge exited with code ${forgeChild.exitCode} before its API answered` };
   }
-  send && send("log", "Forge did not become ready within 120 s (check tools/… or start it once manually)");
-  return false;
+  return { ok: false, error: `Forge API not ready after ${limitS} s` };
 }
 
 // ---- SAM segmentation service — auto-launched hidden from the app, no terminal ------------
@@ -384,33 +602,102 @@ function samHealth(timeoutMs = 1500) {
     rq.end();
   });
 }
-async function samEnsure(send) {
+/** The last lines of the service transcript, so a failed start is explained in the job log. */
+async function samLogTail(n = 12) {
+  try {
+    const txt = await readFile(join(ROOT, "tools", "sam-service", "sam-service.log"), "utf8");
+    return txt.replace(/\0/g, "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(-n);
+  } catch { return []; }
+}
+/** Stop the service that owns SAM_URL's port. Used when weights arrive after a start that latched
+ *  a load failure: the service loads its model once, so new weights need a new process. Only a
+ *  python process is ever stopped. */
+async function samStop(send) {
+  let port = 7263; try { port = Number(new URL(SAM_URL).port) || 80; } catch { /* default */ }
+  const ps = `$c = Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; ` +
+    `if ($c) { $p = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue; if ($p -and $p.ProcessName -like 'python*') { Stop-Process -Id $p.Id -Force } }`;
+  await runProcLines("powershell.exe", ["-NoProfile", "-Command", ps], {}, null, () => {});
+  samChild = null;
+  for (let i = 0; i < 10 && (await samHealth(800)); i++) await new Promise((r) => setTimeout(r, 500));
+  if (send) send("log", "SAM service stopped for a model reload");
+}
+/**
+ * samEnsure(send, { purpose, components })
+ *   purpose "sam"   (default) a segmentation backend must load: SAM 3, else ViT-H
+ *   purpose "track" the video tracker, which is SAM 3 only
+ *   purpose "depth" the depth routes only: a latched SAM load failure does not block them
+ *   components      extra catalog ids the job needs (a depth model, SAM 3 for a subject mask)
+ * Installs whatever is absent first (Python environment, weights), then health-checks, spawns the
+ * hidden launcher and polls. Resolves true, or { ok:false, error, gated?, needsToken?, url? }.
+ */
+let samRestarted = false;   // one automatic restart per latched failure, never a loop
+async function samEnsure(send, { purpose = "sam", components = [] } = {}) {
+  const log = (t) => { if (send) send("log", t); };
+  const need = ["python-env", ...components];
+  if (purpose === "track") need.push("sam3");
+  if (purpose === "sam") {
+    const items = catalog(ROOT, await gpuCached());
+    const have = (id) => !!items.find((i) => i.id === id)?.present;
+    // Any loadable backend is enough to start. With none on disk: SAM 3 when a Hugging Face token
+    // is stored (it is gated), otherwise the ungated ViT-H so the first click works without one.
+    if (!have("sam3") && !have("vit-h")) need.push(hfTokenPresent() ? "sam3" : "vit-h");
+  }
+  const ens = await ensureComponents(need, send);
+  if (!ens.ok) return ens;
+
   let h = await samHealth();
-  if (h && h.ok) return true;
-  if (h && h.error) { send && send("log", `SAM model load failed: ${h.error} — see tools/sam-service/sam-service.log`); return false; }
+  // A latched load failure with weights now on disk (installed just now, or from Settings while
+  // the service was up) is stale: the service loads once, so it is restarted to pick them up.
+  if (h && h.error && purpose !== "depth") {
+    const items = catalog(ROOT, await gpuCached());
+    if (["sam3", "vit-h"].some((id) => items.find((i) => i.id === id)?.present) && !samRestarted) {
+      samRestarted = true;
+      await samStop(send);
+      h = null;
+    }
+  }
+  const usable = (x) => !!x && (x.ok || (purpose === "depth" && !x.loading));
+  if (usable(h)) return true;
+  const failed = async (x) => ({ ok: false, error: `SAM model load failed: ${x.error}`, log: await samLogTail() });
+  if (h && h.error) return failed(h);
   if (!h) {
-    if (!existsSync(SAM_PS1)) { send && send("log", `SAM launcher missing: ${SAM_PS1}`); return false; }
+    if (!existsSync(SAM_PS1)) return { ok: false, error: `SAM launcher absent from this checkout: ${SAM_PS1}` };
     if (!samChild || samChild.exitCode !== null) {
-      send && send("log", "starting SAM service (model load ~40 s on first start)…");
+      log("starting SAM service (model load ~40 s on first start)…");
+      // NOT detached. Measured 2026-09-18 (Windows PowerShell 5.1.26100): powershell.exe spawned
+      // with `detached: true` exits 0 within a second without running the script at all, whatever
+      // the window style or stdio (five variants tried, tools/sam-service/sam-service.log never
+      // even gained a new transcript), so every auto-start silently timed out after 180 s. Without
+      // `detached` the same command binds the port in ~3 s and reports ready in ~13 s. Windows does
+      // not kill a child when its parent exits, so the service still outlives this process; it now
+      // shares this process's (hidden) console instead of a new process group.
+      // toolEnv(): the service inherits the resolved FFMPEG / FFPROBE, so depth.py finds them
+      // even when a request omits the `ffmpeg` field.
       samChild = spawn("powershell.exe",
         ["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", SAM_PS1],
-        { detached: true, stdio: "ignore", windowsHide: true });
+        { stdio: "ignore", windowsHide: true, env: toolEnv() });
       samChild.unref();
     } else {
-      send && send("log", "waiting for the SAM service to finish starting…");
+      log("waiting for the SAM service to finish starting…");
     }
   } else {
-    send && send("log", "SAM service is loading the model…");
+    log("SAM service is loading the model…");
   }
   const deadline = Date.now() + 180000;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 2000));
     h = await samHealth();
-    if (h && h.ok) { send && send("log", `SAM ready (${h.model} on ${h.device})`); return true; }
-    if (h && h.error) { send && send("log", `SAM model load failed: ${h.error} — see tools/sam-service/sam-service.log`); return false; }
+    if (h && h.ok) { samRestarted = false; log(`SAM ready (${h.model} on ${h.device})`); return true; }
+    if (usable(h)) { log("SAM service up (depth routes)"); return true; }
+    if (h && h.error) return failed(h);
   }
-  send && send("log", "SAM did not become ready within 180 s — see tools/sam-service/sam-service.log");
-  return false;
+  return { ok: false, error: "SAM service not ready after 180 s", log: await samLogTail() };
+}
+/** Send a samEnsure / forgeEnsure failure down an SSE stream: the transcript tail as log lines,
+ *  then the error event (gated fields included, so the client can raise its access prompt). */
+function sendEnsureFailure(send, r) {
+  for (const l of r.log || []) send("log", "[service] " + l);
+  send("error", ensureErrorPayload(r));
 }
 
 // ---- 4DViews .4ds codec (Task I: Convert tab wiring for tools/4ds/decode_4ds.py) -----------
@@ -426,11 +713,18 @@ function fourdsDllPath() {
   if (existsSync(FOURDS_DLL_FALLBACK)) return FOURDS_DLL_FALLBACK;
   return null;
 }
-function fourdsMissing() {
-  const missing = [];
-  if (!existsSync(FOURDS_PY)) missing.push("SAM-service Python env (tools/sam-service/env/Scripts/python.exe) — see ⚙ Settings → SAM service Python env");
-  if (!fourdsDllPath()) missing.push("BridgeCodec4DS.dll — copy it from your 4DViews SDK into tools\\4ds\\bin\\ (or set FOURDS_DLL)");
-  return missing;
+/** What a .4ds job still lacks, in the two forms the client acts on by itself: `needs` =
+ *  component ids it installs through /install before retrying, `needsFile` = a file only the
+ *  person has (the licensed codec DLL), collected with the native file dialog and copied into
+ *  place by POST /setup/4ds-codec. FOURDS_DLL still points at one in place. */
+function fourdsNeeds() {
+  return {
+    needs: existsSync(FOURDS_PY) ? [] : ["python-env"],
+    needsFile: fourdsDllPath() ? null : {
+      id: "4ds-codec", label: "BridgeCodec4DS.dll (4DViews SDK)", route: "/setup/4ds-codec",
+      filter: "4DViews codec (BridgeCodec4DS.dll)|BridgeCodec4DS.dll|DLL files (*.dll)|*.dll",
+    },
+  };
 }
 // Run `decode_4ds.py --info` (no decode) and parse its JSON. Used by /probe-4ds and to pick the
 // bake fps in /convert-4ds.
@@ -448,11 +742,123 @@ function run4dsInfo(inputPath) {
   });
 }
 
+// ---- 2D video → 2.5D depth conversion: shared pieces for the /depth* routes in handle() ------
+// The model keys the Python engine knows (tools/sam-service/depth.py); the browser engine covers
+// the first three through onnx-community/depth-anything-v2-{small,base,large}.
+const DEPTH_MODELS = ["small", "base", "large",
+  "metric-indoor-small", "metric-indoor-base", "metric-indoor-large",
+  "metric-outdoor-small", "metric-outdoor-base", "metric-outdoor-large",
+  // Video-Depth-Anything (service engine only); weights are the vda-* catalog components.
+  "video-small", "video-base", "video-large"];
+const DEPTH_VIDEO_MIME = {
+  ".mp4": "video/mp4", ".m4v": "video/mp4", ".mov": "video/quicktime", ".webm": "video/webm",
+  ".mkv": "video/x-matroska", ".avi": "video/x-msvideo", ".mpg": "video/mpeg", ".mpeg": "video/mpeg", ".wmv": "video/x-ms-wmv", ".ts": "video/mp2t",
+};
+// Browser-engine uploads in flight or finished-but-unconverted: job id → { dir, meta, fh, … }.
+// A finished upload that never converts is reaped after an hour so temp space cannot leak.
+const DEPTH_RUNS = new Map();
+const depthJobId = () => "d" + Date.now().toString(36) + Math.random().toString(36).slice(2, 8);
+function depthIsVideoPath(p) {
+  if (!p || typeof p !== "string" || p.length > 4096) return false;
+  if (!(extname(p).toLowerCase() in DEPTH_VIDEO_MIME)) return false;
+  try { return statSync(p).isFile(); } catch { return false; }
+}
+setInterval(() => {
+  const cutoff = Date.now() - 3600_000;
+  for (const [job, run] of DEPTH_RUNS) {
+    if (run.createdAt > cutoff) continue;
+    DEPTH_RUNS.delete(job);
+    (async () => { try { if (run.fh) await run.fh.close(); } catch { /* closed */ } rm(run.dir, { recursive: true, force: true }).catch(() => {}); })();
+  }
+}, 300_000).unref();
+
+/** Stream facts the Convert card and the depth engines need: size, frame rate, frame count,
+ *  duration, whether there is audio to carry into the clip. ffprobe comes from ffTools(); the
+ *  caller ensures the `ffmpeg` component first, so a miss here is a real fault. */
+function probeVideo(p) {
+  return new Promise((resolve, reject) => {
+    const FFPROBE = ffTools()?.ffprobe;
+    if (!FFPROBE) { reject(new Error("ffprobe unresolved")); return; }
+    const args = ["-v", "error", "-show_entries", "stream=index,codec_type,codec_name,width,height,r_frame_rate,avg_frame_rate,nb_frames,duration",
+      "-show_entries", "format=duration,size", "-of", "json", p];
+    const c = spawn(FFPROBE, args, { windowsHide: true });
+    let out = "", err = "";
+    c.stdout.on("data", (d) => { out += d; });
+    c.stderr.on("data", (d) => { err = (err + d).slice(-2000); });
+    c.on("error", (e) => reject(new Error(`ffprobe failed to start (${FFPROBE}): ${e.message}`)));
+    c.on("close", (code) => {
+      if (code !== 0) { reject(new Error(err.trim() || `ffprobe exited ${code}`)); return; }
+      let j; try { j = JSON.parse(out); } catch { reject(new Error("ffprobe returned non-JSON")); return; }
+      const streams = j.streams || [];
+      const v = streams.find((s) => s.codec_type === "video");
+      if (!v) { reject(new Error("no video stream")); return; }
+      const rate = (s) => { const m = /^(\d+)\/(\d+)$/.exec(s || ""); return m && Number(m[2]) ? Number(m[1]) / Number(m[2]) : Number(s) || 0; };
+      const fps = rate(v.avg_frame_rate) || rate(v.r_frame_rate) || 30;
+      const durationS = Number(v.duration) || Number(j.format?.duration) || 0;
+      const frames = Number(v.nb_frames) || (durationS ? Math.round(durationS * fps) : 0);
+      resolve({
+        path: p, width: v.width, height: v.height, fps: +fps.toFixed(3), frames, durationS: +durationS.toFixed(3),
+        codec: v.codec_name, hasAudio: streams.some((s) => s.codec_type === "audio"), sizeBytes: Number(j.format?.size) || 0,
+      });
+    });
+  });
+}
+/** JSON round trip to the local SAM/depth service (same process as /sam/*). Resolves null when it
+ *  is not reachable; `{ status, json | text }` otherwise. */
+/**
+ * Stream one file, honouring a single `Range: bytes=` request (206, or 416 when unsatisfiable) and
+ * HEAD. Throws when the file cannot be stat'ed, before any header is written.
+ */
+async function sendFileRange(req, res, file, type) {
+  const st = await stat(file);
+  if (!st.isFile()) throw new Error(`not a file: ${file}`);
+  const size = st.size;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || "");
+  let start = 0, end = size - 1;
+  if (m && (m[1] || m[2])) {
+    if (m[1]) { start = Number(m[1]); end = m[2] ? Math.min(Number(m[2]), size - 1) : size - 1; }
+    else { start = Math.max(0, size - Number(m[2])); }
+    if (!(start <= end && start < size)) { res.writeHead(416, { ...HEADERS, "Content-Range": `bytes */${size}` }); res.end(); return; }
+  }
+  const partial = !!(m && (m[1] || m[2]));
+  res.writeHead(partial ? 206 : 200, {
+    ...HEADERS, "Content-Type": type, "Accept-Ranges": "bytes", "Content-Length": size ? end - start + 1 : 0,
+    ...(partial ? { "Content-Range": `bytes ${start}-${end}/${size}` } : {}),
+  });
+  if (req.method === "HEAD" || !size) { res.end(); return; }
+  const rs = createReadStream(file, { start, end });
+  rs.on("error", () => { try { res.destroy(); } catch { /* gone */ } });
+  res.on("close", () => rs.destroy());
+  rs.pipe(res);
+}
+
+function samJson(method, pathname, body, timeoutMs = 5000) {
+  return new Promise((resolve) => {
+    let u; try { u = new URL(pathname, SAM_URL); } catch { resolve(null); return; }
+    const payload = body == null ? null : Buffer.from(JSON.stringify(body));
+    const rq = httpRequest({
+      hostname: u.hostname, port: u.port || 80, path: u.pathname + u.search, method, timeout: timeoutMs,
+      headers: payload ? { "Content-Type": "application/json", "Content-Length": payload.length } : {},
+    }, (rs) => {
+      let out = "";
+      rs.on("data", (d) => { out += d; });
+      rs.on("end", () => { try { resolve({ status: rs.statusCode, json: JSON.parse(out) }); } catch { resolve({ status: rs.statusCode, json: null, text: out.slice(0, 500) }); } });
+    });
+    rq.on("error", () => resolve(null));
+    rq.on("timeout", () => { rq.destroy(); resolve(null); });
+    if (payload) rq.write(payload);
+    rq.end();
+  });
+}
+
 // Routes that do work, spend money, open dialogs or write files. Browsers stamp Sec-Fetch-Site on
 // every request, so a page on any other origin (or a same-site page on another port) is refused
 // here even though the server only listens on loopback: EventSource/GET side effects were the
 // audit's CSRF finding. Non-browser callers (curl, scripts) send no such header and pass.
-const GUARDED = /^\/(encode|convert-4ds|enhance|sam\/start|forge\/start|setup\/|runpod\/(launch|stop|action|logs)|pick|log|edits\/|showcase|deps\/)/;
+// /sam/track/ joins /sam/start for the same reason: opening a track session pins 2,263 MiB of
+// device memory (measured, tools/sam-service/track_smoke.py) and a run is 291.6 ms/frame of GPU
+// for the length of a clip. The rest of /sam/* stays unguarded — one forward pass, no state.
+const GUARDED = /^\/(encode|convert-4ds|depth-convert|depth\/(upload|source)|probe-video|enhance|sam\/(start|track\/)|forge\/start|setup\/|runpod\/(launch|stop|action|logs|key)|pick|log|edits\/|showcase|deps\/|install|shell\/|hf-token|import-ares|delete-ares|save-thumb|open-info|resolve-dir)/;
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
 function sameOrigin(req) {
   const sfs = req.headers["sec-fetch-site"];
@@ -481,7 +887,9 @@ async function handle(req, res) {
   if (path === "/runpod/status") {
     res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
     const key = await readRunpodKey();
-    if (!key) { res.end(JSON.stringify({ ok: false, error: "no RunPod key (set RUNPOD_API_KEY or save it to " + RUNPOD_KEY_FILE + ")" })); return; }
+    // A credential is the one input only the person has: `needsKey` makes the Compute panel show
+    // its key field, which posts to /runpod/key below.
+    if (!key) { res.end(JSON.stringify({ ok: false, needsKey: true, error: "RunPod API key not stored" })); return; }
     try {
       const d = await runpodGraphQL(key, "query{myself{clientBalance currentSpendPerHr pods{id name desiredStatus costPerHr gpuCount machine{gpuDisplayName} runtime{uptimeInSeconds}}}}");
       const me = d.myself;
@@ -496,6 +904,23 @@ async function handle(req, res) {
         })),
       }));
     } catch (e) { res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) })); }
+    return;
+  }
+
+  // Store the RunPod API key: POST /runpod/key {"key":"…"} -> { ok } | { ok:false, error }.
+  // Validated against the API before it is written to RUNPOD_KEY_FILE; never echoed or logged.
+  if (path === "/runpod/key" && req.method === "POST") {
+    let body = ""; req.on("data", (d) => { body += d; if (body.length > 4096) req.destroy(); });
+    await new Promise((r) => req.on("end", r));
+    res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
+    let key = ""; try { key = String(JSON.parse(body || "{}").key || "").trim(); } catch { /* malformed */ }
+    if (!/^[A-Za-z0-9_\-]{20,200}$/.test(key)) { res.end(JSON.stringify({ ok: false, error: "invalid key format" })); return; }
+    try {
+      await runpodGraphQL(key, "query{myself{id}}");
+      await mkdir(dirname(RUNPOD_KEY_FILE), { recursive: true });
+      await writeFile(RUNPOD_KEY_FILE, key, "utf8");
+      res.end(JSON.stringify({ ok: true }));
+    } catch (e) { res.end(JSON.stringify({ ok: false, error: "key rejected by RunPod: " + String((e && e.message) || e).slice(0, 120) })); }
     return;
   }
 
@@ -600,8 +1025,9 @@ async function handle(req, res) {
   if (path === "/sam/start") {
     res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
     const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
-    const ok = await samEnsure(send);
-    send(ok ? "done" : "error", ok ? { url: SAM_URL } : { message: "SAM service could not be started — see tools/sam-service/sam-service.log" });
+    // ?for=track additionally requires SAM 3 (the video tracker has no ViT-H path).
+    const r = await samEnsure(send, { purpose: url.searchParams.get("for") === "track" ? "track" : "sam" });
+    if (r === true) send("done", { url: SAM_URL }); else sendEnsureFailure(send, r);
     res.end();
     return;
   }
@@ -625,15 +1051,27 @@ async function handle(req, res) {
       res.writeHead(ur.statusCode ?? 502, out);
       ur.pipe(res);
     });
+    // Tell the SAM service when the browser walked away. pipe() only UNPIPES a dead client socket;
+    // it never destroys the upstream request, so the proxy keeps the upstream response and its
+    // socket open and the service goes on computing for a reader that will never come back.
+    // Measured on a 60-frame /sam/track/run abandoned after 4 masks: without this the service ran
+    // the whole span (16.7 s of GPU) before anything noticed; with it the run stalls at once and
+    // the service's own idle-stream reaper cancels it and frees the inference session. It does NOT
+    // end the upstream generator by itself — starlette cancels its send task and leaves the sync
+    // generator parked, which is exactly the case tools/sam-service/track.py's reaper exists for.
+    // Guarded on writableFinished so a normally completed response is left alone.
+    res.on("close", () => { if (!res.writableFinished) up.destroy(); });
     up.on("error", (e) => {
-      if (res.headersSent) { res.destroy(); return; }
+      // Also bail once the response is gone: the close handler above destroys `up` deliberately,
+      // and answering a 502 into a dead ServerResponse raises on the write instead.
+      if (res.headersSent || res.destroyed || res.writableEnded) { res.destroy(); return; }
       const refused = e.code === "ECONNREFUSED";
       // Auto-start on real work (POST /segment); plain health GETs stay passive so
       // status polling never spawns anything.
-      if (refused && req.method === "POST") samEnsure(null);
+      if (refused && req.method === "POST") samEnsure(null, { purpose: path.startsWith("/sam/track/") ? "track" : path.startsWith("/sam/depth/") ? "depth" : "sam" }).catch(() => {});
       res.writeHead(refused ? 503 : 502, { ...HEADERS, "Content-Type": "application/json" });
       res.end(JSON.stringify(refused
-        ? { error: "sam service not running", starting: req.method === "POST", hint: "GET /sam/start streams launch progress" }
+        ? { error: "sam service not running", starting: req.method === "POST", start: "/sam/start" }
         : { error: "sam proxy failed", detail: e.message }));
     });
     req.pipe(up);
@@ -658,9 +1096,44 @@ async function handle(req, res) {
       return;
     }
     if (req.method === "POST") {
-      let body = "";
-      req.on("data", (d) => { body += d; if (body.length > 4_000_000) req.destroy(); });
+      // 16 MB, not 4, because one propagated range writes a bitmap keyframe per FRAME and the demo
+      // saves pretty-printed (main.js:1057 — JSON.stringify(edits, null, 1)). rleEncodeMask
+      // (edits.ts:50) emits alternating run lengths over the FLAT row-major bitmap, so a silhouette
+      // costs two runs per edge crossing per covered row: a standing figure in a 768 px long-side
+      // mask (768x432) covers 390 rows and measures 1,185 runs, mean run 280 — 3 digits. Every run
+      // is its own ARRAY ELEMENT nine levels down (ranges/keyframes/volumes/mask/rle), so `null, 1`
+      // spends ",\n" plus 9 spaces plus the digits on each: 13.7 bytes measured, 16,290 bytes for
+      // the keyframe. x272 frames = 4.4 MB, over the old cap on ONE object with no user keyframes
+      // and nothing else in the document. Headroom the 16 MB buys: maskRes 1008 is ~5.8 MB, two
+      // tracked objects at 768 ~8.9 MB, a 500-frame clip at 768 ~8.1 MB. The same document
+      // serialized compact is 1.2 MB, so the cap stays generous even after the writer stops
+      // pretty-printing tracked documents.
+      //
+      // And overflow ANSWERS now. `req.destroy()` sent no response at all, which doSave's
+      // .catch(() => {}) (main.js:1057) swallows whole: the sidecar silently stopped being written
+      // and the track was gone on the next reload with nothing logged anywhere.
+      const CAP = 16_000_000;
+      const chunks = [];
+      let bytes = 0, over = false;
+      req.on("data", (d) => {
+        bytes += d.length;
+        if (bytes > CAP) {
+          if (!over) {
+            over = true;
+            chunks.length = 0;                  // drop what was buffered; keep draining so the 413 flushes
+            const declared = Number(req.headers["content-length"]);
+            res.writeHead(413, { ...HEADERS, "Content-Type": "application/json" });
+            res.end(JSON.stringify({ error: "edit list too large", bytes: declared > bytes ? declared : bytes, cap: CAP }));
+          }
+          return;
+        }
+        chunks.push(d);
+      });
       req.on("end", async () => {
+        if (over) return;                       // the 413 already answered
+        // Buffer.concat, not `body += d`: the cap is a BYTE cap, and per-chunk toString() turns a
+        // chunk boundary landing mid-sequence in a non-ASCII range label into U+FFFD.
+        const body = Buffer.concat(chunks).toString("utf8");
         try {
           JSON.parse(body); // must at least be JSON
           // One-deep backup before every overwrite: a stale browser tab's debounced autosave can
@@ -1038,6 +1511,109 @@ async function handle(req, res) {
     return;
   }
 
+  // Windows shell integration: "Convert to .ares" on the right-click menu.
+  //   GET  /shell/status                     -> { supported, registered, folders, files, allFiles, … }
+  //   POST /shell/register  {allFiles?:bool} -> { ok, … }
+  //   POST /shell/unregister                 -> { ok, … }
+  // Registration writes only under HKCU\Software\Classes, so it needs no elevation and is
+  // reversible from the same screen that turned it on.
+  if (path === "/shell/status") {
+    // Two independent routes to the same verb: registry keys reach the CLASSIC menu (and
+    // Windows 10), the MSIX package reaches the Windows 11 SHORT menu. Report both.
+    const [classic, modern] = await Promise.all([shellStatus(ROOT), msixStatus().catch((e) => ({ supported: false, error: String(e.message || e) }))]);
+    res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ...classic, msix: modern }));
+    return;
+  }
+  if ((path === "/shell/msix-install" || path === "/shell/msix-uninstall") && req.method === "POST") {
+    const log = [];
+    let r;
+    try {
+      if (path === "/shell/msix-install") {
+        // The two machine-wide switches the package needs are flipped here, each behind one
+        // Windows consent dialog, and the install is retried: nothing is handed to the person to
+        // paste. (MSVC, when absent, is installed by the Settings tab through /install first.)
+        const q1 = (v) => "'" + String(v).replace(/'/g, "''") + "'";
+        r = await msixInstall((l) => log.push(l));
+        for (let i = 0; i < 2 && !r.ok; i++) {
+          let script = null, what = "";
+          if (/Developer Mode is off/i.test(r.error || "")) {
+            what = "Developer Mode";
+            script = "reg.exe add 'HKLM\\SOFTWARE\\Microsoft\\Windows\\CurrentVersion\\AppModelUnlock' /v AllowDevelopmentWithoutDevLicense /t REG_DWORD /d 1 /f | Out-Null; exit $LASTEXITCODE";
+          } else if (r.needsTrust && r.cerPath) {
+            what = "signing certificate trust";
+            script = `Import-Certificate -FilePath ${q1(r.cerPath)} -CertStoreLocation Cert:\\LocalMachine\\TrustedPeople -ErrorAction Stop | Out-Null`;
+          } else break;
+          log.push(`${what}: requesting elevation`);
+          const code = await runElevated(script);
+          if (code !== 0) { r = { ok: false, error: code === 1223 ? `${what}: elevation declined` : `${what}: elevated step exit ${code}` }; break; }
+          log.push(`${what}: set`);
+          r = await msixInstall((l) => log.push(l));
+        }
+        if (r && !r.ok) { delete r.command; if (r.needsTrust) r.error = "signing certificate not trusted after the elevated import"; }
+      } else r = await msixUninstall((l) => log.push(l));
+    } catch (e) { r = { ok: false, error: String((e && e.message) || e) }; }
+    res.writeHead(r.ok ? 200 : 400, { ...HEADERS, "Content-Type": "application/json" });
+    res.end(JSON.stringify({ ...r, log }));
+    return;
+  }
+  if ((path === "/shell/register" || path === "/shell/unregister") && req.method === "POST") {
+    let body = "";
+    req.on("data", (d) => { body += d; if (body.length > 4096) req.destroy(); });
+    req.on("end", async () => {
+      const log = [];
+      let r;
+      try {
+        const opts = JSON.parse(body || "{}");
+        r = path === "/shell/register"
+          ? await shellRegister(ROOT, { allFiles: !!opts.allFiles }, (l) => log.push(l))
+          : await shellUnregister(ROOT, (l) => log.push(l));
+      } catch (e) { r = { ok: false, error: String((e && e.message) || e) }; }
+      res.writeHead(r.ok ? 200 : 400, { ...HEADERS, "Content-Type": "application/json" });
+      res.end(JSON.stringify({ ...r, log }));
+    });
+    return;
+  }
+
+  // Classify a path the shell verb handed us, so the Convert tab knows what to do with it.
+  //   GET /open-info?path=…  ->  { kind: "dir"|"file", ext, parent, files? }
+  if (path === "/open-info") {
+    const target = url.searchParams.get("path") || "";
+    res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
+    try {
+      const st = await stat(target);
+      if (st.isDirectory()) {
+        const names = await readdir(target);
+        res.end(JSON.stringify({ kind: "dir", path: target, files: names.length }));
+      } else {
+        res.end(JSON.stringify({ kind: "file", path: target, ext: extname(target).toLowerCase(), parent: dirname(target) }));
+      }
+    } catch (e) { res.end(JSON.stringify({ error: String((e && e.message) || e) })); }
+    return;
+  }
+
+  // Store a Hugging Face access token so gated repos can download.
+  //   POST /hf-token  {"token":"hf_…"}  ->  { ok, user } | { ok:false, error }
+  // The token arrives once, is handed to huggingface_hub on STDIN (never argv, which any process
+  // on the machine can read), and is never echoed back, logged, or written to history. This
+  // exists so a gated model is a dialog inside the app rather than a trip to a terminal to run
+  // `hf auth login`.
+  if (path === "/hf-token" && req.method === "POST") {
+    let body = "";
+    req.on("data", (d) => { body += d; if (body.length > 8192) req.destroy(); });
+    req.on("end", async () => {
+      const jsonOut = (o, code = 200) => { res.writeHead(code, { ...HEADERS, "Content-Type": "application/json" }); res.end(JSON.stringify(o)); };
+      try {
+        const { token } = JSON.parse(body || "{}");
+        const r = await saveHfToken(ROOT, token);
+        // Deliberately no token in the log line — only whether it worked.
+        console.log(`[ares-dev] hf token ${r.ok ? "stored" + (r.user ? ` for ${r.user}` : "") : "rejected"}`);
+        jsonOut(r, r.ok ? 200 : 400);
+      } catch { jsonOut({ ok: false, error: "malformed request" }, 400); }
+    });
+    return;
+  }
+
   // Install one or more components: GET /install?ids=a,b,c — SSE, one line at a time.
   // `resolve` expands each id through its `requires` graph and orders dependencies first, so
   // asking for a model that needs the Python env installs the env without being told to.
@@ -1060,7 +1636,7 @@ data: ${JSON.stringify(data)}
       const plan = resolve(items, wanted).filter((it) => !it.statusOnly && it.install);
       const todo = plan.filter((it) => !it.present);
       const skipped = plan.filter((it) => it.present);
-      for (const it of skipped) line(`✓ ${it.label} — already installed, skipping`);
+      for (const it of skipped) line(`✓ ${it.label}: already installed, skipping`);
       if (!todo.length) { send("done", { message: "everything requested is already installed" }); res.end(); return; }
       line(`installing ${todo.length} component${todo.length > 1 ? "s" : ""}: ${todo.map((t) => t.label).join(", ")}`);
       send("plan", { todo: todo.map((t) => ({ id: t.id, label: t.label, sizeMB: t.sizeMB })), skipped: skipped.map((t) => t.id) });
@@ -1070,9 +1646,10 @@ data: ${JSON.stringify(data)}
         send("step", { id: it.id, label: it.label, index: done, total: todo.length });
         line(`── ${it.label} (${it.sizeMB || "?"} MB) ──`);
         const r = await installOne(ROOT, it, line);
+        if (it.id === "ffmpeg") ffTools({ fresh: true });
         if (!r.ok) {
           line(`✗ ${it.label}: ${r.error}`);
-          send("error", { message: r.error, id: it.id, gated: !!r.gated, url: it.gated?.url });
+          send("error", { message: r.error, id: it.id, component: it.id, label: it.label, gated: !!r.gated, needsToken: !!r.needsToken, url: it.gated?.url });
           res.end();
           return;
         }
@@ -1088,27 +1665,36 @@ data: ${JSON.stringify(data)}
     return;
   }
 
-  // Guided installs (Settings tab). Each route streams SSE progress and refuses to touch
-  // anything that already exists — a failed or repeated install can never break a working state.
+  // Guided installs (Settings tab). Each route streams SSE progress and goes through
+  // ensureComponents, so it installs only what is absent and a repeat is a no-op.
   if (path === "/setup/sam-env") {
+    // The environment is the catalog's `python-env`: interpreter discovery (or the private
+    // CPython), the venv, and the PyTorch build chosen for THIS GPU all live in installer.mjs.
     res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
     const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
-    const svcDir = join(ROOT, "tools", "sam-service");
-    const envPy = join(svcDir, "env", "Scripts", "python.exe");
-    if (existsSync(envPy)) { send("done", { message: "env already present — nothing to do" }); res.end(); return; }
-    const reqs = join(svcDir, "requirements.txt");
-    if (!existsSync(reqs)) { send("error", { message: "requirements.txt missing in tools/sam-service/" }); res.end(); return; }
-    send("log", "creating venv (python -m venv env)…");
-    const script = `Set-Location '${svcDir}'; python -m venv env; if ($LASTEXITCODE -ne 0) { exit 1 }; ` +
-      `.\\env\\Scripts\\python.exe -m pip install --upgrade pip; ` +
-      `.\\env\\Scripts\\pip.exe install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124`;
-    const child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], { windowsHide: true });
-    const relay = (d) => String(d).split(/\r?\n/).forEach((l) => l.trim() && send("log", l.trim().slice(0, 300)));
-    child.stdout.on("data", relay);
-    child.stderr.on("data", relay);
-    child.on("error", (e) => { send("error", { message: e.message }); res.end(); });
-    child.on("close", (code) => { send(code === 0 ? "done" : "error", code === 0 ? { message: "env ready — press Start SAM in the editor" } : { message: "pip exited " + code }); res.end(); });
-    req.on("close", () => { try { child.kill(); } catch { /* ignore */ } });
+    if (!(await ensureOrEnd(["python-env"], send, res))) return;
+    send("done", { message: "Python environment ready" });
+    res.end();
+    return;
+  }
+  // The licensed 4DViews codec: POST /setup/4ds-codec {"path":"<abs BridgeCodec4DS.dll>"} copies
+  // the picked file into tools/4ds/bin. The path comes from the native dialog (/pick), never typed.
+  if (path === "/setup/4ds-codec" && req.method === "POST") {
+    let body = ""; req.on("data", (d) => { body += d; if (body.length > 10000) req.destroy(); });
+    await new Promise((r) => req.on("end", r));
+    res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
+    let src = ""; try { src = String(JSON.parse(body || "{}").path || "").trim(); } catch { /* malformed */ }
+    try {
+      const st = src ? await stat(src) : null;
+      if (!st || !st.isFile() || !/\.dll$/i.test(src)) { res.end(JSON.stringify({ ok: false, error: "not a DLL file" })); return; }
+      const head = Buffer.alloc(2);
+      const fh = await open(src, "r");
+      try { await fh.read(head, 0, 2, 0); } finally { await fh.close(); }
+      if (head.toString("latin1") !== "MZ") { res.end(JSON.stringify({ ok: false, error: "not a Windows executable image" })); return; }
+      await mkdir(dirname(FOURDS_DLL_LOCAL), { recursive: true });
+      await copyFile(src, FOURDS_DLL_LOCAL);
+      res.end(JSON.stringify({ ok: true, path: FOURDS_DLL_LOCAL }));
+    } catch (e) { res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) })); }
     return;
   }
   if (path === "/setup/demo-clip") {
@@ -1116,9 +1702,9 @@ data: ${JSON.stringify(data)}
     const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
     const out = join(ROOT, "apps", "demo", "demo.ares");
     if (existsSync(out)) { send("done", { message: "demo.ares already present", out: "/apps/demo/demo.ares" }); res.end(); return; }
-    const cli = join(ROOT, "packages", "encoder", "dist", "cli.js");
-    if (!existsSync(cli)) { send("error", { message: "encoder not built — run npx tsc -b in ares/ first" }); res.end(); return; }
-    const child = spawn(process.execPath, [cli, "synth", "-o", out], { cwd: ROOT, windowsHide: true });
+    if (!(await ensureOrEnd(["encoder"], send, res))) return;
+    const cli = encoderState(ROOT).cli;
+    const child = spawn(process.execPath, [cli, "synth", "-o", out], { cwd: ROOT, windowsHide: true, env: toolEnv() });
     const relay = (d) => String(d).split(/\r?\n/).forEach((l) => l.trim() && send("log", l.trim()));
     child.stdout.on("data", relay);
     child.stderr.on("data", relay);
@@ -1128,7 +1714,43 @@ data: ${JSON.stringify(data)}
     return;
   }
 
-  // Native OS folder/file picker (Windows) — so the user never types a filesystem path.
+  // Resolve a DROPPED folder to a real path. A browser hands a drag-drop or <input webkitdirectory>
+  // only `webkitRelativePath` — the folder's NAME, never its location — so the Convert card had to
+  // ask the user to retype a path they had just pointed at, which is a daft thing to ask.
+  // Given the name (and optionally the file count), look for it under the folders this user has
+  // actually used before (history lastDirs and their parents) plus the drives' obvious roots.
+  // Returns a single unambiguous hit, or the candidates so the UI can ask which.
+  //   GET /resolve-dir?name=Daniel_Volcap[&files=544]  ->  { path } | { candidates:[...] } | {}
+  if (path === "/resolve-dir") {
+    const want = basename(url.searchParams.get("name") || "").trim();
+    const wantFiles = Number(url.searchParams.get("files") || 0);
+    res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
+    if (!want || /[\/:*?"<>|]/.test(want)) { res.end(JSON.stringify({})); return; }
+    try {
+      const hist = await readHistoryStore();
+      const seeds = new Set();
+      for (const d of Object.values(hist.lastDirs || {})) if (d) { seeds.add(d); seeds.add(dirname(d)); seeds.add(dirname(dirname(d))); }
+      for (const it of (hist.items || []).slice(0, 60)) if (it.path) { seeds.add(it.path); seeds.add(dirname(it.path)); }
+      seeds.add(ROOT); seeds.add(dirname(ROOT));
+      const hits = [];
+      for (const seed of seeds) {
+        if (!seed || hits.length >= 8) continue;
+        const cand = join(seed, want);
+        try {
+          const st = await stat(cand);
+          if (!st.isDirectory()) continue;
+          const n = (await readdir(cand)).length;
+          if (wantFiles && Math.abs(n - wantFiles) > Math.max(4, wantFiles * 0.1)) continue;  // name matched, contents did not
+          if (!hits.some((h) => h.path.toLowerCase() === cand.toLowerCase())) hits.push({ path: cand, files: n });
+        } catch { /* not there */ }
+      }
+      if (hits.length === 1) { res.end(JSON.stringify({ path: hits[0].path, files: hits[0].files })); return; }
+      res.end(JSON.stringify({ candidates: hits }));
+    } catch (e) { res.end(JSON.stringify({ error: String((e && e.message) || e) })); }
+    return;
+  }
+
+  // Native OS folder/file picker (Windows), so the user never types a filesystem path.
   //   GET /pick?type=folder|file[&dir=<initial>][&for=<key>][&filter=<ofd filter>]  → { path | null }
   // `for` keys a remembered last-used folder (history.json lastDirs): the dialog reopens there,
   // and a successful pick updates it.
@@ -1170,23 +1792,23 @@ data: ${JSON.stringify(data)}
     return;
   }
 
-  // Pre-warm / start Forge (generative enhance tier) — SSE status, no terminal.
+  // Pre-warm / start Forge (generative enhance tier): SSE status, no terminal.
   if (path === "/forge/start") {
     res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
     const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
-    const ok = await forgeEnsure(send);
-    send(ok ? "done" : "error", ok ? { url: FORGE_URL } : { message: "Forge could not be started" });
+    const r = await forgeEnsure(send);
+    if (r === true) send("done", { url: FORGE_URL }); else sendEnsureFailure(send, r);
     res.end();
     return;
   }
 
   // GUI-triggered local encode (Convert tab). Runs the real encoder CLI on this machine and streams
-  // its progress back as Server-Sent Events — the user never opens a terminal. localhost-only.
+  // its progress back as Server-Sent Events, the user never opens a terminal. localhost-only.
   // coherent=1 (DEFAULT; visual verdict 2026-07-13: "Coherent A by far the best"): a stable-template
   // pre-pass (tools/coherent/coherent-clip.mjs) rewrites the clip into per-GOP shared-topology
   // frames with atlases rebaked into the template's UVs, THEN the normal encoder runs on that
-  // temp frames-dir — same two-stage-inside-one-SSE-stream shape as /convert-4ds. NOT used by
-  // /convert-4ds itself (4DViews topology resets need cross-reset correspondence — future work).
+  // temp frames-dir: same two-stage-inside-one-SSE-stream shape as /convert-4ds. NOT used by
+  // /convert-4ds itself (4DViews topology resets need cross-reset correspondence: future work).
   if (path === "/encode") {
     const q = url.searchParams;
     const dir = q.get("dir") || "";
@@ -1209,7 +1831,7 @@ data: ${JSON.stringify(data)}
     req.on("close", () => { try { child?.kill(); } catch { /* ignore */ } });
     // One stage = one child process whose output relays to the same SSE stream.
     const runStage = (stageArgs) => new Promise((resolve, reject) => {
-      child = spawn(process.execPath, stageArgs, { cwd: ROOT, windowsHide: true });
+      child = spawn(process.execPath, stageArgs, { cwd: ROOT, windowsHide: true, env: toolEnv() });
       child.stdout.on("data", relay);
       child.stderr.on("data", relay);
       child.on("error", reject);
@@ -1218,10 +1840,13 @@ data: ${JSON.stringify(data)}
     (async () => {
       let tmpDir = null;
       try {
+        // The encoder build (rebuilt when its sources are newer) and ffmpeg (texture video, audio)
+        // are installed here, inside this stream, when absent.
+        if (!(await ensureOrEnd(["encoder", "ffmpeg"], send, res))) return;
         let encDir = dir;
         if (coherent) {
           // The runner needs the actual frames dir (it does not descend like the encoder does)
-          // and mesh-fNNNNN.obj + atlas-fNNNNN.png naming — it fails loudly (relayed) otherwise.
+          // and mesh-fNNNNN.obj + atlas-fNNNNN.png naming: it fails loudly (relayed) otherwise.
           const framesSrc = await resolveFramesDir(dir);
           tmpDir = await mkdtemp(join(tmpdir(), "ares-coherent-"));
           const cohFrames = join(tmpDir, "frames");
@@ -1230,12 +1855,12 @@ data: ${JSON.stringify(data)}
           cohPass("gop", "--gop"); cohPass("maxFrames", "--max-frames"); // geometry-GOP length intentionally matches the texture --gop default (30)
           cohPass("bake", "--bake"); // absent → runner default "exact" (the fast bake smears)
           send("start", { dir, out: "/" + outRel, args: "coherent pre-pass → encode", stage: "coherent" });
-          send("log", "[coherent] stable-template pre-pass (registration + atlas rebake) — this is the long stage…");
+          send("log", "[coherent] stable-template pre-pass (registration + atlas rebake): this is the long stage…");
           if (q.get("decimate")) send("log", "[coherent] note: decimate re-collapses each frame independently and can undo the shared topology (frames may fall back to intra)");
           const code = await runStage(cohArgs);
-          if (code !== 0) { send("error", { code, stage: "coherent", message: `coherent pre-pass exited ${code} — see log above` }); res.end(); return; }
+          if (code !== 0) { send("error", { code, stage: "coherent", message: `coherent pre-pass exited ${code}; see log above` }); res.end(); return; }
           encDir = cohFrames;
-          send("log", "[coherent] pre-pass done — encoding coherent frames…");
+          send("log", "[coherent] pre-pass done: encoding coherent frames…");
         }
         // Provenance enrichment: stamp the encoder's <out>.ares.meta.json sidecar with which pipeline
         // produced this clip and (coherent) the resolved registration recipe from the pre-pass manifest.
@@ -1268,7 +1893,7 @@ data: ${JSON.stringify(data)}
           args.push("--audio", audioPath);
           pass("audioOffset", "--audio-offset"); pass("audioBitrate", "--audio-bitrate");
         }
-        if (isSplatDir) send("log", "[encode] splat sequence detected — encoding as the Gaussian splat profile (coherent pre-pass and texture flags do not apply)");
+        if (isSplatDir) send("log", "[encode] splat sequence detected: encoding as the Gaussian splat profile (coherent pre-pass and texture flags do not apply)");
         // editsName → the sidecar saved via POST /edits/<name> (path stays server-side, sanitized).
         const editsName = q.get("editsName");
         if (editsName) args.push("--edits", join(ROOT, "apps", "demo", editsName.replace(/[^a-z0-9._-]/gi, "_") + ".edits.json"));
@@ -1276,7 +1901,7 @@ data: ${JSON.stringify(data)}
         if (!coherent) send("start", { dir, out: "/" + outRel, args: args.slice(1).join(" ") });
         const code = await runStage(args);
         if (code === 0) {
-          // meta records the FULL recipe — the history panel's "⧉ Use settings" re-applies it to
+          // meta records the FULL recipe, the history panel's "⧉ Use settings" re-applies it to
           // another clip's conversion.
           historyAdd({ kind: "encode", path: dir, name: name + ".ares", out: "/" + outRel, meta: {
             codec: q.get("textureCodec") || "vp9", texSize: q.get("texSize") || "", crf: q.get("crf") || "",
@@ -1298,8 +1923,349 @@ data: ${JSON.stringify(data)}
     return;
   }
 
+  // ---- 2D video → 2.5D depth conversion (Convert tab "Video…") ----------------------------------
+  // Ported from VJ-9000's "depthcloud" source (github.com/gantasmo/VJ-9000, src/akvj/depthWorker.ts +
+  // src/useDepthCloud.ts) and turned from a live 8 fps preview into an offline conversion. Two depth
+  // ENGINES write the same run directory (depth.json + depth.f32, contract in docs/depth-2d-to-25d.md):
+  //   service  tools/sam-service/depth.py — Depth-Anything-V2 on CUDA, batched, float output
+  //   browser  apps/demo/depth-worker.js  — the VJ-9000 worker (transformers.js, WebGPU/wasm),
+  //            uploading its maps through POST /depth/upload/* below
+  // and ONE consumer, `ares depth` (packages/encoder/src/cli.ts), meshes + textures + muxes it.
+  //   GET  /probe-video?path=<abs>                 → { width, height, fps, frames, durationS, hasAudio, … }
+  //   GET  /depth/engines                          → which engine can run here, without starting anything
+  //   GET  /depth/source?path=<abs>                → the video bytes, Range-capable (the browser engine's <video>)
+  //   POST /depth/upload/begin | /depth/upload?job=&index=&count= | /depth/upload/finish | /depth/upload/cancel
+  //   GET  /depth-convert?video=&name=&engine=…    → SSE: depth (service) → encode, like /convert-4ds
+  if (path === "/probe-video") {
+    const p = url.searchParams.get("path") || "";
+    res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
+    if (!depthIsVideoPath(p)) { res.end(JSON.stringify({ error: `not a video file: ${p}` })); return; }
+    // A JSON route cannot stream an install, so it names what it lacks: the client runs
+    // /install?ids=<needs> in its own progress UI and repeats this request (apps/demo/ensure.js).
+    if (!ffTools()) { res.end(JSON.stringify({ error: "ffprobe absent", needs: ["ffmpeg"] })); return; }
+    try { res.end(JSON.stringify(await probeVideo(p))); }
+    catch (e) { res.end(JSON.stringify({ error: String((e && e.message) || e) })); }
+    return;
+  }
+
+  if (path === "/depth/engines") {
+    res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
+    // Passive: a health GET never spawns the service (the /sam proxy has the same rule).
+    const h = await samHealth();
+    const depthHealth = h ? (await samJson("GET", "/depth/health"))?.json ?? null : null;
+    res.end(JSON.stringify({
+      service: { env: existsSync(FOURDS_PY), running: !!h, samReady: !!(h && h.ok), depth: depthHealth },
+      browser: true,
+      // Status only. Nothing here gates a job: /depth-convert installs whatever reads false.
+      ffmpeg: !!ffTools(),
+      models: DEPTH_MODELS,
+      encoder: encoderState(ROOT).built,
+      autoInstall: true,
+    }));
+    return;
+  }
+
+  // The browser engine's <video> loads the picked file from here. Range requests are mandatory:
+  // Chrome seeks a media element with byte ranges, and without 206 answers every seek re-downloads
+  // the file from byte 0 and the frame stepping never converges.
+  if (path === "/depth/source") {
+    const p = url.searchParams.get("path") || "";
+    let st = null;
+    try { st = depthIsVideoPath(p) ? await stat(p) : null; } catch { st = null; }
+    if (!st || !st.isFile()) { res.writeHead(404, { ...HEADERS, "Content-Type": "text/plain" }); res.end(`not a video file: ${p}`); return; }
+    await sendFileRange(req, res, p, DEPTH_VIDEO_MIME[extname(p).toLowerCase()] || "application/octet-stream");
+    return;
+  }
+
+  // Browser engine upload. The worker's float32 maps arrive in index order and are appended to
+  // depth.f32 in an OS temp dir; depth.json is rewritten after every batch so a run that dies
+  // mid-way is still a valid (partial) run for the encoder.
+  if (path === "/depth/upload/begin" && req.method === "POST") {
+    let body = ""; req.on("data", (d) => { body += d; if (body.length > 20000) req.destroy(); });
+    await new Promise((r) => req.on("end", r));
+    let b = null; try { b = JSON.parse(body || "{}"); } catch { b = null; }
+    const out = (code, o) => { res.writeHead(code, { ...HEADERS, "Content-Type": "application/json" }); res.end(JSON.stringify(o)); };
+    if (!b || typeof b !== "object") { out(400, { error: "bad JSON" }); return; }
+    const width = Number(b.width), height = Number(b.height);
+    if (!Number.isInteger(width) || !Number.isInteger(height) || width < 1 || height < 1 || width > 4096 || height > 4096) { out(400, { error: "bad width/height" }); return; }
+    if (!depthIsVideoPath(String(b.video || ""))) { out(400, { error: "video must be the picked video's path" }); return; }
+    try {
+      const dir = await mkdtemp(join(tmpdir(), "ares-depth-"));
+      const job = depthJobId();
+      const meta = {
+        schema: "ares-depth/1", engine: "browser",
+        model: String(b.model || "onnx-community/depth-anything-v2-small").slice(0, 120),
+        modelKey: DEPTH_MODELS.includes(b.modelKey) ? b.modelKey : "small",
+        kind: String(b.modelKey || "").startsWith("metric") ? "metric-depth" : "relative-disparity",
+        width, height, frames: 0,
+        fps: Number(b.fps) > 0 ? Number(b.fps) : (Number(b.sourceFps) > 0 ? Number(b.sourceFps) : 30),
+        sampling: { fps: Number(b.sampling?.fps) > 0 ? Number(b.sampling.fps) : null, maxFrames: Number.isInteger(b.sampling?.maxFrames) ? b.sampling.maxFrames : null },
+        video: String(b.video),
+        sourceFps: Number(b.sourceFps) > 0 ? Number(b.sourceFps) : null,
+        sourceWidth: Number.isInteger(b.sourceWidth) ? b.sourceWidth : null,
+        sourceHeight: Number.isInteger(b.sourceHeight) ? b.sourceHeight : null,
+        sourceFrames: Number.isInteger(b.sourceFrames) ? b.sourceFrames : null,
+        sourceDurationS: Number(b.sourceDurationS) > 0 ? Number(b.sourceDurationS) : null,
+        msPerFrame: null, device: String(b.device || "webgpu").slice(0, 16), dtype: String(b.dtype || "fp16").slice(0, 8),
+        done: false,
+      };
+      const fh = await open(join(dir, "depth.f32"), "w");
+      const run = { job, dir, meta, fh, bytesPerFrame: width * height * 4, createdAt: Date.now(), busy: false };
+      DEPTH_RUNS.set(job, run);
+      await writeFile(join(dir, "depth.json"), JSON.stringify(meta, null, 1));
+      out(200, { job, dir });
+    } catch (e) { out(500, { error: String((e && e.message) || e) }); }
+    return;
+  }
+
+  if (path === "/depth/upload" && req.method === "POST") {
+    const out = (code, o) => { res.writeHead(code, { ...HEADERS, "Content-Type": "application/json" }); res.end(JSON.stringify(o)); };
+    const run = DEPTH_RUNS.get(url.searchParams.get("job") || "");
+    const index = Number(url.searchParams.get("index")), count = Number(url.searchParams.get("count") || 1);
+    if (!run || !run.fh) { out(404, { error: "unknown or finished upload job" }); req.destroy(); return; }
+    if (run.busy) { out(409, { error: "one upload at a time per job" }); req.destroy(); return; }
+    if (!Number.isInteger(index) || index !== run.meta.frames) { out(409, { error: `expected index ${run.meta.frames}, got ${index}` }); req.destroy(); return; }
+    if (!Number.isInteger(count) || count < 1 || count > 64) { out(400, { error: "count must be 1..64" }); req.destroy(); return; }
+    const want = count * run.bytesPerFrame;
+    run.busy = true;
+    // Every write lands at an explicit offset from the committed frame count: the handle's own
+    // position is never trusted, so a rejected body (truncated below) cannot leave a hole in front
+    // of the next good frame.
+    const committed = run.meta.frames * run.bytesPerFrame;
+    let got = 0, over = false;
+    try {
+      for await (const chunk of req) {
+        if (got + chunk.length > want) { over = true; break; }
+        await run.fh.write(chunk, 0, chunk.length, committed + got);
+        got += chunk.length;
+      }
+      if (over || got !== want) {
+        // A short or long body would desynchronise every later frame: rewind to the last good frame.
+        await run.fh.truncate(committed);
+        out(400, { error: `expected ${want} bytes for ${count} frame(s), got ${over ? "more" : got}` });
+        if (over) req.destroy();
+        return;
+      }
+      run.meta.frames += count;
+      await writeFile(join(run.dir, "depth.json"), JSON.stringify(run.meta, null, 1));
+      out(200, { ok: true, frames: run.meta.frames });
+    } catch (e) { out(500, { error: String((e && e.message) || e) }); }
+    finally { run.busy = false; }
+    return;
+  }
+
+  if ((path === "/depth/upload/finish" || path === "/depth/upload/cancel") && req.method === "POST") {
+    let body = ""; req.on("data", (d) => { body += d; if (body.length > 10000) req.destroy(); });
+    await new Promise((r) => req.on("end", r));
+    let b = {}; try { b = JSON.parse(body || "{}"); } catch { b = {}; }
+    const out = (code, o) => { res.writeHead(code, { ...HEADERS, "Content-Type": "application/json" }); res.end(JSON.stringify(o)); };
+    const run = DEPTH_RUNS.get(String(b.job || ""));
+    if (!run) { out(404, { error: "unknown upload job" }); return; }
+    try {
+      if (run.fh) { await run.fh.close(); run.fh = null; }
+      if (path === "/depth/upload/cancel") {
+        DEPTH_RUNS.delete(run.job);
+        await rm(run.dir, { recursive: true, force: true }).catch(() => {});
+        out(200, { ok: true });
+        return;
+      }
+      run.meta.done = true;
+      run.meta.msPerFrame = Number(b.msPerFrame) > 0 ? Number(b.msPerFrame) : null;
+      await writeFile(join(run.dir, "depth.json"), JSON.stringify(run.meta, null, 1));
+      out(200, { ok: true, dir: run.dir, frames: run.meta.frames });
+    } catch (e) { out(500, { error: String((e && e.message) || e) }); }
+    return;
+  }
+
+  if (path === "/depth-convert") {
+    const q = url.searchParams;
+    const video = q.get("video") || "";
+    const rawName = q.get("name") || "";
+    const engine = q.get("engine") === "browser" ? "browser" : "service";
+    const model = q.get("model") || "base";
+    const bad = (msg) => { res.writeHead(400, { ...HEADERS, "Content-Type": "text/plain" }); res.end(msg); };
+    if (!depthIsVideoPath(video)) { bad(`not a video file: ${video}`); return; }
+    if (!/^[a-z0-9_-]+$/i.test(rawName)) { bad(`bad output name (letters/digits/-/_ only): "${rawName}"`); return; }
+    if (!DEPTH_MODELS.includes(model)) { bad(`unknown model "${model}"`); return; }
+    // Every numeric knob is validated up front; a present-but-invalid value refuses the job instead
+    // of silently encoding with some other setting (the /convert-4ds rule).
+    const num = (name, min, max, int = false) => {
+      const raw = q.get(name);
+      if (raw == null || raw === "") return null;
+      const n = Number(raw);
+      if (!Number.isFinite(n) || n < min || n > max || (int && !Number.isInteger(n))) throw new Error(`bad ${name} (${int ? "integer " : ""}${min}-${max}): "${raw}"`);
+      return n;
+    };
+    let knobs;
+    try {
+      knobs = {
+        fps: num("fps", 0.1, 240), maxFrames: num("maxFrames", 1, 100000, true), inferWidth: num("inferWidth", 112, 1400, true),
+        grid: num("grid", 16, 1024, true), fov: num("fov", 10, 150), near: num("near", 0.01, 1000), far: num("far", 0.02, 10000),
+        edge: num("edge", 0, 10), stabilize: num("stabilize", 0, 1), texSize: num("texSize", 64, 4096, true), crf: num("crf", 0, 63, true),
+        gop: num("gop", 1, 600, true), smoothTemporal: num("smoothTemporal", 0, 30, true),
+        decimate: num("decimate", 0.01, 1), inpaintBand: num("inpaintBand", 1, 4096, true), guideSigma: num("guideSigma", 0.5, 255),
+      };
+    } catch (e) { bad(e.message); return; }
+    const textureCodec = q.get("textureCodec") || "vp9";
+    if (!["vp9", "av1"].includes(textureCodec)) { bad(`bad textureCodec: "${textureCodec}"`); return; }
+    const center = q.get("center") || "";
+    if (center && !["bottom", "mass", "none"].includes(center)) { bad(`bad center: "${center}"`); return; }
+    const sheets = q.get("sheets") === "1", inpaint = q.get("inpaint") === "1", guided = q.get("noGuided") !== "1", snapRamps = q.get("snapRamps") === "1";
+    // Letterbox crop: the encoder detects it by default; "none" keeps the full frame.
+    const crop = q.get("crop") || "auto";
+    if (crop !== "auto" && crop !== "none" && !/^\d+:\d+:\d+:\d+$/.test(crop)) { bad(`bad crop (auto, none or W:H:X:Y): "${crop}"`); return; }
+    // The encoder refuses the pair; refusing here keeps a run from spending its depth pass first.
+    if (sheets && knobs.decimate != null && knobs.decimate < 1) { bad("decimate re-triangulates every frame and sheets keeps one topology: use one or the other"); return; }
+    // A text prompt for SAM 3; the service runs the mask pass before depth.
+    const subject = (q.get("subject") || "").trim();
+    if (subject.length > 200 || /[\x00-\x1f]/.test(subject)) { bad("bad subject: at most 200 printable characters"); return; }
+    if (subject && engine !== "service") { bad("subject masks run on the service engine only"); return; }
+    const encoderCli = join(ROOT, "packages", "encoder", "dist", "cli.js");
+    let upload = null;
+    if (engine === "browser") {
+      upload = DEPTH_RUNS.get(q.get("depthJob") || "");
+      if (!upload || !upload.meta.done || !upload.meta.frames) { bad("engine=browser needs a finished /depth/upload job (depthJob=)"); return; }
+    }
+    // Everything this job runs on, installed inside the stream below when absent: the encoder
+    // build and ffmpeg always; for the service engine the Python environment plus the weights of
+    // the chosen model, and SAM 3 when a `subject` prompt asks for a subject mask.
+    const jobComponents = ["encoder", "ffmpeg", ...(engine === "service" ? ["python-env", ...depthComponents(model, subject)] : [])];
+
+    const name = await versionedOutName(join(ROOT, "apps", "demo"), rawName); // auto -vN, never overwrite
+    const outRel = `apps/demo/${name}.ares`;
+    const outAbs = join(ROOT, outRel);
+
+    res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
+    const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
+    let closed = false, child = null, runDir = null, serviceJob = null;
+    req.on("close", () => {
+      closed = true;
+      try { if (child) child.kill(); } catch { /* ignore */ }
+      if (serviceJob) samJson("POST", "/depth/cancel", { job: serviceJob }).catch(() => {});
+    });
+    const t0 = Date.now();
+    try {
+      send("start", { video, name, out: "/" + outRel, engine, model });
+      if (!(await ensureOrEnd(jobComponents, send, res))) return;
+      if (engine === "browser") {
+        runDir = upload.dir;
+        DEPTH_RUNS.delete(upload.job);   // the convert owns the dir from here (removed in finally)
+        send("log", `[server] browser engine: ${upload.meta.frames} depth frames ${upload.meta.width}x${upload.meta.height} (${upload.meta.model}, ${upload.meta.device} ${upload.meta.dtype}${upload.meta.msPerFrame ? `, ${upload.meta.msPerFrame.toFixed(1)} ms/frame` : ""})`);
+      } else {
+        // --- depth phase on the GPU service: start it if needed, submit, poll status → progress.
+        const svc = await samEnsure(send, { purpose: subject ? "sam" : "depth" });
+        if (svc !== true) { sendEnsureFailure(send, svc); res.end(); return; }
+        if (closed) return;
+        runDir = await mkdtemp(join(tmpdir(), "ares-depth-"));
+        const submit = await samJson("POST", "/depth/run", {
+          video, out: runDir, model, fps: knobs.fps, maxFrames: knobs.maxFrames, inferWidth: knobs.inferWidth ?? 518, batch: 8, ffmpeg: ffTools()?.ffmpeg ?? null,
+          subject: subject || null,
+        }, 20000);
+        if (!submit || !submit.json || !submit.json.job) {
+          const why = submit ? (submit.json?.error || submit.json?.detail || submit.text || submit.status) : "no answer";
+          throw new Error(`depth service refused the job: ${typeof why === "string" ? why : JSON.stringify(why)}`);
+        }
+        serviceJob = submit.json.job;
+        send("log", `[server] depth job ${serviceJob}: ${model}${subject ? `, subject mask "${subject}"` : ""} on the service (${basename(video)})`);
+        let lastLogCount = 0, misses = 0, lastState = "";
+        for (;;) {
+          await new Promise((r) => setTimeout(r, 700));
+          if (closed) return;
+          const st = await samJson("GET", `/depth/status?job=${encodeURIComponent(serviceJob)}`);
+          if (!st || !st.json) { if (++misses >= 6) throw new Error("depth service stopped answering"); continue; }
+          misses = 0;
+          const s = st.json;
+          const lines = Array.isArray(s.log) ? s.log : [];
+          // The service keeps a rolling tail; forward only what is new (the tail is at most 20 lines,
+          // so a burst longer than that loses lines: the status numbers below never do).
+          if (lines.length >= lastLogCount) for (const l of lines.slice(lastLogCount)) send("log", `[depth] ${l}`);
+          else for (const l of lines) send("log", `[depth] ${l}`);
+          lastLogCount = lines.length;
+          if (s.state !== lastState) { lastState = s.state; send("log", `[server] depth: ${s.state}${s.state === "loading" ? " (model load/download)" : ""}`); }
+          // A subject run has a mask pass before the depth pass; each reports its own counters.
+          const ph = s.phase === "mask" && s.phases?.mask ? s.phases.mask : null;
+          send("progress", ph
+            ? { stage: "mask", frame: ph.done || 0, of: ph.total || null, msPerFrame: ph.msPerFrame ?? null, state: s.state }
+            : { stage: "depth", frame: s.done || 0, of: s.total || null, msPerFrame: s.msPerFrame ?? null, state: s.state });
+          if (s.state === "done") break;
+          if (s.state === "error") throw new Error(`depth failed: ${s.error || "unknown error"}`);
+          if (s.state === "cancelled") throw new Error("depth cancelled");
+        }
+        serviceJob = null;
+      }
+      if (closed) return;
+
+      // --- encode phase: the encoder CLI meshes the run, extracts the texture frames from the
+      // video with the same sampling, muxes, and writes the provenance sidecar.
+      let metaExtraArgs = [];
+      try {
+        const mePath = join(tmpdir(), `ares-meta-extra-${Date.now()}.json`);
+        await writeFile(mePath, JSON.stringify({ pipeline: "depth", source: { video }, request: { engine, model, ...knobs, textureCodec, center: center || null, sheets, inpaint, guided, snapRamps, crop, subject: subject || null } }));
+        metaExtraArgs = ["--meta-extra-file", mePath];
+      } catch { /* best-effort provenance */ }
+      const args = [encoderCli, "depth", video, "--depth", runDir, "-o", outAbs, "--texture-codec", textureCodec, ...metaExtraArgs];
+      const passK = (k, f) => { if (knobs[k] != null) args.push(f, String(knobs[k])); };
+      passK("grid", "--grid"); passK("fov", "--fov"); passK("near", "--near"); passK("far", "--far"); passK("edge", "--edge");
+      passK("stabilize", "--stabilize"); passK("texSize", "--tex-size"); passK("crf", "--crf"); passK("gop", "--gop"); passK("smoothTemporal", "--smooth-temporal");
+      if (knobs.decimate != null && knobs.decimate < 1) passK("decimate", "--decimate");
+      if (inpaint) { args.push("--inpaint"); passK("inpaintBand", "--inpaint-band"); }
+      if (!guided) args.push("--no-guided");
+      else passK("guideSigma", "--guide-sigma");
+      if (snapRamps) args.push("--snap-ramps");
+      if (crop !== "auto") args.push("--crop", crop);
+      if (sheets) args.push("--sheets");
+      if (q.get("noAudio") === "1") args.push("--no-audio");
+      if (q.get("noTexture") === "1") args.push("--no-texture");
+      if (center) args.push("--center", center);
+      send("log", `[server] encode: ares ${args.slice(1).map((a) => (/\s/.test(a) ? JSON.stringify(a) : a)).join(" ")}`);
+      send("progress", { stage: "encode" });
+      await new Promise((resolve, reject) => {
+        const c = spawn(process.execPath, args, { cwd: ROOT, windowsHide: true, env: toolEnv() });
+        child = c;
+        let buf = "";
+        const onData = (d) => {
+          buf += d;
+          const lines = buf.split(/\r?\n/);
+          buf = lines.pop() ?? "";
+          for (const l of lines) {
+            if (!l.trim()) continue;
+            const m = /^\[ares\] progress (\w+) (\d+)\/(\d+)/.exec(l);
+            if (m) { send("progress", { stage: m[1], frame: Number(m[2]), of: Number(m[3]) }); continue; }
+            send("log", l);
+          }
+        };
+        c.stdout.on("data", onData);
+        c.stderr.on("data", onData);
+        c.on("error", reject);
+        c.on("close", (code) => { child = null; if (buf.trim()) send("log", buf); code === 0 ? resolve() : reject(new Error(`encoder exited ${code}`)); });
+      });
+      if (closed) return;
+
+      let frames = null, fps = null;
+      try { const m = JSON.parse(await readFile(outAbs + ".meta.json", "utf8")); frames = m.output?.frames ?? null; fps = m.output?.fps ?? null; } catch { /* sidecar optional */ }
+      historyAdd({
+        kind: "encode", path: video, name: name + ".ares", out: "/" + outRel,
+        meta: { source: "depth", engine, model, codec: textureCodec, texSize: String(knobs.texSize ?? 1024), crf: String(knobs.crf ?? 30), frames, fps,
+          grid: knobs.grid ?? 256, fov: knobs.fov ?? 55, near: knobs.near ?? "", far: knobs.far ?? "", edge: knobs.edge ?? 0.08, sheets: sheets ? "1" : "",
+          stabilize: knobs.stabilize ?? 0.7, maxFrames: knobs.maxFrames ?? "", sampleFps: knobs.fps ?? "", inferWidth: knobs.inferWidth ?? 518,
+          subject, decimate: knobs.decimate ?? "", inpaint: inpaint ? "1" : "", inpaintBand: knobs.inpaintBand ?? "", guided: guided ? "1" : "0",
+          snapRamps: snapRamps ? "1" : "", crop },
+      });
+      send("done", { out: "/" + outRel, frames, fps, seconds: +((Date.now() - t0) / 1000).toFixed(1) });
+    } catch (e) {
+      send("error", { message: String((e && e.message) || e) });
+    } finally {
+      // The run dir holds frames×W×H×4 bytes of float maps: always reclaimed, success or failure,
+      // unless keepRun=1 asked for it (debugging the contract between the engines and the CLI).
+      if (runDir && q.get("keepRun") !== "1") { try { await rm(runDir, { recursive: true, force: true }); } catch { /* best-effort */ } }
+      else if (runDir) send("log", `[server] kept depth run: ${runDir}`);
+    }
+    res.end();
+    return;
+  }
+
   // 4DViews .4ds codec info (Task I). GET /probe-4ds?path=<abs .4ds> → decode_4ds.py --info's
-  // JSON {nbFrames, framerate, maxVertices, maxTriangles, textureSize, textureEncoding} — no
+  // JSON {nbFrames, framerate, maxVertices, maxTriangles, textureSize, textureEncoding}, no
   // decode, just a CreateSequence + query. Richer than the browser's byte-level structural probe
   // (probe.js) because it comes straight from the codec. Used by the Convert tab to size the
   // max-frames default and gate the Convert button before any decode work starts.
@@ -1308,10 +2274,12 @@ data: ${JSON.stringify(data)}
     let ok = false;
     try { ok = !!p && /\.4ds$/i.test(p) && statSync(p).isFile(); } catch { ok = false; }
     if (!ok) { res.writeHead(400, { ...HEADERS, "Content-Type": "application/json" }); res.end(JSON.stringify({ error: `not a .4ds file: ${p}` })); return; }
-    const missing = fourdsMissing();
-    if (missing.length) {
-      res.writeHead(503, { ...HEADERS, "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "4DViews codec unavailable", missing }));
+    // Not an error to read: `needs` is installed by the client through /install and `needsFile`
+    // is collected with the file dialog, then this request is repeated (apps/demo/ensure.js).
+    const lack = fourdsNeeds();
+    if (lack.needs.length || lack.needsFile) {
+      res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: lack.needsFile ? "4DViews codec DLL not located" : "Python environment absent", ...lack }));
       return;
     }
     try {
@@ -1329,7 +2297,7 @@ data: ${JSON.stringify(data)}
   // /enhance above (EventSource can't POST, so this follows their query-string convention rather
   // than the JSON-body shape sketched in the task brief). Pipeline: decode_4ds.py writes a
   // per-frame OBJ+PNG frames-dir into a fresh OS-temp directory, then the real encoder CLI bakes
-  // that dir into apps/demo/<name>.ares — the same two tools Task H already verified standalone,
+  // that dir into apps/demo/<name>.ares, the same two tools Task H already verified standalone,
   // just chained and streamed. The temp frames dir is ALWAYS removed in a finally, mirroring
   // cli.ts's own scratch-atlas-dir cleanup (`.finally(() => cleanupTexDir?.())`), success or fail.
   if (path === "/convert-4ds") {
@@ -1340,7 +2308,7 @@ data: ${JSON.stringify(data)}
     const mirrorX = q.get("mirrorX") === "1";
 
     // Optional codec-quality overrides (Task J fix 3). Default for .4ds converts is now the
-    // SOURCE atlas's NATIVE texture size (not a hardcoded 1024) and crf 28 (not 32) — measured:
+    // SOURCE atlas's NATIVE texture size (not a hardcoded 1024) and crf 28 (not 32): measured:
     // native size + crf28 cuts end-to-end UV-seam MAE from 8.14 to 5.75 (-29%) for +5% file size,
     // vs downscaling to 1024 which concentrates lanczos error on the seams before the codec even
     // runs. Query params are validated integers; a present-but-invalid value 400s rather than
@@ -1369,13 +2337,11 @@ data: ${JSON.stringify(data)}
     try { srcOk = !!srcPath && /\.4ds$/i.test(srcPath) && statSync(srcPath).isFile(); } catch { srcOk = false; }
     if (!srcOk) { res.writeHead(400, { ...HEADERS, "Content-Type": "text/plain" }); res.end(`not a .4ds file: ${srcPath}`); return; }
     if (!/^[a-z0-9_-]+$/i.test(rawName)) { res.writeHead(400, { ...HEADERS, "Content-Type": "text/plain" }); res.end(`bad output name (letters/digits/-/_ only): "${rawName}"`); return; }
-    const missing = fourdsMissing();
-    if (missing.length) { res.writeHead(503, { ...HEADERS, "Content-Type": "text/plain" }); res.end("4DViews codec unavailable: " + missing.join("; ")); return; }
     const encoderCli = join(ROOT, "packages", "encoder", "dist", "cli.js");
-    if (!existsSync(encoderCli)) { res.writeHead(503, { ...HEADERS, "Content-Type": "text/plain" }); res.end("encoder not built — run npx tsc -b in ares/ first"); return; }
 
     const name = await versionedOutName(join(ROOT, "apps", "demo"), rawName); // auto -vN, never overwrite
     const outRel = `apps/demo/${name}.ares`;
+    const outAbs = join(ROOT, outRel);   // was undeclared: every .4ds convert died at the encode stage with "outAbs is not defined"
 
     res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
     const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
@@ -1383,17 +2349,22 @@ data: ${JSON.stringify(data)}
     req.on("close", () => { closed = true; try { if (child) child.kill(); } catch { /* ignore */ } });
 
     try {
+      send("start", { path: srcPath, name, out: "/" + outRel, maxFrames: maxFramesArg || null, mirrorX });
+      if (!(await ensureOrEnd(["python-env", "encoder", "ffmpeg"], send, res))) return;
+      // The codec DLL is licensed and cannot be fetched: the client collects it with a file dialog
+      // (needsFile) and re-issues this request. /probe-4ds asks first, so this is the backstop.
+      const lack = fourdsNeeds();
+      if (lack.needsFile) { send("error", { message: "4DViews codec DLL not located", stage: "setup", needsFile: lack.needsFile }); res.end(); return; }
       tmpDir = await mkdtemp(join(tmpdir(), "ares-4ds-"));
-      send("start", { path: srcPath, name, out: "/" + outRel, maxFrames: maxFramesArg || null, mirrorX, tmp: tmpDir });
 
-      // --- decode phase: decode_4ds.py prints "[decode_4ds] N/M frames (...)" progress lines —
+      // --- decode phase: decode_4ds.py prints "[decode_4ds] N/M frames (...)" progress lines:
       // forward every line as a log event and pull frame/of out of the matching ones as progress.
       const decodeArgs = [FOURDS_SCRIPT, srcPath, "-o", tmpDir];
       if (maxFramesArg) decodeArgs.push("--max-frames", maxFramesArg);
       if (mirrorX) decodeArgs.push("--mirror-x");
-      send("log", `[server] decoding (this can take a while — ~2 fps): ${basename(FOURDS_PY)} decode_4ds.py ${basename(srcPath)} -o <tmp>${maxFramesArg ? " --max-frames " + maxFramesArg : ""}${mirrorX ? " --mirror-x" : ""}`);
+      send("log", `[server] decoding (this can take a while: ~2 fps): ${basename(FOURDS_PY)} decode_4ds.py ${basename(srcPath)} -o <tmp>${maxFramesArg ? " --max-frames " + maxFramesArg : ""}${mirrorX ? " --mirror-x" : ""}`);
       await new Promise((resolve, reject) => {
-        const c = spawn(FOURDS_PY, decodeArgs, { windowsHide: true });
+        const c = spawn(FOURDS_PY, decodeArgs, { windowsHide: true, env: toolEnv() });
         child = c;
         let buf = "";
         const onData = (d) => {
@@ -1414,7 +2385,7 @@ data: ${JSON.stringify(data)}
       });
       if (closed) return;
 
-      // fps for the bake comes from the codec itself (manifest.json), rounded to an integer —
+      // fps for the bake comes from the codec itself (manifest.json), rounded to an integer:
       // more reliable than trusting the .4ds probe's float fps for --fps. Same manifest also
       // reports the SOURCE atlas's native textureSize, the new default (fix 3) absent an explicit
       // texSize= override.
@@ -1427,14 +2398,14 @@ data: ${JSON.stringify(data)}
       } catch { /* keep default fps=30 if the manifest is somehow unreadable */ }
       const texSize = texSizeReq.value ?? nativeTexSize ?? 1024;
       const crf = crfReq.value ?? 28;
-      send("log", `[server] decode complete — ${framesDecoded ?? "?"} frame(s); encoding at ${fps}fps, ${texSize}px crf${crf}…`);
+      send("log", `[server] decode complete: ${framesDecoded ?? "?"} frame(s); encoding at ${fps}fps, ${texSize}px crf${crf}…`);
       send("progress", { stage: "encode" });
 
       // --- encode phase: the same encoder CLI /encode already spawns; .4ds converts now default
       // to native texture size + crf 28 (fix 3) instead of the encoder's own generic 1024/crf32.
       const encodeArgs = [encoderCli, "encode", tmpDir, "-o", outAbs, "--fps", String(fps), "--tex-size", String(texSize), "--crf", String(crf)];
       await new Promise((resolve, reject) => {
-        const c = spawn(process.execPath, encodeArgs, { cwd: ROOT, windowsHide: true });
+        const c = spawn(process.execPath, encodeArgs, { cwd: ROOT, windowsHide: true, env: toolEnv() });
         child = c;
         const relay = (d) => String(d).split(/\r?\n/).forEach((l) => l.trim() && send("log", l));
         c.stdout.on("data", relay);
@@ -1452,7 +2423,7 @@ data: ${JSON.stringify(data)}
     } catch (e) {
       send("error", { message: String((e && e.message) || e) });
     } finally {
-      // Always reclaim the temp frames dir — success or failure — same discipline as cli.ts's
+      // Always reclaim the temp frames dir: success or failure; same discipline as cli.ts's
       // scratch atlas-dir cleanup. A full-length decode can be gigabytes of OBJ+PNG.
       if (tmpDir) { try { await rm(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ } }
     }
@@ -1462,10 +2433,10 @@ data: ${JSON.stringify(data)}
 
   // GUI-triggered generative texture enhance (Convert tab).
   // Streams SSE progress (mirroring /encode) while each atlas-*.png is POSTed to a local SD-Forge
-  // instance. tier "resrgan": extras API — upscaler_2 (R-ESRGAN 4x+) blended over upscaler_1
+  // instance. tier "resrgan": extras API; upscaler_2 (R-ESRGAN 4x+) blended over upscaler_1
   // (Lanczos) at `strength` via extras_upscaler_2_visibility, so the strength dial runs inside
   // Forge (parameter names verified against Forge's modules/api/models.py, ExtrasBaseRequest).
-  // tier "sd": script-less img2img at source resolution, denoise = strength*0.5 (hero frames —
+  // tier "sd": script-less img2img at source resolution, denoise = strength*0.5 (hero frames:
   // minutes/frame). Output goes to a SIBLING folder that /encode can consume directly.
   if (path === "/enhance") {
     const q = url.searchParams;
@@ -1473,9 +2444,23 @@ data: ${JSON.stringify(data)}
     let ok = false;
     try { ok = !!dir && statSync(dir).isDirectory(); } catch { ok = false; }
     if (!ok) { res.writeHead(400, { ...HEADERS, "Content-Type": "text/plain" }); res.end(`not a directory: ${dir}`); return; }
-    // tiers: "ncnn" = standalone Real-ESRGAN (no server, default) · "sd" = Forge img2img (generative).
-    // Legacy tier names (resrgan/forge) fold into the no-server ncnn path.
-    const tier = q.get("tier") === "sd" ? "sd" : "ncnn";
+    // Tiers, fastest first:
+    //   "fast"    CUDA batch worker, compact general net   ~0.7 s/frame   (default)
+    //   "quality" CUDA batch worker, x4plus                ~12 s/frame
+    //   "ncnn"    vendored ncnn-vulkan, no Python env      ~22 s/frame    (portable fallback)
+    //   "sd"      Forge img2img, generative                 minutes/frame
+    // Legacy names (resrgan/forge) fold into ncnn, which is what they used to mean.
+    const tierIn = q.get("tier") || "fast";
+    // An unknown tier is an error, never a silent downgrade: the old handler folded everything
+    // it did not recognise into ncnn, which turned a 2 s/frame request into 22 s/frame with no
+    // indication that it had happened.
+    const LEGACY_TIERS = { resrgan: "ncnn", forge: "ncnn" };
+    const tier = ["fast", "quality", "ncnn", "sd"].includes(tierIn) ? tierIn : LEGACY_TIERS[tierIn];
+    if (!tier) {
+      res.writeHead(400, { ...HEADERS, "Content-Type": "text/plain" });
+      res.end(`unknown tier: ${tierIn}`); return;
+    }
+    const cudaTier = tier === "fast" || tier === "quality";
     const strength = Math.min(1, Math.max(0, Number(q.get("strength") ?? 1) || 0));
     const scale = Math.min(4, Math.max(1, Number(q.get("scale") ?? 2) || 2));
     const model = /anime/i.test(q.get("model") || "") ? "realesrgan-x4plus-anime" : "realesrgan-x4plus";
@@ -1507,7 +2492,7 @@ data: ${JSON.stringify(data)}
           all = (await readdir(srcDir)).sort();
           atlases = atlasesIn(all);
         } else if (hits.length > 1) {
-          send("error", { message: `multiple subfolders under ${dir} contain atlas-*.png — point enhance at the specific frames folder`, hint: hits.map((p) => basename(p)).join(", ") });
+          send("error", { message: `multiple subfolders under ${dir} contain atlas-*.png: point enhance at the specific frames folder`, hint: hits.map((p) => basename(p)).join(", ") });
           res.end(); return;
         }
       }
@@ -1518,22 +2503,83 @@ data: ${JSON.stringify(data)}
       await mkdir(outDir, { recursive: true });
       // Make the out folder a drop-in /encode source: hard-link (same volume — it's a sibling;
       // copy as fallback) the meshes and any atlas frames beyond maxFrames.
+      // A carry failure used to be swallowed, which produced an output folder that LOOKED fine
+      // and silently had no meshes in it — /encode then reported "no frames" about a folder the
+      // user had just watched succeed. Count the failures and say so.
+      const carryFailed = [];
       const carry = async (f) => {
-        try { await link(join(srcDir, f), join(outDir, f)); }
-        catch (e) { if (e.code !== "EEXIST") { try { await copyFile(join(srcDir, f), join(outDir, f)); } catch { /* ignore */ } } }
+        try { await link(join(srcDir, f), join(outDir, f)); return; }
+        catch (e) { if (e.code === "EEXIST") return; }
+        try { await copyFile(join(srcDir, f), join(outDir, f)); }
+        catch (e) { carryFailed.push({ f, code: e.code || "?" }); }
       };
-      for (const f of all) if (!/\.png$/i.test(f)) await carry(f);
-      for (const f of atlases.slice(todo.length)) await carry(f);
-      send("start", { dir: srcDir, out: outDir, frames: todo.length, of: atlases.length, tier, strength, scale, via: tier === "sd" ? "SD img2img (Forge)" : "Real-ESRGAN (ncnn, no server)" });
+      const carryAll = async () => {
+        carryFailed.length = 0;
+        for (const f of all) if (!/\.png$/i.test(f)) await carry(f);
+        for (const f of atlases.slice(todo.length)) await carry(f);
+      };
+      await carryAll();
+      if (carryFailed.some((c) => c.code === "EPERM" || c.code === "EACCES")) {
+        // The source files deny read access to this account. Granting it needs elevation, so
+        // Windows shows its consent dialog once; the grant is read-only and scoped to this folder.
+        send("log", `[setup] ${carryFailed.length} source file(s) deny read access: requesting elevation to grant read access on ${srcDir}`);
+        const code = await grantReadAccess(srcDir);
+        send("log", code === 0 ? "[setup] read access granted" : code === 1223 ? "[setup] elevation declined" : `[setup] access grant exit ${code}`);
+        if (code === 0) await carryAll();
+      }
+      if (carryFailed.length) {
+        const codes = [...new Set(carryFailed.map((c) => c.code))].join(", ");
+        send("error", {
+          message: `could not copy ${carryFailed.length} source file(s) into ${basename(outDir)} (${codes})`,
+          hint: codes.includes("EPERM")
+            ? `${basename(carryFailed[0].f)}: read access denied and the elevated access grant did not complete`
+            : "the output folder would have no meshes, so /encode could not use it",
+        });
+        res.end(); return;
+      }
+      const via = tier === "sd" ? "SD img2img (Forge)"
+        : cudaTier ? SR_TIERS[tier].label
+        : "Real-ESRGAN x4plus (ncnn-vulkan, no Python)";
+      send("start", { dir: srcDir, out: outDir, frames: todo.length, of: atlases.length, tier, strength, scale, via });
 
-      // Tier prechecks: sd auto-launches Forge; ncnn just needs the vendored binary present.
+      // Tier prerequisites are installed here when absent (ENHANCE_COMPONENTS): the CUDA tiers
+      // run on the venv plus one weight file, ncnn on the vendored binary plus ffmpeg for the
+      // resample, sd on Forge, which forgeEnsure also starts.
+      const ENV_PY = installPaths(ROOT).envPy;
       if (tier === "sd") {
-        if (!(await forgeEnsure(send))) { send("error", { message: "Forge unavailable for the generative tier", hint: "use the Fast (Real-ESRGAN) tier — it needs no server — or set FORGE_ROOT to your webui_forge install" }); res.end(); return; }
-      } else if (!existsSync(REALESRGAN_EXE)) {
-        send("error", { message: "Real-ESRGAN upscaler missing", hint: "expected tools/bin/realesrgan-ncnn-vulkan/realesrgan-ncnn-vulkan.exe (re-run the vendor step)" }); res.end(); return;
+        const f = await forgeEnsure(send);
+        if (f !== true) { sendEnsureFailure(send, f); res.end(); return; }
+      } else if (!(await ensureOrEnd(ENHANCE_COMPONENTS[tier], send, res))) return;
+      const FFMPEG = ffTools()?.ffmpeg;
+
+      // ---- CUDA tiers: one worker for the whole folder ---------------------------------
+      // The worker does the resample and the strength blend on the GPU, so there is no 4x
+      // intermediate PNG on disk and no second ffmpeg decode per frame.
+      if (cudaTier) {
+        const tW = Date.now();
+        let doneN = 0, workerErr = null;
+        const args = [SR_WORKER, "--src", srcDir, "--out", outDir,
+          "--model", SR_TIERS[tier].ckpt, "--scale", String(scale), "--strength", String(strength),
+          "--tile", process.env.SR_TILE || "1024"];
+        if (Number.isFinite(maxFrames)) args.push("--max-frames", String(maxFrames));
+        const code = await runProcLines(ENV_PY, args, { cwd: ROOT, env: toolEnv() }, (c) => { child = c; }, (line) => {
+          const m = /^PROGRESS (\d+) (\d+) (\S+) (\d+)$/.exec(line);
+          if (m) { doneN = Number(m[1]); send("progress", { frame: doneN, of: Number(m[2]), file: m[3], ms: Number(m[4]) }); return; }
+          if (line.startsWith("LOAD ")) { send("log", line); return; }
+          if (line.startsWith("ERROR ")) { workerErr = line.slice(6); return; }
+          if (!line.startsWith("DONE ")) send("log", line);
+        });
+        child = null;
+        if (closed) return;
+        if (code !== 0 || workerErr) { send("error", { message: workerErr || `upscale worker exited ${code}` }); res.end(); return; }
+        historyAdd({ kind: "enhance", path: srcDir, name: basename(outDir), out: outDir, meta: { frames: doneN, tier, strength, scale } });
+        send("done", { out: outDir, frames: doneN, ms: Date.now() - tW });
+        res.end();
+        return;
       }
 
       const t0 = Date.now();
+      let ncnnTile = Number(NCNN_TILE) || 256;
       for (let i = 0; i < todo.length; i++) {
         if (closed) return;
         const f = todo[i];
@@ -1552,29 +2598,58 @@ data: ${JSON.stringify(data)}
           inflight = null;
           if (closed) return;
           const outB64 = r.images && r.images[0];
-          if (!outB64) throw new Error("Forge returned no image (is a checkpoint loaded?)");
+          if (!outB64) throw new Error("Forge returned no image (no checkpoint loaded)");
           await writeFile(join(outDir, f), Buffer.from(outB64, "base64"));
         } else {
-          // ncnn upscales to 2× → tmp; an optional ffmpeg pass handles scale=1 (downscale to source
-          // for detail-only) and/or the strength blend: out = lanczos(orig)*(1-S) + esrgan*S — the same
-          // Lanczos/R-ESRGAN blend Forge's extras tier did, but with no server.
+          // ncnn ALWAYS runs at the model's native ratio. The x4plus nets are fixed 4×: passing
+          // -s 2 / -s 3 makes the binary stride its output tiles at 2×/3× while the net still emits
+          // 4×, so every tile lands at the wrong offset and the atlas comes back shredded into a
+          // displaced checkerboard. Running native costs nothing — the net does 4× either way
+          // (measured 40.0s vs 41.9s on a 2048² atlas) — so the requested `scale` and the strength
+          // blend are both applied afterwards by ffmpeg: out = lanczos(orig)*(1-S) + esrgan*S,
+          // the same Lanczos/R-ESRGAN blend Forge's extras tier did, but with no server.
           const tmpPng = join(outDir, "._up_" + f);
-          await runProc(REALESRGAN_EXE, ["-i", srcPng, "-o", tmpPng, "-n", model, "-s", "2", "-t", "256", "-g", "0"], { cwd: REALESRGAN_DIR }, (c) => { child = c; });
+          await runProc(REALESRGAN_EXE, ["-i", srcPng, "-o", tmpPng, "-n", model, "-s", String(NCNN_NATIVE_SCALE), "-t", String(ncnnTile), ...NCNN_GPU], { cwd: REALESRGAN_DIR }, (c) => { child = c; });
           child = null;
           if (closed) { try { await unlink(tmpPng); } catch { /* ignore */ } return; }
           const dims = pngDimsBuf(await readFile(srcPng));
           const outPng = join(outDir, f);
-          if ((strength < 0.99 || scale < 2) && dims) {
-            const tw = scale < 2 ? dims[0] : dims[0] * 2, th = scale < 2 ? dims[1] : dims[1] * 2;
+          const tw = dims ? dims[0] * scale : 0, th = dims ? dims[1] * scale : 0;
+          if (dims && strength < 0.99) {
             await runProc(FFMPEG, ["-y", "-loglevel", "error", "-i", srcPng, "-i", tmpPng,
               "-filter_complex", `[0:v]scale=${tw}:${th}:flags=lanczos[a];[1:v]scale=${tw}:${th}:flags=lanczos[b];[a][b]blend=all_expr='A*(1-${strength})+B*${strength}'`,
               "-frames:v", "1", outPng], {}, (c) => { child = c; });
+            child = null;
+            try { await unlink(tmpPng); } catch { /* ignore */ }
+          } else if (dims && scale !== NCNN_NATIVE_SCALE) {
+            // Full strength: the source contributes nothing to the blend, so this is a plain
+            // resample of the 4× result down to the requested ratio — one decode instead of two.
+            await runProc(FFMPEG, ["-y", "-loglevel", "error", "-i", tmpPng,
+              "-vf", `scale=${tw}:${th}:flags=lanczos`, "-frames:v", "1", outPng], {}, (c) => { child = c; });
             child = null;
             try { await unlink(tmpPng); } catch { /* ignore */ }
           } else {
             try { await rename(tmpPng, outPng); } catch { await copyFile(tmpPng, outPng); try { await unlink(tmpPng); } catch { /* ignore */ } }
           }
           if (closed) return;
+          // ncnn exits 0 and writes an ALL-BLACK png when tile x concurrency outruns VRAM.
+          // A real atlas never compresses that small, so size is a reliable, cheap detector;
+          // caught here the cause is still known, whereas the encoder would just bake it in.
+          try {
+            const st = await stat(outPng);
+            if (st.size < 65536) throw new Error("blank frame");
+          } catch {
+            // Out of VRAM at this tile size. Halve it and redo the same frame: the smaller tile
+            // stays in force for the rest of the run, and only a 32 px tile failing is an error.
+            if (ncnnTile > 32) {
+              ncnnTile = Math.max(32, Math.floor(ncnnTile / 2));
+              send("log", `blank frame (${f}): GPU memory exhausted, tile size reduced to ${ncnnTile} px, frame repeated`);
+              i--;
+              continue;
+            }
+            send("error", { message: `upscaler produced a blank frame (${f}) at the 32 px minimum tile size` });
+            res.end(); return;
+          }
         }
         send("progress", { frame: i + 1, of: todo.length, file: f, ms: Date.now() - t });
       }
@@ -1611,10 +2686,8 @@ data: ${JSON.stringify(data)}
       }
       target = join(target, "index.html");
     }
-    const body = await readFile(target);
-    const type = MIME[extname(target).toLowerCase()] ?? "application/octet-stream";
-    res.writeHead(200, { ...HEADERS, "Content-Type": type, "Content-Length": body.length });
-    res.end(body);
+    // Streamed, never read whole: a long .ares clip runs to gigabytes, and readFile stops at 2 GiB.
+    await sendFileRange(req, res, target, MIME[extname(target).toLowerCase()] ?? "application/octet-stream");
   } catch {
     res.writeHead(404, { ...HEADERS, "Content-Type": "text/plain" });
     res.end(`404 ${path}`);

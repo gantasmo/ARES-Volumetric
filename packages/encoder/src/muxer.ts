@@ -9,9 +9,10 @@ import {
   FourCC, CHUNK_MAGIC, TextureBlobFormat, ByteWriter, quantizePositions, type Aabb,
 } from "@ares/core";
 import { encodeGeometryBlock, encodePFrameBlock, computeSmoothNormals, meshoptEncoderReady, type EncodeMeshFrame } from "./geometry-encode.js";
-import { buildTemporalGops, type TemporalOptions } from "./temporal.js";
+import { buildTemporalGops, type TemporalOptions, type TemporalGop } from "./temporal.js";
 import { encodeSplatStateBlock, encodeSplatPBlock, quantizeSplatFrame, matchSplatsByIndex, matchSplatsNearest, orderForPFrame, splatAabb, mortonOrder, permuteSplatFrame, type SplatFrame, type SplatTemporalOptions } from "./splat-frame.js";
 import { buildAudioBlock, packetsInWindow, type AudioTrackData } from "./audio-mux.js";
+import { openSync, closeSync, writeSync, readSync, rmSync } from "node:fs";
 
 export interface MuxTextureVideo {
   fourcc: string; // "VP09" | "AV01"
@@ -100,29 +101,11 @@ export async function muxClipWithStats(clip: MuxClip): Promise<MuxResult> {
   gops.forEach((gop, chunkIdx) => {
     const start = gop.frameStart;
     const gopBox = gop.gopBox;
-    const blocks: { type: BlockType; trackId: number; payload: Uint8Array }[] = [];
-    let framesInChunk: number;
-
-    if (gop.temporal && gop.framePositions && gop.uvs && gop.indices) {
-      const fp = gop.framePositions;
-      const fuv = gop.frameUvs; // per-frame UVs when tracked (else undefined → UVs constant)
-      const vcount = fp[0]!.length / 3;
-      const posQs = fp.map((p) => quantizePositions(p, gopBox, bits));
-      const normals = fp.map((p) => computeSmoothNormals(p, gop.indices!)); // smooth per-frame normals
-      // I-frame (full: positions[0] + uvs[0] + normals[0] + persistent indices)
-      blocks.push({ type: BlockType.GeometryI, trackId: 0, payload: encodeGeometryBlock({ positions: fp[0]!, uvs: fuv ? fuv[0]! : gop.uvs, normals: normals[0], indices: gop.indices }, gopBox, bits) });
-      // P-frames (position deltas + [per-frame UVs when re-atlased] + normals)
-      for (let f = 1; f < posQs.length; f++) blocks.push({ type: BlockType.GeometryPB, trackId: 0, payload: encodePFrameBlock(posQs[f - 1]!, posQs[f]!, vcount, normals[f], fuv ? fuv[f]! : undefined) });
-      framesInChunk = fp.length;
-      temporalFrames += fp.length;
-      if (gop.trackError) { errAcc += gop.trackError; errN++; }
-    } else {
-      const member = gop.frames!;
-      // Intra path re-uploads topology every frame → meshopt vertex reorder is lossless & free here (C1).
-      for (const fr of member) blocks.push({ type: BlockType.GeometryI, trackId: 0, payload: encodeGeometryBlock({ ...fr, normals: computeSmoothNormals(fr.positions, fr.indices) }, gopBox, bits, /*reorder*/ true) });
-      framesInChunk = member.length;
-      intraFrames += member.length;
-    }
+    const g = encodeMeshGopBlocks(gop, bits);
+    const blocks = g.blocks;
+    const framesInChunk = g.frames;
+    if (gop.temporal) temporalFrames += g.frames; else intraFrames += g.frames;
+    if (gop.temporal && gop.trackError) { errAcc += gop.trackError; errN++; }
 
     // This chunk's OWN frames, by index — see the note above the loop.
     const tframes = texFrames ? texFrames.slice(start, start + framesInChunk) : null;
@@ -138,6 +121,203 @@ export async function muxClipWithStats(clip: MuxClip): Promise<MuxResult> {
   });
 
   return layoutFile(clip, chunks, globalBox, bits, gopLength, 0, GeometryProfile.MeshIPB, FourCC.Meshopt, { temporalFrames, intraFrames, meanTrackError: errN ? errAcc / errN : 0 });
+}
+
+type ChunkBlock = { type: BlockType; trackId: number; payload: Uint8Array };
+
+/** One planned GOP -> its geometry blocks (I + P for a persistent-topology GOP, all I otherwise). */
+function encodeMeshGopBlocks(gop: TemporalGop, bits: number): { blocks: ChunkBlock[]; frames: number } {
+  const gopBox = gop.gopBox;
+  const blocks: ChunkBlock[] = [];
+  if (gop.temporal && gop.framePositions && gop.uvs && gop.indices) {
+    const fp = gop.framePositions;
+    const fuv = gop.frameUvs; // per-frame UVs when tracked (else undefined → UVs constant)
+    const vcount = fp[0]!.length / 3;
+    const posQs = fp.map((p) => quantizePositions(p, gopBox, bits));
+    const normals = fp.map((p) => computeSmoothNormals(p, gop.indices!)); // smooth per-frame normals
+    // I-frame (full: positions[0] + uvs[0] + normals[0] + persistent indices)
+    blocks.push({ type: BlockType.GeometryI, trackId: 0, payload: encodeGeometryBlock({ positions: fp[0]!, uvs: fuv ? fuv[0]! : gop.uvs, normals: normals[0], indices: gop.indices }, gopBox, bits) });
+    // P-frames (position deltas + [per-frame UVs when re-atlased] + normals)
+    for (let f = 1; f < posQs.length; f++) blocks.push({ type: BlockType.GeometryPB, trackId: 0, payload: encodePFrameBlock(posQs[f - 1]!, posQs[f]!, vcount, normals[f], fuv ? fuv[f]! : undefined) });
+    return { blocks, frames: fp.length };
+  }
+  const member = gop.frames!;
+  // Intra path re-uploads topology every frame → meshopt vertex reorder is lossless & free here (C1).
+  for (const fr of member) blocks.push({ type: BlockType.GeometryI, trackId: 0, payload: encodeGeometryBlock({ ...fr, normals: computeSmoothNormals(fr.positions, fr.indices) }, gopBox, bits, /*reorder*/ true) });
+  return { blocks, frames: member.length };
+}
+
+export interface MeshClipWriterOptions {
+  /** Final .ares path. Chunks accumulate in `<out>.chunks.tmp` next to it until finish(). */
+  out: string;
+  fps: number;
+  gopLength?: number;
+  quantBitsPos?: number;
+  audio?: AudioTrackData;
+  /** Texture video track identity; the coded frames arrive GOP by GOP through writeGop. */
+  textureVideo?: { fourcc: string; width: number; height: number };
+  temporal?: Partial<Omit<TemporalOptions, "gopLength">>;
+}
+
+export interface MeshClipWriterResult { sizeBytes: number; frames: number; chunks: number; temporalFrames: number; intraFrames: number; }
+
+/**
+ * The mesh muxer for clips that do not fit in memory. muxClip holds every frame and the whole
+ * output in one buffer, which caps a clip at a few hundred frames of dense geometry; this writes
+ * one GOP at a time. Encoded chunks append to a scratch file; finish() knows the chunk count and
+ * the clip bounds, lays out header + superblock + GOP index + track directory, and copies the
+ * chunks in behind them. The file it produces is byte-for-byte the layout muxClip produces.
+ *
+ * `finish({ translate })` shifts the whole clip by moving every chunk's quantisation box: positions
+ * are stored relative to their box, so a translation that is only known once the last frame has
+ * been seen (centring on the clip's bounds) costs no re-encode.
+ */
+export class MeshClipWriter {
+  private readonly tmpPath: string;
+  private fd: number;
+  private readonly index: { startPts: bigint; frameStart: number; frameCount: number; length: number }[] = [];
+  private globalBox: Aabb | null = null;
+  private frameCount = 0;
+  private tmpBytes = 0;
+  private temporalFrames = 0;
+  private intraFrames = 0;
+  private pending: { frames: EncodeMeshFrame[]; tex: { data: Uint8Array; isKey: boolean }[] | null } | null = null;
+  private readonly bits: number;
+  private readonly gopLength: number;
+
+  private constructor(private readonly opts: MeshClipWriterOptions) {
+    this.bits = opts.quantBitsPos ?? 14;
+    this.gopLength = opts.gopLength ?? 30;
+    this.tmpPath = opts.out + ".chunks.tmp";
+    this.fd = openSync(this.tmpPath, "w+");
+  }
+
+  static async open(opts: MeshClipWriterOptions): Promise<MeshClipWriter> {
+    await meshoptEncoderReady();
+    return new MeshClipWriter(opts);
+  }
+
+  /** Append the next `frames.length` (<= gopLength) frames, with their coded texture frames. */
+  writeGop(frames: EncodeMeshFrame[], tex: { data: Uint8Array; isKey: boolean }[] | null): void {
+    if (!frames.length) return;
+    if (frames.length > this.gopLength) throw new Error(`MeshClipWriter: ${frames.length} frames exceed the GOP length ${this.gopLength}`);
+    if (tex && tex.length !== frames.length) throw new Error(`texture/geometry frame count mismatch: ${tex.length} coded texture frames for ${frames.length} geometry frames`);
+    // Held back one call: the audio window of the LAST chunk runs to infinity, and only the next
+    // call (or finish) says whether this one was last.
+    if (this.pending) this.flush(false);
+    this.pending = { frames, tex };
+  }
+
+  private flush(isLast: boolean): void {
+    const { frames, tex } = this.pending!;
+    this.pending = null;
+    const usPerFrame = 1e6 / this.opts.fps;
+    const base = this.frameCount;
+    const gops = buildTemporalGops(frames, {
+      gopLength: this.gopLength,
+      track: this.opts.temporal?.track ?? false,
+      smoothTemporal: this.opts.temporal?.smoothTemporal ?? 0,
+      smoothSpatial: this.opts.temporal?.smoothSpatial ?? 0,
+      forceIntra: this.opts.temporal?.forceIntra ?? false,
+    });
+    gops.forEach((gop, gi) => {
+      const g = encodeMeshGopBlocks(gop, this.bits);
+      if (gop.temporal) this.temporalFrames += g.frames; else this.intraFrames += g.frames;
+      const start = base + gop.frameStart;
+      const blocks = g.blocks;
+      if (tex) blocks.push({ type: BlockType.TextureColor, trackId: 1, payload: buildTextureBlock(tex.slice(gop.frameStart, gop.frameStart + g.frames)) });
+      if (this.opts.audio) {
+        const lastChunk = isLast && gi === gops.length - 1;
+        const a0 = Math.round(start * usPerFrame), a1 = lastChunk ? Infinity : Math.round((start + g.frames) * usPerFrame);
+        const pk = packetsInWindow(this.opts.audio.packets, start === 0 ? -Infinity : a0, a1);
+        if (pk.length) blocks.push({ type: BlockType.Audio, trackId: 2, payload: buildAudioBlock(pk, a0) });
+      }
+      const startPts = BigInt(Math.round(start * usPerFrame));
+      const bytes = assembleChunk(startPts, g.frames, gop.gopBox, blocks);
+      for (let put = 0; put < bytes.length; ) put += writeSync(this.fd, bytes, put, bytes.length - put, this.tmpBytes + put);
+      this.tmpBytes += bytes.length;
+      this.index.push({ startPts, frameStart: start, frameCount: g.frames, length: bytes.length });
+      this.globalBox = this.globalBox ? unionBox(this.globalBox, gop.gopBox) : gop.gopBox;
+    });
+    this.frameCount += frames.length;
+  }
+
+  /** Clip bounds over everything written so far (before any finish-time translation). */
+  bounds(): Aabb | null {
+    if (this.pending) this.flush(false);
+    return this.globalBox;
+  }
+
+  finish(o: { meta?: Record<string, string>; translate?: [number, number, number] } = {}): MeshClipWriterResult {
+    if (this.pending) this.flush(true);
+    if (!this.frameCount || !this.globalBox) { this.abort(); throw new Error("muxClip: no frames"); }
+    const tr = o.translate ?? [0, 0, 0];
+    const shift = (b: Aabb): Aabb => ({ min: [b.min[0] + tr[0], b.min[1] + tr[1], b.min[2] + tr[2]], max: [b.max[0] + tr[0], b.max[1] + tr[1], b.max[2] + tr[2]] });
+    const tv = this.opts.textureVideo ? { ...this.opts.textureVideo, gops: [] } : undefined;
+    const usPerFrame = 1e6 / this.opts.fps;
+
+    const { bytes: sb } = writeSuperblock(shift(this.globalBox), this.bits, this.gopLength, 0, o.meta ?? {}, undefined, tv);
+    const trackDir = writeTrackDir(FourCC.Meshopt, undefined, tv, this.opts.audio);
+    const gopIndexSize = 4 + this.index.length * (8 + 4 + 2 + 2 + 8 + 4);
+    const superblockOffset = HEADER_SIZE;
+    const gopIndexOffset = superblockOffset + sb.length;
+    const trackDirOffset = gopIndexOffset + gopIndexSize;
+    const firstChunkOffset = trackDirOffset + trackDir.length;
+
+    const gi = new ByteWriter(gopIndexSize);
+    gi.u32(this.index.length);
+    let offset = firstChunkOffset;
+    for (const c of this.index) {
+      gi.u64(c.startPts).u32(c.frameStart).u16(c.frameCount).u16(0).u64(BigInt(offset)).u32(c.length);
+      offset += c.length;
+    }
+    const header = writeHeader({
+      fps: this.opts.fps, frameCount: this.frameCount, durationUs: BigInt(Math.round(this.frameCount * usPerFrame)),
+      superblockOffset, gopIndexOffset, trackDirOffset, firstChunkOffset,
+      textureCodec: tv ? (tv.fourcc === "AV01" ? TextureCodec.AV1 : TextureCodec.VP9) : TextureCodec.None,
+      profile: GeometryProfile.MeshIPB,
+      flags: this.opts.audio ? HeaderFlags.HasAudio : 0,
+    });
+
+    const out = openSync(this.opts.out, "w");
+    try {
+      let pos = 0;
+      const put = (b: Uint8Array) => { for (let n = 0; n < b.length; ) n += writeSync(out, b, n, b.length - n, pos + n); pos += b.length; };
+      put(header); put(sb); put(gi.finish()); put(trackDir);
+      // Chunk header: magic 4, pts 8, frame_count 2, reserved 2, then box min (3 x f32) and max.
+      const BOX_AT = 16;
+      let src = 0;
+      for (const c of this.index) {
+        const buf = new Uint8Array(c.length);
+        for (let got = 0; got < c.length; ) {
+          const n = readSync(this.fd, buf, got, c.length - got, src + got);
+          if (n <= 0) throw new Error(`MeshClipWriter: chunk scratch file ended at byte ${src + got}`);
+          got += n;
+        }
+        if (tr[0] !== 0 || tr[1] !== 0 || tr[2] !== 0) {
+          const dv = new DataView(buf.buffer, buf.byteOffset, buf.byteLength);
+          for (let k = 0; k < 3; k++) {
+            dv.setFloat32(BOX_AT + k * 4, dv.getFloat32(BOX_AT + k * 4, true) + tr[k]!, true);
+            dv.setFloat32(BOX_AT + 12 + k * 4, dv.getFloat32(BOX_AT + 12 + k * 4, true) + tr[k]!, true);
+          }
+        }
+        put(buf);
+        src += c.length;
+      }
+      return { sizeBytes: pos, frames: this.frameCount, chunks: this.index.length, temporalFrames: this.temporalFrames, intraFrames: this.intraFrames };
+    } finally {
+      closeSync(out);
+      this.abort();
+    }
+  }
+
+  /** Drop the scratch file. Safe to call twice; finish() calls it. */
+  abort(): void {
+    if (this.fd < 0) return;
+    try { closeSync(this.fd); } catch { /* already closed */ }
+    this.fd = -1;
+    try { rmSync(this.tmpPath, { force: true }); } catch { /* best effort */ }
+  }
 }
 
 /**

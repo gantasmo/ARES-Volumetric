@@ -23,6 +23,7 @@
  * Options
  *   --port N      base port for the dev server (default 8137; serve.mjs walks up 10 if busy)
  *   --src clip    .ares under apps/demo to open in the app (default: first clip present)
+ *   --open PATH   a folder or file to open in the Convert tab (the Windows shell verb uses this)
  *   --detach      start the server in the background and exit (what the Windows path uses)
  *   --no-open     do not open a browser
  *   --no-build    skip the TypeScript build
@@ -51,7 +52,7 @@ const PAGE = { app: "/apps/demo/", probe: "/apps/phase0-probe/", bench: "/bench/
 /** Clips the app opens without being told which. .ares files are git-ignored, so a fresh clone
  *  has none of them and mode app synthesizes demo.ares instead. */
 const CLIP_CANDIDATES = ["daniel-s0.ares", "daniel.ares", "demo.ares"];
-const OPTIONS = ["--port", "--src", "--detach", "--no-open", "--no-build", "--no-install", "--help"];
+const OPTIONS = ["--port", "--src", "--open", "--detach", "--no-open", "--no-build", "--no-install", "--help"];
 
 let ownsServer = false; // true once this process started the server itself (foreground mode)
 
@@ -105,17 +106,20 @@ Log: tools/launch.log`;
  *  `--src bench.ares bench`, the mode is still bench and the clip is still bench.ares. */
 function parseArgs(argv) {
   if (argv.includes("-h") || argv.includes("--help")) { console.log(HELP); process.exit(0); }
-  const out = { src: undefined, port: DEFAULT_PORT, detach: false, open: true, build: true, install: true };
+  const out = { src: undefined, openPath: undefined, port: DEFAULT_PORT, detach: false, open: true, build: true, install: true };
   const positional = [];
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (!a.startsWith("-")) { positional.push(a); continue; }
-    if (!OPTIONS.includes(a)) fail(`unknown option ${a} — run with --help`);
-    if (a === "--port" || a === "--src") {
+    if (!OPTIONS.includes(a)) fail(`unknown option ${a}: run with --help`);
+    if (a === "--port" || a === "--src" || a === "--open") {
       const v = argv[++i];
       // A value flag followed by another flag (or by nothing) is a usage error, not a value.
-      if (v === undefined || v.startsWith("-")) fail(`${a}: expected a value`);
+      // --open is the exception: a Windows path can legitimately begin with "-", and the shell
+      // verb passes whatever the user right-clicked, so only reject a MISSING value there.
+      if (v === undefined || (a !== "--open" && v.startsWith("-"))) fail(`${a}: expected a value`);
       if (a === "--src") { out.src = v; continue; }
+      if (a === "--open") { out.openPath = v; continue; }
       const n = Number(v);
       if (!Number.isInteger(n) || n < 1024 || n > 65535) fail(`--port: expected an integer 1024-65535, got ${JSON.stringify(v)}`);
       out.port = n;
@@ -126,9 +130,9 @@ function parseArgs(argv) {
     else if (a === "--no-build") out.build = false;
     else if (a === "--no-install") out.install = false;
   }
-  if (positional.length > 1) fail(`unexpected argument ${JSON.stringify(positional[1])} — one mode at a time; run with --help`);
+  if (positional.length > 1) fail(`unexpected argument ${JSON.stringify(positional[1])}, one mode at a time; run with --help`);
   const mode = positional[0] ?? "app";
-  if (!MODES.has(mode)) fail(`unknown mode ${JSON.stringify(mode)} — expected one of ${[...MODES].join(", ")}`);
+  if (!MODES.has(mode)) fail(`unknown mode ${JSON.stringify(mode)}: expected one of ${[...MODES].join(", ")}`);
   return { mode, ...out };
 }
 
@@ -153,7 +157,7 @@ async function build(enabled, fatal) {
     : await run(NPM, ["run", "build"], { shell: process.platform === "win32" });
   if (code === 0) return;
   if (fatal) fail(`build failed (exit ${code}). See ${LOG_FILE}.`);
-  log(`WARNING: build failed (exit ${code}) — this page does not need the packages; see ${LOG_FILE}`);
+  log(`WARNING: build failed (exit ${code}); this page does not need the packages; see ${LOG_FILE}`);
 }
 
 async function ensureClip(src) {
@@ -161,7 +165,7 @@ async function ensureClip(src) {
   const demoDir = join(ROOT, "apps", "demo");
   const present = CLIP_CANDIDATES.find((c) => existsSync(join(demoDir, c)));
   if (present) return present;
-  log("no clip in apps/demo — synthesizing demo.ares...");
+  log("no clip in apps/demo: synthesizing demo.ares...");
   if (!existsSync(CLI_JS)) fail("the encoder is not built, so no demo clip can be generated. Run without --no-build.");
   const code = await run(process.execPath, [CLI_JS, "synth", "-o", "apps/demo/demo.ares", "--shape", "object", "--frames", "60", "--fps", "30"]);
   if (code !== 0) fail(`demo clip generation failed (exit ${code}). See ${LOG_FILE}.`);
@@ -223,7 +227,7 @@ function openBrowser(url) {
   // A missing opener (headless Linux without xdg-utils) surfaces as an async 'error' event,
   // never as a throw, so the listener — not a try/catch — is what keeps the URL visible.
   const child = spawn(cmd, args, { detached: true, stdio: "ignore", windowsHide: true });
-  child.on("error", (e) => log(`could not open a browser (${e.message}) — go to ${url}`));
+  child.on("error", (e) => log(`could not open a browser (${e.message}): go to ${url}`));
   child.unref();
 }
 
@@ -231,10 +235,13 @@ function startSamService() {
   if (process.platform !== "win32") fail("mode sam is Windows-only (the service runs from a local Python env); start it from the app's Edit panel instead.");
   if (!existsSync(SAM_PS1)) fail(`missing ${SAM_PS1}`);
   log("starting the SAM segmentation service (the first start loads weights, 10-20 s)...");
+  // Not detached: Windows PowerShell 5.1 spawned with `detached: true` exits 0 at once without
+  // running the script (measured 2026-09-18, see tools/serve.mjs samEnsure). The child outlives
+  // this process regardless: Windows never kills a child with its parent.
   spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", SAM_PS1], {
-    detached: true, stdio: "ignore", windowsHide: true,
+    stdio: "ignore", windowsHide: true,
   }).unref();
-  log("SAM service starting on http://127.0.0.1:7263 — log: tools/sam-service/sam-service.log");
+  log("SAM service starting on http://127.0.0.1:7263; log: tools/sam-service/sam-service.log");
 }
 
 // --- main --------------------------------------------------------------------
@@ -252,7 +259,12 @@ await ensureDeps(opts.install);
 await build(opts.build, opts.mode !== "probe");
 
 let query = "";
-if (opts.mode === "app") query = `?src=${await ensureClip(opts.src)}`;
+if (opts.mode === "app") {
+  query = `?src=${await ensureClip(opts.src)}`;
+  // Sent by the Windows "Convert to .ares" shell verb. The app opens the Convert tab on it: a
+  // folder is analysed, a container is probed, a lone mesh points at the folder that holds it.
+  if (opts.openPath) query += `&open=${encodeURIComponent(resolvePath(opts.openPath))}`;
+}
 
 if (opts.mode === "bench") {
   if (!existsSync(BENCH_JS)) fail("the bench is not built. Run without --no-build.");
@@ -267,4 +279,4 @@ if (opts.open) { openBrowser(url); log(`opened ${url}`); }
 else log(`ready at ${url}`);
 
 if (opts.detach || !ownsServer) process.exit(0); // the server outlives us; foreground waits on it
-log("serving — Ctrl-C to stop");
+log("serving: Ctrl-C to stop");

@@ -13,15 +13,23 @@
  *               both: [--trim-in N] [--trim-out N] [--up-axis x|y|z] [--center bottom|mass|none]
  *                     [--scale N] [--rotate x,y,z] [--translate x,y,z] [--meta-extra-file f.json]
  *               audio (both): [--audio file] [--audio-offset s] [--audio-bitrate kbps]
+ *   ares depth  <video> --depth <run-dir> [-o out.ares]   2D video + an ares-depth/1 run -> a 2.5D relief clip
+ *               [--fov 55] [--near 0.5] [--far 6] [--grid 256] [--edge 0.08] [--sheets] [--stabilize 0.7]
+ *               [--gop 30] [--tex-size 1024] [--texture-codec vp9|av1] [--crf 30] [--no-texture]
+ *               [--no-audio] [--audio file] [--audio-offset s] [--audio-bitrate kbps] [--smooth-temporal N]
+ *               [--up-axis x|y|z] [--center bottom|mass|none] [--scale N] [--rotate x,y,z] [--translate x,y,z]
+ *               [--meta-extra-file f.json]
  *   ares export <file.ares> -o <out> [--frame N]      (.obj/.ply for meshes; .spz/.ply/.glb/.splat for splats)
  *   ares info   <file.ares>
+ *   ares verify-edits <file.edits.json>               (mask2d/keyframe pre-flight, exit 1 on any issue)
  */
-import { readdir, readFile, writeFile, stat } from "node:fs/promises";
-import { readFileSync } from "node:fs";
+import { readdir, readFile, writeFile, stat, mkdtemp, rm, open } from "node:fs/promises";
+import { readFileSync, existsSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join, extname, basename } from "node:path";
 import { performance } from "node:perf_hooks";
 import { createHash } from "node:crypto";
-import { Demuxer, GeometryProfile, BlockType, decodeGeometryBlock, decodePFrameBlock, decodeSplatBlock, decodeSplatPBlock, dequantScale, meshoptReady, transformMatrix, type DecodedGeometry } from "@ares/core";
+import { Demuxer, GeometryProfile, BlockType, decodeGeometryBlock, decodePFrameBlock, decodeSplatBlock, decodeSplatPBlock, dequantScale, meshoptReady, transformMatrix, type DecodedGeometry, type GopEntry } from "@ares/core";
 import { parsePly, parsePlyHeader, isSplatPlyHeader, parsePlySplat, writeSplatPly } from "./importers/ply.js";
 import { parseObj } from "./importers/obj.js";
 import { parseSpz, writeSpz } from "./importers/spz.js";
@@ -33,9 +41,9 @@ import { decodedMeshToFrame, writeObj, writeMeshPly } from "./export.js";
 import { transcodeToOpus, type AudioTrackData } from "./audio-mux.js";
 import { filterFrame, parseCropBox } from "./crop.js";
 import { decimateFrame, simplifierReady } from "./decimate.js";
-import { parseEditList, keepPredicateAt, prepareRangeAt, prepareRangeSdfAt, isRangeEnabled, type EditList, type EditRange } from "@ares/core";
+import { parseEditList, validateMasks, keepPredicateAt, prepareRangeAt, prepareRangeSdfAt, isRangeEnabled, type EditList, type EditRange } from "@ares/core";
 import { resolveOffset, applyTransform, applyTransformNormals, transformAabb, type ModelTransform } from "@ares/core";
-import type { Aabb } from "@ares/core";
+import { HEADER_SIZE, type Aabb } from "@ares/core";
 import { collectCopyOps, applyGeoCopy, resolveSrcFragment, buildPieceFragment, type CopyOp } from "./frame-copy.js";
 import {
   buildPatchedAtlasDir, pngSize, rasterizeUvFootprint, dilateMask,
@@ -48,7 +56,14 @@ import { detectHoleLoopsForRange, appendCaps, findFreeTile, HOLE_TILE, type Hole
 import { muxClip, muxClipWithStats, type MuxClip } from "./muxer.js";
 import { synthClip, synthSplatClip } from "./synth.js";
 import { proceduralAtlas } from "./png.js";
-import { encodeTextureVideo, detectPattern, ffmpegAvailable, ffmpegPath, type TexCodec } from "./texture-video.js";
+import { encodeTextureVideo, detectPattern, ffmpegAvailable, ffmpegPath, type TexCodec, type TextureGop } from "./texture-video.js";
+import { openDepthRun, type DepthRunMeta } from "./depth-io.js";
+import { stabilizeDepthStream, RgbMotionGate } from "./depth-stabilize.js";
+import { buildDepthGrid, resampleMap, depthFrameToMesh, gridDepths, fillLayerToMesh, mergeMeshes, reliefDiscard, DepthHistogram, cutEdgeCount } from "./depth-mesh.js";
+import { resizeRgbArea, resampleMask, guidedResample, buildFillLayer, composeLayeredAtlas, snapRamps, FILL_MIN_JUMP } from "./depth-layers.js";
+import { fileStore, memoryStore, type FrameStore } from "./depth-store.js";
+import { openRawFrames, encodeRawTextureGop, detectLetterbox, type CropRect } from "./video-frames.js";
+import { MeshClipWriter } from "./muxer.js";
 import type { EncodeMeshFrame } from "./geometry-encode.js";
 
 function flag(a: string[], name: string): string | undefined {
@@ -182,26 +197,62 @@ async function findFramesSubdir(dir: string, names: string[]): Promise<string | 
  * editor only ever sees the whole thing), so trimming without this would silently slide every range
  * by `from` frames — a delete authored on the head would land in the middle of the body.
  *
- * Ranges that fall wholly outside the window are dropped; partial ones are clamped. Keyframes are
- * shifted but NEVER dropped, even when they land outside [0, n): prepareRangeAt interpolates
- * between the keyframes bracketing a frame, so discarding an out-of-window one would change the
- * shape of the surviving in-window frames. A copy op whose srcFrame was trimmed away is dropped
+ * Ranges that fall wholly outside the window are dropped; partial ones are clamped. A USER
+ * keyframe is shifted but NEVER dropped, even when it lands outside [0, n): prepareRangeAt
+ * interpolates between the keyframes bracketing a frame, so discarding an out-of-window anchor
+ * would change the shape of the surviving in-window frames. That reasoning inverts for a
+ * `derived` keyframe — a propagation writes one per frame, so every surviving frame already
+ * carries its own and nothing in-window interpolates through an out-of-window one. Those ARE
+ * dropped, because at ~272 keyframes per range the alternative is carrying the whole trimmed-off
+ * tail's decoded bitmaps through the bake. A copy op whose srcFrame was trimmed away is dropped
  * outright with a warning — its source no longer exists, and silently copying from some other frame
  * would be a fabrication.
+ *
+ * There is deliberately NO `from === 0` fast path: a trim-out-only bake (the common one — the
+ * editor's out point moves far more often than its in point) still has to clamp endFrame to the
+ * shorter window and still has to drop the derived keyframes past it. `trimmed` says whether the
+ * window is actually narrower than the discovered clip, which is what gates the copy-payload
+ * rebase below — see the comment there.
  */
-function rebaseEditList(list: EditList, from: number, n: number): EditList {
-  if (from === 0) return list;
+function rebaseEditList(list: EditList, from: number, n: number, trimmed: boolean): EditList {
   const ranges: EditRange[] = [];
+  let droppedDerived = 0;
   for (const r of list.ranges) {
     const s = r.startFrame - from, e = r.endFrame - from;
-    if (e < 0 || s > n - 1) continue;                         // wholly outside the kept window
+    // A copy range is exempt: its bake frames are copy.srcFrame/dstFrames, and frame-copy.ts
+    // evaluates its region with prepareRangeAt(range, srcFrame) — the span never enters the
+    // computation, so it is not the gate for this action. The srcFrame/dstFrames checks below are.
+    if ((r.action ?? "delete") !== "copy" && (e < 0 || s > n - 1)) {
+      console.log(`[ares] trim: dropping range ${r.id ?? `${r.startFrame}-${r.endFrame}`} — its span is wholly outside the ${n}-frame window`);
+      continue;
+    }
+    const keyframes = r.keyframes
+      .map((k) => ({ ...k, frame: k.frame - from }))
+      .filter((k) => {
+        if (k.derived !== true || (k.frame >= 0 && k.frame <= n - 1)) return true;
+        droppedDerived++;
+        return false;
+      });
+    // Every keyframe was derived and every one fell outside: the range now matches nothing. Drop
+    // it rather than keep an empty-keyframe range, which for mode:"keep" would put every point
+    // "outside all keep regions" and delete the frame whole (the trap parseEditList documents).
+    if (!keyframes.length) {
+      console.warn(`[ares] trim: dropping range ${r.id ?? `${r.startFrame}-${r.endFrame}`} — every keyframe it had is derived and outside the trim`);
+      continue;
+    }
     const nr: EditRange = {
       ...r,
       startFrame: Math.max(0, s),
       endFrame: Math.min(n - 1, e),
-      keyframes: r.keyframes.map((k) => ({ ...k, frame: k.frame - from })),
+      keyframes,
     };
-    if (nr.copy) {
+    // Only rebase the copy payload when the window is actually narrower than the clip. Untrimmed,
+    // `src < 0 || src >= n` and the dstFrames filter below are the SAME bounds collectCopyOps
+    // (frame-copy.ts) checks — but it throws where these warn-and-drop, and a partly out-of-range
+    // dstFrames list drops silently. A typo'd frame index in a hand-authored sidecar has to keep
+    // failing loudly (frame-copy.ts's header states that contract, and recolor.ts cites it as the
+    // reason recolor clamps and copy does not).
+    if (nr.copy && trimmed) {
       const cp = nr.copy;
       const src = cp.srcFrame - from;
       const dst = cp.dstFrames.map((d: number) => d - from).filter((d: number) => d >= 0 && d < n);
@@ -213,10 +264,14 @@ function rebaseEditList(list: EditList, from: number, n: number): EditList {
         console.warn(`[ares] trim: dropping copy range ${r.id ?? `${r.startFrame}-${r.endFrame}`} — every dstFrame is outside the trim`);
         continue;
       }
+      if (dst.length !== cp.dstFrames.length)
+        console.warn(`[ares] trim: copy range ${r.id ?? `${r.startFrame}-${r.endFrame}`} pastes to ${dst.length} of ${cp.dstFrames.length} dstFrame(s) — the rest are outside the trim`);
       nr.copy = { ...cp, srcFrame: src, dstFrames: dst };
     }
     ranges.push(nr);
   }
+  if (droppedDerived)
+    console.log(`[ares] trim: dropped ${droppedDerived} derived keyframe(s) outside the ${n}-frame window (user keyframes are kept wherever they land)`);
   return { ...list, ranges };
 }
 
@@ -259,7 +314,7 @@ type SplatKind = "spz" | "splat" | "sog" | "gltf" | "ply";
 async function audioFromFlags(a: string[], fps: number, from: number, frameCount: number): Promise<AudioTrackData | null> {
   const src = flag(a, "--audio");
   if (!src) return null;
-  if (!(await ffmpegAvailable())) throw new Error("--audio needs ffmpeg (set FFMPEG or install it)");
+  if (!(await ffmpegAvailable())) throw new Error("--audio needs ffmpeg: none found (FFMPEG, FFMPEG_PATH, C:/FFmpeg/bin, PATH)");
   const offset = numFlag(a, "--audio-offset", 0);
   const bitrate = numFlag(a, "--audio-bitrate", 96, { min: 6, max: 510, int: true });
   const t0 = performance.now();
@@ -318,6 +373,11 @@ async function encode(a: string[]) {
   const editsArg = flag(a, "--edits");
   if (editsArg) {
     editList = parseEditList(JSON.parse(await readFile(editsArg, "utf8")));
+    // parseEditList throws on a malformed DOCUMENT; validateMasks reports a malformed VOLUME, which
+    // bakes as a silent no-op instead (prepareVolume returns null and the range matches nothing).
+    // Warn rather than abort: an edit list with one bad keyframe out of hundreds should still bake.
+    // `ares verify-edits` is the same check with an exit code, for a scripted pre-flight.
+    for (const issue of validateMasks(editList)) console.warn(`[ares] edits: ${issue}`);
     const muted = editList.ranges.filter((r) => !isRangeEnabled(r)).length;
     if (muted) { console.log(`[ares] edits: ${muted} muted range(s) skipped`); editList.ranges = editList.ranges.filter(isRangeEnabled); }
   }
@@ -426,7 +486,7 @@ async function encode(a: string[]) {
   // onto the kept window before anything below reads a frame number. --crop is the degenerate
   // one-keyframe keep-box edit list, so both flags flow through the same path (preview == bake) —
   // and it is built AFTER the re-base, in trimmed space, since frames.length is already trimmed.
-  if (editList) editList = rebaseEditList(editList, from, files.length);
+  if (editList) editList = rebaseEditList(editList, from, files.length, from !== 0 || toExcl !== discovered.length);
   const cropArg = flag(a, "--crop");
   if (cropArg) {
     const box = parseCropBox(cropArg);
@@ -759,7 +819,7 @@ async function encode(a: string[]) {
   const noTexture = has(a, "--no-texture");
   if (!noTexture && atlasFiles.length >= files.length) {
     if (!(await ffmpegAvailable())) {
-      console.warn("[ares] ffmpeg not found — skipping texture (set FFMPEG or install ffmpeg). Geometry-only.");
+      console.warn("[ares] ffmpeg not found (FFMPEG, FFMPEG_PATH, C:/FFmpeg/bin, PATH): texture skipped, geometry only");
     } else {
       const pat = detectPattern(atlasFiles);
       if (!pat) console.warn("[ares] could not detect atlas filename pattern — skipping texture.");
@@ -975,6 +1035,481 @@ async function encodeSplats(a: string[], dir: string, files: string[], kind: Spl
   await info(["info", out]);
 }
 
+/* ================== 2D video -> 2.5D relief volumetric (`ares depth`) ================== */
+
+/** ffprobe, found the same way ffmpeg is: env override, then the sibling of whatever ffmpeg we resolved. */
+function ffprobePath(): string {
+  const fromEnv = process.env.FFPROBE || process.env.FFPROBE_PATH;
+  if (fromEnv && existsSync(fromEnv)) return fromEnv;
+  const ff = ffmpegPath();
+  const sibling = ff.replace(/ffmpeg(\.exe)?$/i, (m) => (m.toLowerCase().endsWith(".exe") ? "ffprobe.exe" : "ffprobe"));
+  if (sibling !== ff && existsSync(sibling)) return sibling;
+  return "ffprobe";
+}
+
+/** Machine-readable progress for the dev server's bar. The exact shape is a contract — do not reword. */
+const progress = (stage: string, i: number, n: number) => console.log(`[ares] progress ${stage} ${i}/${n}`);
+
+/**
+ * The FRAME SAMPLING CONTRACT, as the depth engines apply it. Every later decode of the same video
+ * has to reproduce it verbatim or frame i of the texture is not frame i of the depth: `fps=F` is
+ * present only when the run sampled at a fixed rate, and it comes BEFORE the scale. A letterbox
+ * crop (encoder side only; the engines never crop) sits between the two: it selects no frames.
+ */
+const samplingFilter = (meta: DepthRunMeta, scale: string, crop: CropRect | null = null): string =>
+  (meta.sampling?.fps != null ? `fps=${meta.sampling.fps},` : "") + (crop ? `crop=${crop.w}:${crop.h}:${crop.x}:${crop.y}:exact=1,` : "") + scale;
+
+/** ffmpeg args that decode the run's own sampled frame set, cropped, to raw rgb24 at `w x h`. */
+function sampledRgbArgs(video: string, meta: DepthRunMeta, frameCount: number, w: number, h: number, flags: string, crop: CropRect | null): string[] {
+  return [
+    "-hide_banner", "-loglevel", "error", "-i", video,
+    "-vf", samplingFilter(meta, `scale=${w}:${h}:flags=${flags}`, crop),
+    "-frames:v", String(frameCount),
+    "-f", "rawvideo", "-pix_fmt", "rgb24", "-",
+  ];
+}
+
+/**
+ * The crop of the run's maps that matches a source-pixel crop, and the source crop re-derived from
+ * it so the texture decode and the maps cut the picture at the same place: map edges are rounded
+ * inward to whole map pixels, the source edges then inward to whole source pixels, which leaves
+ * the two within one source pixel of each other.
+ */
+function mapCrop(crop: CropRect, runW: number, runH: number, srcW: number, srcH: number): { map: { x: number; y: number; w: number; h: number }; source: CropRect } {
+  const mx0 = Math.ceil((crop.x * runW) / srcW), mx1 = Math.floor(((crop.x + crop.w) * runW) / srcW);
+  const my0 = Math.ceil((crop.y * runH) / srcH), my1 = Math.floor(((crop.y + crop.h) * runH) / srcH);
+  const sx0 = Math.ceil((mx0 * srcW) / runW), sx1 = Math.floor((mx1 * srcW) / runW);
+  const sy0 = Math.ceil((my0 * srcH) / runH), sy1 = Math.floor((my1 * srcH) / runH);
+  return { map: { x: mx0, y: my0, w: mx1 - mx0, h: my1 - my0 }, source: { w: sx1 - sx0, h: sy1 - sy0, x: sx0, y: sy0 } };
+}
+
+/**
+ * The RGB motion gate for every frame of the run, streamed: one decode at the (cropped) maps' own
+ * W x H, two frames resident, the gate written to `store`. Returns false when the video yielded
+ * fewer frames than the run holds, in which case the stabilizer derives its gate from the depth
+ * change instead.
+ */
+async function rgbMotionToStore(video: string, meta: DepthRunMeta, frameCount: number, w: number, h: number, store: FrameStore<Uint8Array>, crop: CropRect | null): Promise<boolean> {
+  const reader = openRawFrames(sampledRgbArgs(video, meta, frameCount, w, h, "area", crop), w * h * 3);
+  const gate = new RgbMotionGate(w, h);
+  const out = new Uint8Array(w * h);
+  let t = 0;
+  try {
+    for (;;) {
+      const batch = await reader.read(16);
+      if (!batch.length) break;
+      for (const f of batch) {
+        if (t >= frameCount) break;
+        gate.next(f, 0, out);
+        store.write(t++, out);
+      }
+      progress("rgb", Math.min(t, frameCount), frameCount);
+    }
+  } finally { reader.close(); }
+  progress("rgb", frameCount, frameCount);
+  if (t < frameCount) {
+    console.warn(`[ares] depth: the video yielded ${t} sampled frame(s), the run has ${frameCount} — the motion gate falls back to the depth change itself`);
+    return false;
+  }
+  return true;
+}
+
+/** Does the source video carry an audio stream at all? (Default-on audio needs to know.) */
+async function videoHasAudio(video: string): Promise<boolean> {
+  const { execFile } = await import("node:child_process");
+  const { promisify } = await import("node:util");
+  try {
+    const { stdout } = await promisify(execFile)(ffprobePath(), ["-v", "error", "-select_streams", "a", "-show_entries", "stream=codec_type", "-of", "csv=p=0", video]);
+    return /audio/i.test(String(stdout));
+  } catch { return false; }
+}
+
+/**
+ * `ares depth <video> --depth <run-dir>` — a flat 2D video plus a monocular depth run become a
+ * 2.5D volumetric clip: a per-frame pinhole-unprojected relief mesh wearing the video as its
+ * texture. The depth run comes from one of the engines (the Python GPU service or the browser
+ * worker) and is consumed through the ares-depth/1 directory contract (depth-io.ts).
+ *
+ * Every stage STREAMS. A run is frames x H x W floats and a clip is frames x ~1.6 MB of mesh; a
+ * four-minute video is gigabytes of each, so nothing here holds a clip: the run is read a frame at
+ * a time, the stabilizer's passes go through scratch frame stores, and the second half of the
+ * pipeline moves one GOP at a time from the stabilized store and the texture decoder, through
+ * meshing, to the chunk writer.
+ *
+ *   pass A  decode RGB at the map size -> motion gate store
+ *   pass B  stabilize (align, smooth, normalise) -> stabilized store
+ *   pass C  per GOP: decode texture frames; per frame: image-guided resample onto the grid,
+ *           unproject, cut silhouettes (or keep the sheet), decimate, fill layer; encode the GOP's
+ *           texture and geometry; append the chunk
+ *   finish  centre the clip (a translation of the chunk boxes), write header + index, copy chunks
+ *
+ * The UVs ARE the grid coordinates, so the video frame is the atlas — no packing step exists.
+ */
+async function depth(a: string[]) {
+  const video = a[1]!;
+  const runDir = flag(a, "--depth");
+  if (!runDir) throw new Error("depth: --depth <run-dir> is required (a directory holding depth.json + depth.f32)");
+  const out = flag(a, "-o") ?? "out.ares";
+
+  const run = await openDepthRun(runDir);
+  const scratch = await mkdtemp(join(tmpdir(), "ares-depthwork-"));
+  const stores: { close(): void }[] = [];
+  let writer: MeshClipWriter | null = null;
+  try {
+    const meta = run.meta;
+    const runW = run.width, runH = run.height, runP = runW * runH;
+    let frames = run.frames;
+    const fps = meta.fps;
+    const metric = meta.kind === "metric-depth";
+    console.log(`[ares] depth run ${runDir}: ${meta.engine}/${meta.modelKey} (${meta.model}), ${meta.kind}, ${runW}x${runH}, ${frames} frame(s) @ ${fps}fps` +
+      `${meta.temporal === "model" ? ", temporally consistent model" : ""}${run.hasMask ? `, subject mask ${JSON.stringify(meta.mask?.prompt ?? "")}` : ""}`);
+
+    const fov = numFlag(a, "--fov", 55, { min: 1, max: 179 });
+    // A relative run's depth range is a choice, and its ratio is what a viewer sees: the relief is
+    // exact from the capture camera whatever the range, and from anywhere else content at depth z
+    // is z times larger than it looks in the picture. At 0.5..6 m (12:1) the characters of a shot
+    // sat at doll size in front of a background twelve times their scale; 2..6 m keeps it at 3:1.
+    // A metric run is already in metres: 0.5..20 m clamps only what the model got wrong.
+    const near = numFlag(a, "--near", metric ? 0.5 : 2, { min: 0.001 });
+    const far = numFlag(a, "--far", metric ? 20 : 6, { min: 0.002 });
+    if (far <= near) throw new Error(`--far (${far}) must be greater than --near (${near})`);
+    const gridW = numFlag(a, "--grid", 256, { min: 2, max: 4096, int: true });
+    const edge = numFlag(a, "--edge", 0.08, { min: 0, max: 100 });
+    const sheets = has(a, "--sheets");
+    const strength = numFlag(a, "--stabilize", 0.7, { min: 0, max: 1 });
+    const median = numFlag(a, "--median", 5, { min: 1, max: 5, int: true });
+    if (median % 2 === 0) throw new Error(`--median: expected 1, 3 or 5 frames, got ${median}`);
+    const gop = numFlag(a, "--gop", 30, { min: 1, max: 65535, int: true });
+    const smoothTemporal = numFlag(a, "--smooth-temporal", 0, { min: 0, int: true });
+    const noTexture = has(a, "--no-texture");
+    const noAudio = has(a, "--no-audio");
+    const decimate = flag(a, "--decimate") != null ? numFlag(a, "--decimate", 1, { min: 0.01, max: 1 }) : 1;
+    if (decimate < 1 && sheets) throw new Error("--decimate re-triangulates every frame and --sheets needs one topology for the whole clip; use one or the other");
+    const guided = !has(a, "--no-guided");
+    const snap = has(a, "--snap-ramps");
+    const guideSigma = numFlag(a, "--guide-sigma", 14, { min: 0.5, max: 255 });
+    const inpaint = has(a, "--inpaint");
+    const band = numFlag(a, "--inpaint-band", Math.max(4, Math.round(gridW * 0.16)), { min: 1, max: 4096, int: true });
+
+    const texSize = numFlag(a, "--tex-size", 1024, { min: 16, max: 8192, int: true });
+    if (texSize % 4) throw new Error(`--tex-size: ${texSize} is not a multiple of 4; 4:2:0 video and the fill plate need it`);
+    const codecRaw = flag(a, "--texture-codec") ?? "vp9";
+    if (codecRaw !== "vp9" && codecRaw !== "av1") throw new Error(`--texture-codec: expected vp9|av1, got ${JSON.stringify(codecRaw)}`);
+    const crf = numFlag(a, "--crf", 30, { min: 0, max: 63, int: true });
+
+    const haveFfmpeg = await ffmpegAvailable();
+    if (!haveFfmpeg) console.warn("[ares] ffmpeg is not available to the encoder: geometry only, no texture, no audio, and the stabilizer gates on the depth change instead of the image.");
+
+    // ---- letterbox: the bars are not part of the picture, so they become neither geometry nor
+    // texture, and they stay out of the normalisation range (a bar reads as infinitely far) ---------
+    const cropArg = flag(a, "--crop") ?? "auto";
+    const srcFullW = meta.sourceWidth ?? runW, srcFullH = meta.sourceHeight ?? runH;
+    let crop: CropRect | null = null;
+    let cropFrom = "none";
+    if (cropArg === "auto") {
+      if (!haveFfmpeg) console.log("[ares] letterbox: not detected (ffmpeg is not available)");
+      else if (meta.sourceWidth == null || meta.sourceHeight == null) console.log("[ares] letterbox: not detected (the run does not record the source size)");
+      else {
+        try {
+          const d = await detectLetterbox(video, srcFullW, srcFullH);
+          if (d) { crop = d.crop; cropFrom = `detected over ${d.frames} frame(s)`; }
+          else console.log("[ares] letterbox: none");
+        } catch (e) { console.warn(`[ares] letterbox: detection failed (${(e as Error).message}); the full frame is used`); }
+      }
+    } else if (cropArg !== "none") {
+      const m = /^(\d+):(\d+):(\d+):(\d+)$/.exec(cropArg);
+      if (!m) throw new Error(`--crop: expected auto, none or W:H:X:Y in source pixels, got ${JSON.stringify(cropArg)}`);
+      crop = { w: +m[1]!, h: +m[2]!, x: +m[3]!, y: +m[4]! };
+      if (crop.w < 2 || crop.h < 2 || crop.x + crop.w > srcFullW || crop.y + crop.h > srcFullH) throw new Error(`--crop ${cropArg} does not fit inside the ${srcFullW}x${srcFullH} source`);
+      cropFrom = "--crop";
+    }
+    let mapBox = { x: 0, y: 0, w: runW, h: runH };
+    if (crop) {
+      const c = mapCrop(crop, runW, runH, srcFullW, srcFullH);
+      if (c.map.w < 2 || c.map.h < 2) throw new Error(`the crop ${crop.w}x${crop.h}+${crop.x}+${crop.y} leaves under 2x2 of the ${runW}x${runH} maps`);
+      mapBox = c.map; crop = c.source;
+      console.log(`[ares] letterbox: picture ${crop.w}x${crop.h}+${crop.x}+${crop.y} of ${srcFullW}x${srcFullH} (${cropFrom}), maps ${mapBox.w}x${mapBox.h}+${mapBox.x}+${mapBox.y} of ${runW}x${runH}`);
+    }
+    // From here on W x H is the picture: the cropped maps, and the source size is the crop's.
+    const W = mapBox.w, H = mapBox.h, P = W * H;
+    const srcW = crop ? crop.w : srcFullW, srcH = crop ? crop.h : srcFullH;
+    const gridH = Math.max(2, Math.round(gridW * srcH / srcW));
+    const cropped = mapBox.w !== runW || mapBox.h !== runH;
+    /** Copy the picture's rows of one full run frame (`from`, runW x runH) into `to` (W x H). */
+    const cutMap = <T extends Float32Array | Uint8Array>(from: T, to: T): T => {
+      if (!cropped) { to.set(from.subarray(0, P)); return to; }
+      for (let y = 0; y < H; y++) { const s = (mapBox.y + y) * runW + mapBox.x; to.set(from.subarray(s, s + W), y * W); }
+      return to;
+    };
+
+    // Scratch stores: memory for a short clip, files past 256 MB so clip length is bounded by disk.
+    const bigClip = frames * P * 4 > (1 << 28);
+    const makeF32 = (name: string): FrameStore<Float32Array> => {
+      const s = bigClip ? fileStore<Float32Array>(join(scratch, `${name}.f32`), 4, frames, P) : memoryStore((n) => new Float32Array(n), frames, P);
+      stores.push(s); return s;
+    };
+    const makeU8 = (name: string): FrameStore<Uint8Array> => {
+      const s = bigClip ? fileStore<Uint8Array>(join(scratch, `${name}.u8`), 1, frames, P) : memoryStore((n) => new Uint8Array(n), frames, P);
+      stores.push(s); return s;
+    };
+    if (bigClip) console.log(`[ares] long clip: working set on disk in ${scratch} (${((frames * P * 9) / 1073741824).toFixed(1)} GB)`);
+
+    // ---- pass A: RGB motion gate over the SAME sampled frames the depth engine consumed ----------
+    let motion: FrameStore<Uint8Array> | null = null;
+    if (haveFfmpeg) {
+      const m = makeU8("motion");
+      // Optional by design: a video ffmpeg cannot open still yields a clip from the depth alone.
+      try { if (await rgbMotionToStore(video, meta, frames, W, H, m, crop)) motion = m; }
+      catch (e) { console.warn(`[ares] depth: could not decode ${basename(video)} for the motion gate (${(e as Error).message}) — falling back to the depth change`); }
+      if (!motion) m.close();
+    } else progress("rgb", 0, frames);
+
+    // ---- pass B: stabilize ------------------------------------------------------------------------
+    const ts = performance.now();
+    const raw = new Float32Array(runP);
+    const stab = stabilizeDepthStream({
+      width: W, height: H, frames, motion, makeF32, makeU8,
+      readRaw: (t, o) => { run.readFrames(t, 1, raw); cutMap(raw, o); },
+    }, {
+      kind: meta.kind, strength, median,
+      align: meta.temporal !== "model",
+      grow: !has(a, "--no-grow"),
+      onProgress: (i, n) => { if (i === n || i % 30 === 0) progress("stabilize", Math.floor((i * frames) / Math.max(1, n)), frames); },
+    });
+    const st = stab.stats;
+    console.log(`[ares] stabilize (strength ${strength}, gate ${st.rgbGated ? "rgb" : "depth-derived"}${strength > 0 && median > 1 ? `, ${median}-frame median` : ""}${st.aligned ? "" : ", alignment off: the model is temporally consistent"}): scale ${st.scaleMin.toFixed(3)}..${st.scaleMax.toFixed(3)} (mean ${st.scaleMean.toFixed(3)}), ` +
+      `${st.clamped} clamped, ${st.degenerate} degenerate, gate grown on ${st.grownFrames} frame(s), still-pixel alpha ${st.alphaStill.toFixed(3)}, mean motion ${st.motionMean.toFixed(1)}/255`);
+    console.log(`[ares]   ${metric ? `depth percentiles ${stab.lo.toFixed(2)}..${stab.hi.toFixed(2)} m (kept in metres)` : `disparity percentiles ${stab.lo.toFixed(4)}..${stab.hi.toFixed(4)} -> [0,1], 1 = nearest`} in ${((performance.now() - ts) / 1000).toFixed(1)}s`);
+    if (st.clamped > 0.1 * Math.max(1, st.aligned)) {
+      console.warn(`[ares] stabilize: ${st.clamped} of ${st.aligned} frame fits hit the [0.5, 2] scale clamp; depth may drift across the clip. A temporally consistent engine (video-small, video-large) does not need the fit.`);
+    }
+    if (motion) motion.close();
+
+    // ---- grid, atlas layout -----------------------------------------------------------------------
+    const aspect = srcW / srcH;
+    const texW = texSize, texH = texSize, plateH = inpaint ? texSize / 2 : 0, atlasH = texH + plateH;
+    const vScale = texH / atlasH;
+    const grid = buildDepthGrid(gridW, gridH, aspect, fov, { vScale, vOffset: 0 });
+    const plateGrid = inpaint ? buildDepthGrid(gridW, gridH, aspect, fov, { vScale: plateH / atlasH, vOffset: vScale }) : null;
+    console.log(`[ares] grid ${gridW}x${gridH} (aspect ${aspect.toFixed(3)} from ${srcW}x${srcH}), fov ${fov}deg vertical, z ${near}..${far}${metric ? " m" : ""}, ` +
+      `${sheets ? "sheets (full grid, persistent topology, silhouettes discarded at draw time)" : `silhouette cull at edge ${edge}`}` +
+      `${decimate < 1 ? `, decimate ${decimate}` : ""}${inpaint ? `, fill layer (band ${band} cells, plate ${texW}x${plateH})` : ""}`);
+
+    // ---- model transform: identical law to `encode`, but defaulting to "stand it on the floor" ----
+    // Rotation and scale are applied per frame; the centring offset needs the whole clip's bounds,
+    // so it is applied at finish() as a translation of the chunk boxes.
+    const modelXf: ModelTransform = parseModelTransform(a) ?? { upAxis: "y", center: "bottom", rotate: [0, 0, 0], translate: [0, 0, 0], scale: 1 };
+    const bounds: Aabb = { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] };
+
+    // ---- audio: default ON, taken from the video's own stream -------------------------------------
+    let audio: AudioTrackData | null = null;
+    let audioSource: string | null = null;
+    if (!noAudio) {
+      if (flag(a, "--audio")) { audio = await audioFromFlags(a, fps, 0, frames); audioSource = flag(a, "--audio")!; }
+      else if (haveFfmpeg && (await videoHasAudio(video))) {
+        audio = await audioFromFlags([...a, "--audio", video], fps, 0, frames);
+        audioSource = video;
+      } else if (haveFfmpeg) console.log(`[ares] audio: ${basename(video)} has no audio stream — none muxed`);
+    }
+
+    // ---- pass C: GOP by GOP -------------------------------------------------------------------------
+    const wantTexture = !noTexture && haveFfmpeg;
+    const needFrames = haveFfmpeg && (wantTexture || guided || inpaint || snap);
+    if (!noTexture && !haveFfmpeg) console.warn("[ares] no texture: ffmpeg is not available to the encoder. Geometry-only.");
+    if (inpaint && !wantTexture) console.warn("[ares] --inpaint builds the fill geometry, but its colours live in the texture and this clip has none.");
+    const texReader = needFrames ? openRawFrames(sampledRgbArgs(video, meta, frames, texW, texH, "lanczos", crop), texW * texH * 3) : null;
+    if (wantTexture) console.log(`[ares] texture video: ${codecRaw} ${texW}x${atlasH}, crf ${crf}, one closed GOP per ${gop} frames`);
+    if (decimate < 1) await simplifierReady();
+    writer = await MeshClipWriter.open({
+      out, fps, gopLength: gop, audio: audio ?? undefined,
+      textureVideo: wantTexture ? { fourcc: codecRaw === "av1" ? "AV01" : "VP09", width: texW, height: atlasH } : undefined,
+      temporal: { forceIntra: !sheets, smoothTemporal },
+    });
+
+    const tm = performance.now();
+    const fullTris = (gridW - 1) * (gridH - 1) * 2;
+    const surfaceDepth = new DepthHistogram(near, far);
+    // The silhouette cut carries its per-edge decisions from frame to frame (depth-mesh.ts
+    // hysteresis): an edge near the threshold keeps its state instead of blinking.
+    const cutState = sheets ? null : new Uint8Array(cutEdgeCount(gridW, gridH));
+    let cutPrimed = false;
+    let triSum = 0, fillTriSum = 0, texBytes = 0, done = 0, snapSum = 0;
+    const map = new Float32Array(P), maskMap = run.hasMask ? new Uint8Array(P) : null, maskFull = run.hasMask ? new Uint8Array(runP) : null;
+    const guideMap = new Uint8Array(P * 3), guideGrid = new Uint8Array(gridW * gridH * 3);
+    const inflight: { meshes: EncodeMeshFrame[]; tex: Promise<TextureGop> | null }[] = [];
+    let framesFailed = false;
+    const drain = async (keep: number) => {
+      while (inflight.length > keep) {
+        const g = inflight.shift()!;
+        const t = g.tex ? await g.tex : null;
+        if (t) texBytes += t.frames.reduce((s, f) => s + f.data.byteLength, 0);
+        writer!.writeGop(g.meshes, t ? t.frames : null);
+        done += g.meshes.length;
+        progress("texture", done, frames);
+        progress("mux", done, frames);
+      }
+    };
+    try {
+      for (let t0 = 0; t0 < frames; t0 += gop) {
+        let n = Math.min(gop, frames - t0);
+        let texFrames: Uint8Array[] | null = null;
+        if (texReader && !framesFailed) {
+          try { texFrames = await texReader.read(n); }
+          catch (e) {
+            // Only the texture genuinely needs the video decoded: without one, a video ffmpeg cannot
+            // open still yields a clip from the depth alone, resampled without the image guide.
+            if (wantTexture || t0 > 0) throw e;
+            console.warn(`[ares] depth: could not decode ${basename(video)} for the image guide (${(e as Error).message}); resampling unguided`);
+            framesFailed = true; texFrames = null;
+          }
+        }
+        if (texFrames) {
+          if (texFrames.length < n) {
+            // Never let the two halves drift: frame i of the geometry must be frame i of the texture.
+            const have = t0 + texFrames.length;
+            if (have < 1) throw new Error(`the video decode produced no frames from ${video}`);
+            console.warn(`[ares] video frames (${have}) != depth frames (${frames}) — truncating the clip to ${have}`);
+            n = texFrames.length; frames = have;
+            if (!n) break;
+          }
+        }
+        const meshes: EncodeMeshFrame[] = [];
+        const atlasFrames: Uint8Array[] = [];
+        for (let k = 0; k < n; k++) {
+          const t = t0 + k;
+          stab.out.read(t, map);
+          const frame = texFrames ? texFrames[k]! : null;
+          let gm: Float32Array;
+          if (frame && (guided || inpaint || snap)) resizeRgbArea(frame, texW, texH, gridW, gridH, guideGrid);
+          if (frame && guided) {
+            resizeRgbArea(frame, texW, texH, W, H, guideMap);
+            gm = guidedResample(map, W, H, guideMap, guideGrid, gridW, gridH, { sigmaRange: guideSigma });
+          } else gm = resampleMap(map, W, H, gridW, gridH);
+          let gmask: Uint8Array | null = null;
+          if (maskMap && maskFull) { run.readMask(t, 1, maskFull); gmask = resampleMask(cutMap(maskFull, maskMap), W, H, gridW, gridH); }
+          if (snap) snapSum += snapRamps(gm, gridDepths(gm, gridW * gridH, { kind: meta.kind, near, far }), gridW, gridH, frame ? guideGrid : null, FILL_MIN_JUMP);
+          let m = depthFrameToMesh(gm, grid, { kind: meta.kind, near, far, edge, sheets, mask: gmask, hysteresis: cutState ? { state: cutState, primed: cutPrimed } : undefined });
+          cutPrimed = true;
+          surfaceDepth.add(m.positions);   // before decimation, which thins the vertices unevenly
+          if (decimate < 1 && m.indices.length > 3) m = decimateFrame(m, decimate);
+          triSum += m.indices.length / 3;
+          if (inpaint && frame && plateGrid) {
+            const z = gridDepths(gm, gridW * gridH, { kind: meta.kind, near, far });
+            const fill = buildFillLayer(z, gridW, gridH, guideGrid, { edge, band, mask: gmask });
+            const fm = fillLayerToMesh(fill, z, plateGrid, { edge, sheets });
+            fillTriSum += fm.indices.length / 3;
+            if (fm.indices.length) m = mergeMeshes(m, fm);
+            if (wantTexture) atlasFrames.push(composeLayeredAtlas(frame, texW, texH, plateH, fill, gridW, gridH));
+          } else if (wantTexture && frame) atlasFrames.push(frame);
+          const p = m.positions;
+          for (let i = 0; i < p.length; i += 3) for (let c = 0; c < 3; c++) {
+            const v = p[i + c]!;
+            if (v < bounds.min[c]!) bounds.min[c] = v;
+            if (v > bounds.max[c]!) bounds.max[c] = v;
+          }
+          // Sheets share one uv/index buffer between frames; positions are always per frame.
+          applyTransform(m.positions, modelXf, [0, 0, 0]);
+          meshes.push(m);
+        }
+        progress("mesh", t0 + n, frames);
+        const tex = wantTexture
+          ? encodeRawTextureGop({ frames: atlasFrames, width: texW, height: atlasH, fps, gopLength: gop, codec: codecRaw as TexCodec, crf, workDir: scratch, tag: t0 })
+          : null;
+        // An unobserved rejection would take the process down before drain() reaches it.
+        tex?.catch(() => { /* surfaced by the await in drain */ });
+        inflight.push({ meshes, tex });
+        await drain(3);
+      }
+      await drain(0);
+    } finally { texReader?.close(); }
+    progress("mesh", frames, frames);
+    console.log(`[ares] meshed ${frames} frame(s): ${Math.round(triSum / frames)} tris/frame of ${fullTris} full-grid ` +
+      `(${(100 - (triSum / frames / fullTris) * 100).toFixed(1)}% ${decimate < 1 ? "culled + decimated" : "culled"})` +
+      `${inpaint ? `, fill layer ${Math.round(fillTriSum / frames)} tris/frame` : ""}${guided && needFrames ? ", image-guided resample" : ""}` +
+      `${snap ? `, ${(snapSum / frames).toFixed(0)} ramp vertices snapped/frame` : ""} in ${((performance.now() - tm) / 1000).toFixed(1)}s`);
+    if (wantTexture) console.log(`[ares] texture video: ${(texBytes / 1048576).toFixed(2)} MB (${(texBytes / frames / 1024).toFixed(1)} KB/frame)`);
+
+    // ---- finish: centre, relief metadata, layout ----------------------------------------------------
+    const offset = resolveOffset(bounds, modelXf);
+    {
+      const after = transformAabb(bounds, modelXf);
+      const lo = after.min.map((v, i) => v + offset[i]!), hi = after.max.map((v, i) => v + offset[i]!);
+      console.log(`[ares] transform: up=${modelXf.upAxis} center=${modelXf.center} scale=${modelXf.scale} rotate=[${modelXf.rotate}] translate=[${modelXf.translate}]`);
+      console.log(`[ares]   bounds ${bounds.min.map((v) => v.toFixed(2))}..${bounds.max.map((v) => v.toFixed(2))} -> ${lo.map((v) => v.toFixed(2))}..${hi.map((v) => v.toFixed(2))}`);
+    }
+    const clipMeta: Record<string, string> = { title: basename(video), encoder: "ares-cli/0.2.0", source: "depth" };
+    const discard = reliefDiscard(gridH, fov, edge, far);
+    const unit = Math.abs(modelXf.scale ?? 1);
+    const framing = surfaceDepth.framing();
+    // The capture camera sits at the origin looking down -Z; carry both through the model transform.
+    // Every relief records it: the player opens a relief at that camera, orbits it about `pivot`, and
+    // sizes its sway from the depth span (`near`, `far`: the nearest and farthest 5 % of the surface).
+    const fwd = applyTransform(new Float32Array([0, 0, -1]), modelXf, [0, 0, 0]);
+    const fl = Math.hypot(fwd[0]!, fwd[1]!, fwd[2]!) || 1;
+    clipMeta["relief.camera"] = offset.map((v) => +v.toFixed(6)).join(",");
+    clipMeta["relief.forward"] = [fwd[0]! / fl, fwd[1]! / fl, fwd[2]! / fl].map((v) => +v.toFixed(6)).join(",");
+    clipMeta["relief.fov"] = String(fov);
+    clipMeta["relief.aspect"] = String(+(srcW / srcH).toFixed(6));
+    if (framing) {
+      clipMeta["relief.pivot"] = String(+(framing.pivot * unit).toFixed(6));
+      clipMeta["relief.near"] = String(+(framing.near * unit).toFixed(6));
+      clipMeta["relief.far"] = String(+(framing.far * unit).toFixed(6));
+    }
+    // A culled clip has no stretched triangles and no parked vertices; only sheets need the discard.
+    if (sheets) {
+      clipMeta["relief.slope"] = String(+discard.slope.toFixed(6));
+      clipMeta["relief.depthMax"] = String(+(discard.depthMax * unit).toFixed(6));
+    }
+    console.log(`[ares] relief: capture camera at [${clipMeta["relief.camera"]}] looking [${clipMeta["relief.forward"]}], fov ${fov}deg, ` +
+      `${framing ? `surface depth ${framing.near.toFixed(3)}..${framing.far.toFixed(3)}${metric ? " m" : ""} (5th..95th percentile), pivot ${framing.pivot.toFixed(3)}` : "no surface"}` +
+      `${sheets ? `, draw-time discard slope ${discard.slope.toFixed(4)}` : ""}`);
+    const t1 = performance.now();
+    const r = writer.finish({ meta: clipMeta, translate: offset });
+    writer = null;
+    const mode = r.temporalFrames && !r.intraFrames ? "temporal (I+P)" : r.temporalFrames ? "mixed I+P/intra" : "intra-only";
+    console.log(`[ares] geometry: ${mode} — ${r.temporalFrames} temporal + ${r.intraFrames} intra frames in ${r.chunks} chunk(s)`);
+    console.log(`[ares] wrote ${out} — ${(r.sizeBytes / 1048576).toFixed(2)} MB, ${(r.sizeBytes / frames / 1024).toFixed(1)} KB/frame, laid out in ${((performance.now() - t1) / 1000).toFixed(1)}s`);
+
+    let srcBytes = 0;
+    try { srcBytes = (await stat(video)).size; } catch { /* the video may be gone by now */ }
+    await writeClipMeta(a, out, {
+      output: { name: basename(out), sizeBytes: r.sizeBytes, frames, fps, durationS: +(frames / fps).toFixed(2) },
+      source: { video, kind: "2d-video+depth-run", depthRun: runDir, videoBytes: srcBytes, fileCount: 1, sourceWidth: meta.sourceWidth, sourceHeight: meta.sourceHeight, sourceFps: meta.sourceFps, sourceFrames: meta.sourceFrames },
+      depth: {
+        engine: meta.engine, model: meta.model, modelKey: meta.modelKey, kind: meta.kind, temporal: meta.temporal ?? "none",
+        mapWidth: runW, mapHeight: runH, frames, sampling: meta.sampling, device: meta.device, dtype: meta.dtype,
+        crop: crop ? { source: [crop.w, crop.h, crop.x, crop.y], map: [mapBox.w, mapBox.h, mapBox.x, mapBox.y], from: cropFrom } : null,
+        fov, near, far, grid: [gridW, gridH], edge, sheets, stabilize: strength, median: strength > 0 ? median : 1,
+        guided: guided && needFrames ? { sigmaRange: guideSigma } : null,
+        snapRamps: snap ? { jump: FILL_MIN_JUMP, perFrame: +(snapSum / Math.max(1, frames)).toFixed(1) } : null,
+        decimate: decimate < 1 ? decimate : null,
+        inpaint: inpaint ? { band, plate: [texW, plateH], trisPerFrame: Math.round(fillTriSum / Math.max(1, frames)) } : null,
+        mask: run.hasMask ? meta.mask : null,
+        discard: sheets ? discard : null,
+        framing: framing ? { pivot: +framing.pivot.toFixed(4), near: +framing.near.toFixed(4), far: +framing.far.toFixed(4) } : null,
+        normalization: { lo: stab.lo, hi: stab.hi, units: metric ? "metres" : "disparity -> [0,1], 1 = nearest" },
+        gate: st.rgbGated ? "rgb" : "depth-derived",
+        scale: { min: st.scaleMin, max: st.scaleMax, mean: st.scaleMean, clamped: st.clamped, degenerate: st.degenerate, grownFrames: st.grownFrames },
+      },
+      encode: {
+        gop, texSize: wantTexture ? texSize : null, atlas: wantTexture ? [texW, atlasH] : null, textureCodec: wantTexture ? codecRaw : null, crf: wantTexture ? crf : null,
+        noTexture, forceIntra: !sheets, smoothTemporal,
+        quantBitsPos: 14, quantBitsUv: 16,
+        transform: modelXf,
+        audio: audio ? { source: basename(audioSource ?? video), bitrateKbps: numFlag(a, "--audio-bitrate", 96), offsetSec: numFlag(a, "--audio-offset", 0), packets: audio.packets.length } : null,
+      },
+      geometry: { mode, temporalFrames: r.temporalFrames, intraFrames: r.intraFrames, chunks: r.chunks, trisPerFrame: Math.round(triSum / Math.max(1, frames)), fullGridTris: fullTris },
+      tooling: { encoder: "ares-cli/0.2.0", node: process.version, generatedBy: "ares depth" },
+    });
+    await info(["info", out]);
+  } finally {
+    writer?.abort();
+    for (const s of stores) s.close();
+    run.close();
+    await rm(scratch, { recursive: true, force: true });
+  }
+}
+
 /** Locate frame `idx` in a parsed file: its chunk, its block, and the keyframe block(s) leading to it. */
 function locateFrame(file: ReturnType<typeof Demuxer.parse>, idx: number) {
   for (const gop of file.gopIndex) {
@@ -1025,29 +1560,90 @@ async function exportCmd(a: string[]) {
 
 async function info(a: string[]) {
   const path = a[1]!;
-  const file = Demuxer.parse(new Uint8Array(await readFile(path)));
-  const h = file.header, s = file.superblock;
-  const profile = h.geometryProfile === GeometryProfile.SplatIPB ? "splat" : h.geometryProfile === GeometryProfile.MeshIPB ? "mesh" : `profile ${h.geometryProfile}`;
-  console.log(`[ares] ${path}: v${h.versionMajor}.${h.versionMinor}, ${h.frameCount} frames @ ${h.fps}fps, ${(Number(h.durationUs) / 1e6).toFixed(2)}s`);
-  if (h.geometryProfile === GeometryProfile.SplatIPB) {
-    await meshoptReady();
-    let n = 0;
-    try { const { blocks } = locateFrame(file, 0); n = decodeSplatBlock(blocks[0]!.data).count; } catch { /* leave 0 */ }
-    console.log(`       geometry ${profile} · ${n} splats in frame 0 · SH degree ${s.shDegree} · quant ${s.quantBitsPos}b pos · gop=${s.gopLength}`);
-  } else {
-    console.log(`       geometry ${profile} intra=${h.intraCodec} · quant ${s.quantBitsPos}b pos / ${s.quantBitsUv}b uv · gop=${s.gopLength}`);
-  }
-  console.log(`       ${file.gopIndex.length} chunk(s), ${file.tracks.length} track(s): ${file.tracks.map((t) => t.codecFourcc).join(", ")}`);
-  const vid = Demuxer.textureVideo(file);
-  const tex = Demuxer.textureAtlas(file);
-  console.log(`       texture: ${vid ? `${vid.fourcc} video ${vid.width}x${vid.height}` : tex ? `${tex.width}x${tex.height} still atlas, ${(tex.bytes.length / 1024).toFixed(1)} KB` : "none"}`);
-  const at = Demuxer.audioTrack(file);
-  if (at) {
-    let packets = 0, bytes = 0, endUs = 0;
-    for (const gop of file.gopIndex) for (const p of Demuxer.audioPackets(file, Demuxer.chunkAt(file, gop))) { packets++; bytes += p.data.byteLength; endUs = Math.max(endUs, p.ptsUs + p.durationUs); }
-    console.log(`       audio: ${at.fourcc} 48 kHz ${at.channels === 1 ? "mono" : "stereo"}, ${packets} packets, ${(endUs / 1e6).toFixed(2)}s, ${(bytes / 1024).toFixed(1)} KB`);
-  }
-  console.log(`       AABB min [${s.aabb.min.map((v) => v.toFixed(2)).join(", ")}] max [${s.aabb.max.map((v) => v.toFixed(2)).join(", ")}]`);
+  // Never read whole: a clip runs to gigabytes, and `ares depth` ends every encode with this. The
+  // head (everything before the first chunk) is read once; the audio totals and a splat clip's
+  // first frame come from chunks read one at a time.
+  const fh = await open(path, "r");
+  try {
+    const hdr = new Uint8Array(HEADER_SIZE);
+    await fh.read(hdr, 0, HEADER_SIZE, 0);
+    const first = Number(Demuxer.parseHeader(hdr).firstChunkOffset);
+    const head = new Uint8Array(first);
+    await fh.read(head, 0, first, 0);
+    const file = Demuxer.parse(head);
+    /** One chunk as a file of its own: its bytes at offset 1 (chunkAt rejects a chunk at 0). */
+    const chunkFile = async (gop: GopEntry) => {
+      const buf = new Uint8Array(1 + gop.byteLength);
+      await fh.read(buf, 1, gop.byteLength, Number(gop.byteOffset));
+      const f = { ...file, buf, gopIndex: [{ ...gop, byteOffset: 1n }] };
+      return { f, chunk: Demuxer.chunkAt(f, f.gopIndex[0]!) };
+    };
+    const h = file.header, s = file.superblock;
+    const profile = h.geometryProfile === GeometryProfile.SplatIPB ? "splat" : h.geometryProfile === GeometryProfile.MeshIPB ? "mesh" : `profile ${h.geometryProfile}`;
+    console.log(`[ares] ${path}: v${h.versionMajor}.${h.versionMinor}, ${h.frameCount} frames @ ${h.fps}fps, ${(Number(h.durationUs) / 1e6).toFixed(2)}s`);
+    if (h.geometryProfile === GeometryProfile.SplatIPB) {
+      await meshoptReady();
+      let n = 0;
+      try {
+        const { f, chunk } = await chunkFile(file.gopIndex[0]!);
+        n = decodeSplatBlock(Demuxer.geometryBlocks(f, chunk)[0]!.data).count;
+      } catch { /* leave 0 */ }
+      console.log(`       geometry ${profile} · ${n} splats in frame 0 · SH degree ${s.shDegree} · quant ${s.quantBitsPos}b pos · gop=${s.gopLength}`);
+    } else {
+      console.log(`       geometry ${profile} intra=${h.intraCodec} · quant ${s.quantBitsPos}b pos / ${s.quantBitsUv}b uv · gop=${s.gopLength}`);
+    }
+    console.log(`       ${file.gopIndex.length} chunk(s), ${file.tracks.length} track(s): ${file.tracks.map((t) => t.codecFourcc).join(", ")}`);
+    const vid = Demuxer.textureVideo(file);
+    const tex = Demuxer.textureAtlas(file);
+    console.log(`       texture: ${vid ? `${vid.fourcc} video ${vid.width}x${vid.height}` : tex ? `${tex.width}x${tex.height} still atlas, ${(tex.bytes.length / 1024).toFixed(1)} KB` : "none"}`);
+    const at = Demuxer.audioTrack(file);
+    if (at) {
+      let packets = 0, bytes = 0, endUs = 0;
+      for (const gop of file.gopIndex) {
+        const { f, chunk } = await chunkFile(gop);
+        for (const p of Demuxer.audioPackets(f, chunk)) { packets++; bytes += p.data.byteLength; endUs = Math.max(endUs, p.ptsUs + p.durationUs); }
+      }
+      console.log(`       audio: ${at.fourcc} 48 kHz ${at.channels === 1 ? "mono" : "stereo"}, ${packets} packets, ${(endUs / 1e6).toFixed(2)}s, ${(bytes / 1024).toFixed(1)} KB`);
+    }
+    console.log(`       AABB min [${s.aabb.min.map((v) => v.toFixed(2)).join(", ")}] max [${s.aabb.max.map((v) => v.toFixed(2)).join(", ")}]`);
+  } finally { await fh.close(); }
+}
+
+/**
+ * `ares verify-edits <file.edits.json>` — a sidecar pre-flight that needs no frames directory.
+ * parseEditList throws on a malformed document; this additionally runs validateMasks, which is
+ * the only check that catches the failure mode a bake CANNOT report: an unrecognised mask2d
+ * matches nothing, so the encode succeeds and the edit silently did not happen. Exits 1 on any
+ * issue so a script can gate a bake on it.
+ */
+async function verifyEdits(a: string[]) {
+  const path = a[1]!;
+  const list = parseEditList(JSON.parse(await readFile(path, "utf8")));
+  const trim = list.trim ? `, trim ${list.trim.in}..${list.trim.out}` : "";
+  console.log(`[ares] ${path}: ${list.ranges.length} range(s)${list.frameCount ? `, ${list.frameCount} source frames` : ""}${trim}`);
+  const issues = validateMasks(list);
+  list.ranges.forEach((r, i) => {
+    const derived = r.keyframes.filter((k) => k.derived === true).length;
+    const shapes = new Set<string>();
+    for (const kf of r.keyframes) for (const v of kf.volumes ?? []) {
+      shapes.add(v.type !== "mask2d" ? v.type
+        : v.kind === "bitmap" && v.mask ? `mask2d bitmap ${v.mask.width}x${v.mask.height}`
+        : `mask2d ${v.kind ?? "no kind"}`);
+    }
+    // Re-run per range for the count only: the printed issues come from the whole-document pass
+    // above, which is the one that knows each range's real index for an id-less range.
+    const bad = validateMasks({ ...list, ranges: [r] }).length;
+    // `muted` is the one field of the same kind as mode/action that changes whether the bake reads
+    // this range at all (encode filters on isRangeEnabled), so a report that gates a bake has to
+    // say it — otherwise a muted range's issues read as a reason the bake will fail when the bake
+    // will not even look at it.
+    console.log(`       ${r.id ?? `#${i}`} · ${r.mode}${r.action && r.action !== "delete" ? ` ${r.action}` : ""}${isRangeEnabled(r) ? "" : " · muted"} · frames ${r.startFrame}..${r.endFrame} · ` +
+      `${r.keyframes.length} kf (${r.keyframes.length - derived} user, ${derived} derived) · ${[...shapes].join(", ") || "no volumes"} · ${bad ? `${bad} issue(s)` : "ok"}`);
+  });
+  for (const issue of issues) console.log(`[ares] edits: ${issue}`);
+  // exitCode, not exit(): the summary above is several console.log calls and a piped stdout on
+  // Windows flushes asynchronously, so exiting here would truncate the very report being gated on.
+  if (issues.length) process.exitCode = 1;
 }
 
 const USAGE = `usage:
@@ -1065,9 +1661,24 @@ const USAGE = `usage:
               [--up-axis x|y|z] [--center bottom|mass|none] [--scale N] [--rotate x,y,z] [--translate x,y,z]
               [--meta-extra-file f.json]  (merged into the <out>.ares.meta.json provenance sidecar)
               [--audio file] [--audio-offset seconds] [--audio-bitrate kbps]   (any format ffmpeg reads → Opus 48 kHz)
+  ares depth  <video> --depth <run-dir> [-o out.ares]   (2D video + monocular depth run → 2.5D relief clip)
+              unprojection: [--fov 55] [--near 2, or 0.5 for a metric run] [--far 6, or 20] [--grid 256]
+                            [--edge 0.08] [--sheets]            (--sheets: full grid, persistent topology, silhouettes cut at draw time)
+                            [--decimate ratio]                  (triangles kept per frame after the cut; excludes --sheets)
+                            [--crop auto|none|W:H:X:Y]          (letterbox: auto detects the bars; W:H:X:Y in source pixels)
+              surface:      [--no-guided] [--guide-sigma 14]    (image-guided resampling of depth onto the grid)
+                            [--snap-ramps]                      (vertices partway down a silhouette ramp take one side's depth)
+                            [--inpaint] [--inpaint-band cells]  (fill layer behind silhouettes, plate under the frame in the atlas)
+              depth:        [--stabilize 0.7] [--no-grow]       (0 = raw per-frame depth, 1 = strongest temporal smoothing)
+                            [--median 5]                        (temporal median frames after smoothing: 1 off, 3, 5)
+              texture:      [--tex-size 1024] [--texture-codec vp9|av1] [--crf 30] [--no-texture]
+              audio:        on by default from the video's own stream; [--no-audio] [--audio file] [--audio-offset s] [--audio-bitrate kbps]
+              also:         [--gop 30] [--smooth-temporal N] [--up-axis x|y|z] [--center bottom|mass|none]
+                            [--scale N] [--rotate x,y,z] [--translate x,y,z] [--meta-extra-file f.json]
   ares export <file.ares> -o <out> [--frame N]
               mesh → .obj | .ply      splat → .spz | .ply (3DGS) | .glb (KHR_gaussian_splatting) | .splat
-  ares info   <file.ares>`;
+  ares info   <file.ares>
+  ares verify-edits <file.edits.json>   (per-range keyframe/mask2d report; exit 1 on any issue)`;
 
 async function main() {
   const a = process.argv.slice(2);
@@ -1075,8 +1686,10 @@ async function main() {
   try {
     if (cmd === "synth") await synth(a);
     else if (cmd === "encode" && a[1]) await encode(a);
+    else if (cmd === "depth" && a[1]) await depth(a);
     else if (cmd === "export" && a[1]) await exportCmd(a);
     else if (cmd === "info" && a[1]) await info(a);
+    else if (cmd === "verify-edits" && a[1]) await verifyEdits(a);
     else {
       console.error(USAGE);
       process.exit(cmd === "--help" || cmd === "-h" || cmd === "help" ? 0 : 1);
