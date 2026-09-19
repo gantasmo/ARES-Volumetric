@@ -183,26 +183,62 @@ async function findFramesSubdir(dir: string, names: string[]): Promise<string | 
  * editor only ever sees the whole thing), so trimming without this would silently slide every range
  * by `from` frames — a delete authored on the head would land in the middle of the body.
  *
- * Ranges that fall wholly outside the window are dropped; partial ones are clamped. Keyframes are
- * shifted but NEVER dropped, even when they land outside [0, n): prepareRangeAt interpolates
- * between the keyframes bracketing a frame, so discarding an out-of-window one would change the
- * shape of the surviving in-window frames. A copy op whose srcFrame was trimmed away is dropped
+ * Ranges that fall wholly outside the window are dropped; partial ones are clamped. A USER
+ * keyframe is shifted but NEVER dropped, even when it lands outside [0, n): prepareRangeAt
+ * interpolates between the keyframes bracketing a frame, so discarding an out-of-window anchor
+ * would change the shape of the surviving in-window frames. That reasoning inverts for a
+ * `derived` keyframe — a propagation writes one per frame, so every surviving frame already
+ * carries its own and nothing in-window interpolates through an out-of-window one. Those ARE
+ * dropped, because at ~272 keyframes per range the alternative is carrying the whole trimmed-off
+ * tail's decoded bitmaps through the bake. A copy op whose srcFrame was trimmed away is dropped
  * outright with a warning — its source no longer exists, and silently copying from some other frame
  * would be a fabrication.
+ *
+ * There is deliberately NO `from === 0` fast path: a trim-out-only bake (the common one — the
+ * editor's out point moves far more often than its in point) still has to clamp endFrame to the
+ * shorter window and still has to drop the derived keyframes past it. `trimmed` says whether the
+ * window is actually narrower than the discovered clip, which is what gates the copy-payload
+ * rebase below — see the comment there.
  */
-function rebaseEditList(list: EditList, from: number, n: number): EditList {
-  if (from === 0) return list;
+function rebaseEditList(list: EditList, from: number, n: number, trimmed: boolean): EditList {
   const ranges: EditRange[] = [];
+  let droppedDerived = 0;
   for (const r of list.ranges) {
     const s = r.startFrame - from, e = r.endFrame - from;
-    if (e < 0 || s > n - 1) continue;                         // wholly outside the kept window
+    // A copy range is exempt: its bake frames are copy.srcFrame/dstFrames, and frame-copy.ts
+    // evaluates its region with prepareRangeAt(range, srcFrame) — the span never enters the
+    // computation, so it is not the gate for this action. The srcFrame/dstFrames checks below are.
+    if ((r.action ?? "delete") !== "copy" && (e < 0 || s > n - 1)) {
+      console.log(`[ares] trim: dropping range ${r.id ?? `${r.startFrame}-${r.endFrame}`} — its span is wholly outside the ${n}-frame window`);
+      continue;
+    }
+    const keyframes = r.keyframes
+      .map((k) => ({ ...k, frame: k.frame - from }))
+      .filter((k) => {
+        if (k.derived !== true || (k.frame >= 0 && k.frame <= n - 1)) return true;
+        droppedDerived++;
+        return false;
+      });
+    // Every keyframe was derived and every one fell outside: the range now matches nothing. Drop
+    // it rather than keep an empty-keyframe range, which for mode:"keep" would put every point
+    // "outside all keep regions" and delete the frame whole (the trap parseEditList documents).
+    if (!keyframes.length) {
+      console.warn(`[ares] trim: dropping range ${r.id ?? `${r.startFrame}-${r.endFrame}`} — every keyframe it had is derived and outside the trim`);
+      continue;
+    }
     const nr: EditRange = {
       ...r,
       startFrame: Math.max(0, s),
       endFrame: Math.min(n - 1, e),
-      keyframes: r.keyframes.map((k) => ({ ...k, frame: k.frame - from })),
+      keyframes,
     };
-    if (nr.copy) {
+    // Only rebase the copy payload when the window is actually narrower than the clip. Untrimmed,
+    // `src < 0 || src >= n` and the dstFrames filter below are the SAME bounds collectCopyOps
+    // (frame-copy.ts) checks — but it throws where these warn-and-drop, and a partly out-of-range
+    // dstFrames list drops silently. A typo'd frame index in a hand-authored sidecar has to keep
+    // failing loudly (frame-copy.ts's header states that contract, and recolor.ts cites it as the
+    // reason recolor clamps and copy does not).
+    if (nr.copy && trimmed) {
       const cp = nr.copy;
       const src = cp.srcFrame - from;
       const dst = cp.dstFrames.map((d: number) => d - from).filter((d: number) => d >= 0 && d < n);
@@ -214,10 +250,14 @@ function rebaseEditList(list: EditList, from: number, n: number): EditList {
         console.warn(`[ares] trim: dropping copy range ${r.id ?? `${r.startFrame}-${r.endFrame}`} — every dstFrame is outside the trim`);
         continue;
       }
+      if (dst.length !== cp.dstFrames.length)
+        console.warn(`[ares] trim: copy range ${r.id ?? `${r.startFrame}-${r.endFrame}`} pastes to ${dst.length} of ${cp.dstFrames.length} dstFrame(s) — the rest are outside the trim`);
       nr.copy = { ...cp, srcFrame: src, dstFrames: dst };
     }
     ranges.push(nr);
   }
+  if (droppedDerived)
+    console.log(`[ares] trim: dropped ${droppedDerived} derived keyframe(s) outside the ${n}-frame window (user keyframes are kept wherever they land)`);
   return { ...list, ranges };
 }
 
@@ -432,7 +472,7 @@ async function encode(a: string[]) {
   // onto the kept window before anything below reads a frame number. --crop is the degenerate
   // one-keyframe keep-box edit list, so both flags flow through the same path (preview == bake) —
   // and it is built AFTER the re-base, in trimmed space, since frames.length is already trimmed.
-  if (editList) editList = rebaseEditList(editList, from, files.length);
+  if (editList) editList = rebaseEditList(editList, from, files.length, from !== 0 || toExcl !== discovered.length);
   const cropArg = flag(a, "--crop");
   if (cropArg) {
     const box = parseCropBox(cropArg);

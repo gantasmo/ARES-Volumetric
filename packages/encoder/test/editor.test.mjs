@@ -1,7 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { collectSculptOps, applySculptToFrame, synthClip, filterFrame } from "../dist/index.js";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
+import { execFileSync } from "node:child_process";
+import { fileURLToPath } from "node:url";
+import { collectSculptOps, applySculptToFrame, synthClip, filterFrame, writeObj } from "../dist/index.js";
 import { parseEditList, validateMasks, keepPredicateAt, prepareRangeSdfAt, morphBitmap, growKeyframe, mirrorKeyframe, rleEncodeMask, rleDecodeMask, isRangeEnabled } from "@ares/core";
+
+const CLI = fileURLToPath(new URL("../dist/cli.js", import.meta.url));
 
 /** Flat n×n grid on y = 0 (see mesh.test.mjs); noisy y when `noise` is set. */
 function gridPlane(n, noise = 0) {
@@ -206,4 +213,62 @@ test("validateMasks reports the mask2d faults that bake as a silent no-op", () =
   ] }] });
   assert.equal(far.length, 1);
   assert.match(far[0], /range r1 kf 0 is unreachable — no frame in \[50, 60\] brackets it/);
+});
+
+test("a trim-out-only bake still rebases: derived keyframes past the window are dropped, user keyframes are not", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ares-trim-"));
+  try {
+    const frames = join(dir, "frames");
+    mkdirSync(frames);
+    synthClip("talk", 4, 30).frames.forEach((f, i) => writeFileSync(join(frames, `mesh-f${String(i + 1).padStart(5, "0")}.obj`), writeObj(f)));
+    // A box far from the mesh: nothing is deleted, so what the assertions read is purely the rebase.
+    const far = { type: "box", min: [100, 100, 100], max: [101, 101, 101] };
+    writeFileSync(join(dir, "clip.edits.json"), JSON.stringify({ aresEdits: 1, fps: 30, ranges: [{ id: "r1", mode: "delete", startFrame: 0, endFrame: 20, keyframes: [
+      { frame: 0, derived: true, volumes: [far] },
+      { frame: 8, volumes: [far] },                     // user, outside the window: ALWAYS kept
+      { frame: 9, derived: true, volumes: [far] },      // derived, outside the window: dropped
+    ] }] }));
+    // --trim-out with no --trim-in is the common trim and the one rebaseEditList used to skip
+    // entirely, so before the early return was removed this log line did not exist at all. The
+    // count is the assertion: 2 would mean the `derived` test was ignored, 0 that nothing ran.
+    const log = execFileSync(process.execPath, [CLI, "encode", frames, "-o", join(dir, "t.ares"), "--no-texture", "--edits", join(dir, "clip.edits.json"), "--trim-out", "1"], { encoding: "utf8" });
+    assert.match(log, /trim: keeping source frames 0\.\.1 of 4/);
+    assert.match(log, /trim: dropped 1 derived keyframe\(s\) outside the 2-frame window/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("the rebase leaves a copy range's frame refs alone: span is not its gate, and a typo still aborts", () => {
+  const dir = mkdtempSync(join(tmpdir(), "ares-copytrim-"));
+  try {
+    const frames = join(dir, "frames");
+    mkdirSync(frames);
+    synthClip("talk", 4, 30).frames.forEach((f, i) => writeFileSync(join(frames, `mesh-f${String(i + 1).padStart(5, "0")}.obj`), writeObj(f)));
+    // Span 3..3, region = the whole mesh. The demo authors exactly this shape: ensureRange stamps
+    // startFrame from the playhead while srcFrame/dstFrames are typed independently.
+    const sidecar = (copy) => JSON.stringify({ aresEdits: 1, ranges: [{ id: "c1", mode: "delete", action: "copy",
+      startFrame: 3, endFrame: 3, keyframes: [{ frame: 3, volumes: [{ type: "box", min: [-99, -99, -99], max: [99, 99, 99] }] }], copy }] });
+    const file = join(dir, "copy.edits.json");
+    const run = (...args) => execFileSync(process.execPath, [CLI, "encode", frames, "-o", join(dir, "t.ares"), "--no-texture", "--edits", file, ...args], { encoding: "utf8" });
+
+    // A copy op's bake frames are srcFrame/dstFrames — frame-copy.ts evaluates its region with
+    // prepareRangeAt(range, srcFrame) and never reads the span — so the "wholly outside the
+    // window" drop must not reach it, even when the trim excludes the span outright.
+    writeFileSync(file, sidecar({ srcFrame: 0, dstFrames: [1], what: "geo" }));
+    const log = run("--trim-out", "1");
+    assert.match(log, /copy c1 \(srcFrame 0 → frame 1\)/);
+    assert.doesNotMatch(log, /dropping range c1/);
+
+    // Untrimmed, a typo'd frame ref must still ABORT through collectCopyOps rather than be quietly
+    // clamped away by the rebase — the contract frame-copy.ts's header states and recolor.ts cites.
+    writeFileSync(file, sidecar({ srcFrame: 300, dstFrames: [1], what: "geo" }));
+    assert.throws(() => run(), /copy\.srcFrame 300 out of range \[0, 4\)/);
+    // The partial case is the invisible one: a dstFrames list with one bad entry pasted to the
+    // good frames and said nothing.
+    writeFileSync(file, sidecar({ srcFrame: 0, dstFrames: [1, 300], what: "geo" }));
+    assert.throws(() => run(), /copy\.dstFrames entry 300 out of range \[0, 4\)/);
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });
