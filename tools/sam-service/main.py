@@ -81,9 +81,14 @@ def _resolve_sam3_dir():
 
 
 SAM3_DIR = _resolve_sam3_dir()
+# The .pth is the file that actually exists (models/sam_vit_h_4b8939.pth, 2,564,550,879 bytes); the
+# fp16 .safetensors this used to name has never been in the tree, so with SAM_BACKEND=auto a sam3
+# failure left BOTH backends failed and the documented fallback was dead. _load_vith branches on
+# the extension, because pointing this at the .pth alone is not enough — safetensors' load_file
+# raises SafetensorError (HeaderTooLarge) on a torch pickle, past the isfile guard.
 VITH_CHECKPOINT = os.environ.get(
     "SAM_CKPT",
-    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "sam_vit_h_4b8939_fp16.safetensors"),
+    os.path.join(os.path.dirname(os.path.abspath(__file__)), "models", "sam_vit_h_4b8939.pth"),
 )
 BACKEND_PREF = os.environ.get("SAM_BACKEND", "auto")  # auto | sam3 | vit_h
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
@@ -214,17 +219,26 @@ def _assert_vision_encoder_shared(concept_model) -> None:
 
 
 def _load_vith():
-    """SAM v1 ViT-H fp16 — plain safetensors load (no mmgp/accelerate needed)."""
+    """SAM v1 ViT-H — a torch pickle (.pth) or a safetensors file, decided by the EXTENSION.
+
+    The branch is not a nicety: this loader was safetensors-only, so once the checkpoint on disk
+    was the upstream .pth, load_file raised SafetensorError (HeaderTooLarge) from inside the try
+    that only guards a missing file, and the fallback backend could never load at all."""
     global _predictor
-    from safetensors.torch import load_file
     from segment_anything import sam_model_registry, SamPredictor
 
     if not os.path.isfile(VITH_CHECKPOINT):
         raise FileNotFoundError(f"SAM ViT-H checkpoint not found: {VITH_CHECKPOINT}")
     t0 = time.time()
-    model = sam_model_registry["vit_h"](checkpoint=None)
-    model.load_state_dict(load_file(VITH_CHECKPOINT))
-    model.to(torch.float32)  # fp16 storage -> fp32 weights (precision), predict under autocast
+    if VITH_CHECKPOINT.lower().endswith(".safetensors"):
+        from safetensors.torch import load_file
+        model = sam_model_registry["vit_h"](checkpoint=None)
+        model.load_state_dict(load_file(VITH_CHECKPOINT))
+        model.to(torch.float32)  # fp16 storage -> fp32 weights (precision), predict under autocast
+    else:
+        # segment_anything torch.loads and load_state_dicts it itself (build_sam.py:102-105); the
+        # upstream .pth is already fp32, so there is nothing to promote.
+        model = sam_model_registry["vit_h"](checkpoint=VITH_CHECKPOINT)
     model.to(device=DEVICE)
     model.eval()
     _predictor = SamPredictor(model)
