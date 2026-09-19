@@ -392,9 +392,16 @@ async function samEnsure(send) {
     if (!existsSync(SAM_PS1)) { send && send("log", `SAM launcher missing: ${SAM_PS1}`); return false; }
     if (!samChild || samChild.exitCode !== null) {
       send && send("log", "starting SAM service (model load ~40 s on first start)…");
+      // NOT detached. Measured 2026-09-18 (Windows PowerShell 5.1.26100): powershell.exe spawned
+      // with `detached: true` exits 0 within a second without running the script at all, whatever
+      // the window style or stdio (five variants tried, tools/sam-service/sam-service.log never
+      // even gained a new transcript), so every auto-start silently timed out after 180 s. Without
+      // `detached` the same command binds the port in ~3 s and reports ready in ~13 s. Windows does
+      // not kill a child when its parent exits, so the service still outlives this process; it now
+      // shares this process's (hidden) console instead of a new process group.
       samChild = spawn("powershell.exe",
         ["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", SAM_PS1],
-        { detached: true, stdio: "ignore", windowsHide: true });
+        { stdio: "ignore", windowsHide: true });
       samChild.unref();
     } else {
       send && send("log", "waiting for the SAM service to finish starting…");

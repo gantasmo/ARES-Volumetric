@@ -231,8 +231,11 @@ function startSamService() {
   if (process.platform !== "win32") fail("mode sam is Windows-only (the service runs from a local Python env); start it from the app's Edit panel instead.");
   if (!existsSync(SAM_PS1)) fail(`missing ${SAM_PS1}`);
   log("starting the SAM segmentation service (the first start loads weights, 10-20 s)...");
+  // Not detached: Windows PowerShell 5.1 spawned with `detached: true` exits 0 at once without
+  // running the script (measured 2026-09-18, see tools/serve.mjs samEnsure). The child outlives
+  // this process regardless: Windows never kills a child with its parent.
   spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", SAM_PS1], {
-    detached: true, stdio: "ignore", windowsHide: true,
+    stdio: "ignore", windowsHide: true,
   }).unref();
   log("SAM service starting on http://127.0.0.1:7263; log: tools/sam-service/sam-service.log");
 }
