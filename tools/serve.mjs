@@ -882,7 +882,9 @@ async function handle(req, res) {
   if (path === "/runpod/status") {
     res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
     const key = await readRunpodKey();
-    if (!key) { res.end(JSON.stringify({ ok: false, error: "no RunPod key (set RUNPOD_API_KEY or save it to " + RUNPOD_KEY_FILE + ")" })); return; }
+    // A credential is the one input only the person has: `needsKey` makes the Compute panel show
+    // its key field, which posts to /runpod/key below.
+    if (!key) { res.end(JSON.stringify({ ok: false, needsKey: true, error: "RunPod API key not stored" })); return; }
     try {
       const d = await runpodGraphQL(key, "query{myself{clientBalance currentSpendPerHr pods{id name desiredStatus costPerHr gpuCount machine{gpuDisplayName} runtime{uptimeInSeconds}}}}");
       const me = d.myself;
@@ -897,6 +899,23 @@ async function handle(req, res) {
         })),
       }));
     } catch (e) { res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) })); }
+    return;
+  }
+
+  // Store the RunPod API key: POST /runpod/key {"key":"…"} -> { ok } | { ok:false, error }.
+  // Validated against the API before it is written to RUNPOD_KEY_FILE; never echoed or logged.
+  if (path === "/runpod/key" && req.method === "POST") {
+    let body = ""; req.on("data", (d) => { body += d; if (body.length > 4096) req.destroy(); });
+    await new Promise((r) => req.on("end", r));
+    res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
+    let key = ""; try { key = String(JSON.parse(body || "{}").key || "").trim(); } catch { /* malformed */ }
+    if (!/^[A-Za-z0-9_\-]{20,200}$/.test(key)) { res.end(JSON.stringify({ ok: false, error: "invalid key format" })); return; }
+    try {
+      await runpodGraphQL(key, "query{myself{id}}");
+      await mkdir(dirname(RUNPOD_KEY_FILE), { recursive: true });
+      await writeFile(RUNPOD_KEY_FILE, key, "utf8");
+      res.end(JSON.stringify({ ok: true }));
+    } catch (e) { res.end(JSON.stringify({ ok: false, error: "key rejected by RunPod: " + String((e && e.message) || e).slice(0, 120) })); }
     return;
   }
 

@@ -40,6 +40,30 @@ async function render() {
   let d;
   try { d = await fetch("/runpod/status").then((r) => r.json()); }
   catch { out.innerHTML = `<div class="card"><div class="note" style="color:var(--bad)">Dev server not reachable.</div></div>`; return; }
+  if (!d.ok && d.needsKey) {
+    // The API key is a credential, the one input only the person has: collected here, validated
+    // and stored by the server (POST /runpod/key), never rendered back.
+    out.innerHTML = `<div class="card"><div class="cap">RunPod API key</div>
+      <div class="row" style="gap:6px;margin-top:6px;flex-wrap:wrap">
+        <input id="rpKey" class="inp" type="password" autocomplete="off" spellcheck="false" placeholder="rpa_…" style="flex:1;min-width:200px">
+        <button class="u primary" id="rpKeySave">Store</button>
+      </div>
+      <div class="note2" id="rpKeyMsg" style="margin-top:4px">Stored server-side in .runpod/runpod.key. Not sent to the browser again.</div></div>`;
+    const save = async () => {
+      const input = $("rpKey"), msg = $("rpKeyMsg");
+      const key = input.value.trim();
+      if (!key) { input.focus(); return; }
+      msg.style.color = ""; msg.textContent = "validating…";
+      let r;
+      try { r = await fetch("/runpod/key", { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ key }) }).then((x) => x.json()); }
+      catch { r = { ok: false, error: "dev server not reachable" }; }
+      input.value = "";
+      if (r.ok) render(); else { msg.style.color = "var(--bad)"; msg.textContent = r.error || "rejected"; }
+    };
+    $("rpKeySave").onclick = save;
+    $("rpKey").onkeydown = (e) => { if (e.key === "Enter") save(); };
+    return;
+  }
   if (!d.ok) { out.innerHTML = `<div class="card"><div class="note" style="color:var(--bad)">RunPod: ${esc(d.error)}</div></div>`; return; }
 
   const bal = Number(d.balance || 0);
