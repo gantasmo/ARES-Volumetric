@@ -13,6 +13,8 @@
  * same Install button works, because the download runs through the stored HF token.
  */
 
+import { accessPrompt } from "./ensure.js";
+
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const gb = (mb) => (mb >= 1024 ? (mb / 1024).toFixed(mb % 1024 && mb < 10240 ? 1 : 0) + " GB" : (mb || 0) + " MB");
@@ -39,8 +41,7 @@ async function load() {
 function hardwareCard() {
   if (!gpu) return "";
   const blockers = [];
-  if (!pre?.python && !pre?.envPresent) blockers.push("No Python on PATH — the environment step will say how to fix it.");
-  if (!pre?.hfToken) blockers.push(`No Hugging Face token stored, so gated models cannot download. Run <code>hf auth login</code> in a terminal.`);
+  if (!pre?.python && !pre?.envPresent) blockers.push("CPython 3.11 to 3.13: none detected. The Python environment component unpacks a private interpreter.");
   const gpuRows = gpu.gpus.map((g, i) =>
     `<div class="k">GPU ${i}</div><div class="v">${esc(g.name)} · ${gb(g.vramMB)} · sm_${String(g.cc).replace(".", "")}</div>`).join("");
   return `
@@ -51,10 +52,54 @@ function hardwareCard() {
         ${gpuRows || `<div class="k">GPU</div><div class="v">none detected: models will run on the CPU</div>`}
         <div class="k">precision</div><div class="v">${esc(gpu.dtype)} <small style="color:var(--text-faint)">· ${esc(gpu.dtypeWhy)}</small></div>
         ${gpu.cudaIndex ? `<div class="k">PyTorch build</div><div class="v">${esc(gpu.cudaIndex)} <small style="color:var(--text-faint)">· ${esc(gpu.cudaWhy)}</small></div>` : ""}
-        <div class="k">Hugging Face</div><div class="v">${pre?.hfToken ? "token stored: gated models can download" : "not signed in"}</div>
+        <div class="k">Hugging Face</div><div class="v" id="hfState">${pre?.hfToken ? "token stored: gated models can download" : "not signed in"}</div>
       </div>
       ${blockers.map((b) => `<div class="note2" style="color:var(--warn);margin-top:6px">${b}</div>`).join("")}
+      ${tokenFormHtml(!!pre?.hfToken)}
     </div>`;
+}
+
+/** Hugging Face sign-in, inline. Gated repos used to dead-end here: the licence button opened a
+ *  browser and the token still had to be created with `hf auth login` in a terminal. The token is
+ *  posted once to /hf-token, validated server-side, and never rendered back. */
+function tokenFormHtml(haveToken) {
+  if (haveToken) return `<div class="note2" style="margin-top:6px">Signed in. <a href="#" id="hfChange">Use a different token</a></div>`;
+  return `
+    <div id="hfForm" style="margin-top:8px">
+      <div class="row" style="flex-wrap:wrap;gap:6px">
+        <input id="hfToken" class="inp" type="password" autocomplete="off" spellcheck="false"
+               placeholder="hf_…" style="flex:1;min-width:200px">
+        <button class="u primary" id="hfSave">Sign in</button>
+        <a class="u gatebtn" href="https://huggingface.co/settings/tokens" target="_blank" rel="noopener">Create a token ↗</a>
+      </div>
+      <div class="note2" id="hfMsg" style="margin-top:4px">A read token is enough. Stored by huggingface_hub, the same place the CLI keeps it.</div>
+    </div>`;
+}
+
+function wireTokenForm() {
+  const change = $("hfChange");
+  if (change) change.onclick = (e) => {
+    e.preventDefault();
+    change.closest(".note2").outerHTML = tokenFormHtml(false);
+    wireTokenForm();
+  };
+  const btn = $("hfSave");
+  if (!btn) return;
+  const submit = async () => {
+    const input = $("hfToken"), msg = $("hfMsg");
+    const token = input.value.trim();
+    if (!token) { input.focus(); return; }
+    btn.disabled = true; msg.textContent = "checking…"; msg.style.color = "";
+    let r;
+    try { r = await fetch("/hf-token", { method: "POST", body: JSON.stringify({ token }) }).then((x) => x.json()); }
+    catch { r = { ok: false, error: "dev server not reachable" }; }
+    input.value = "";                                     // never leave the token in the DOM
+    btn.disabled = false;
+    if (r.ok) { msg.style.color = "var(--good)"; msg.textContent = r.user ? `signed in as ${r.user}` : "token stored"; setTimeout(() => render(), 700); }
+    else { msg.style.color = "var(--bad)"; msg.textContent = r.error || "rejected"; }
+  };
+  btn.onclick = submit;
+  $("hfToken").onkeydown = (e) => { if (e.key === "Enter") submit(); };
 }
 
 function profileCards() {
@@ -98,7 +143,9 @@ function componentRows() {
       ? `installed${d.onDiskMB ? " · " + gb(d.onDiskMB) : ""}`
       : `${gb(d.sizeMB)}${d.vramMB ? " · " + gb(d.vramMB) + " VRAM" : ""}`;
     const gate = d.gated && !d.present
-      ? `<a class="u gatebtn" href="${esc(d.gated.url)}" target="_blank" rel="noopener">Accept licence ↗</a>` : "";
+      ? `<a class="u gatebtn" href="${esc(d.gated.url)}" target="_blank" rel="noopener">Accept licence ↗</a>`
+        + (pre?.hfToken ? "" : `<span class="csize" style="color:var(--warn)">token needed</span>`)
+      : "";
     return `
       <label class="comp${d.present ? " have" : ""}">
         <input type="checkbox" data-id="${esc(d.id)}"${on ? " checked" : ""}${d.present ? " disabled" : ""}>
@@ -127,7 +174,7 @@ function statusRows() {
   const rows = deps.filter((d) => d.statusOnly);
   if (!rows.length) return "";
   return `<details class="card"><summary style="cursor:pointer;font-weight:600;font-size:13px">Other components (${rows.filter((r) => r.present).length}/${rows.length} present)</summary>
-      <div class="note" style="margin:6px 0">Not downloadable from here — your own data, a licensed SDK, or a separate application.</div>
+      <div class="note" style="margin:6px 0">Not downloadable from here: your own capture data, or a licensed SDK no installer may fetch.</div>
       ${rows.map((d) => `
         <label class="comp status${d.present ? " have" : ""}">
           <span style="width:16px;text-align:center;color:var(--text-faint)">${d.present ? "✓" : "·"}</span>
@@ -174,13 +221,19 @@ function runInstall(ids) {
     });
     es.addEventListener("error", (e) => {
       es.close(); busy = false;
-      let msg = "failed (connection lost)", gated = null;
-      try { const d = JSON.parse(e.data); msg = d.message || msg; gated = d.gated ? d.url : null; } catch { /* no payload */ }
+      let msg = "failed (connection lost)", gate = null;
+      try { const d = JSON.parse(e.data); msg = d.message || msg; gate = d.gated ? d : null; } catch { /* no payload */ }
       title.textContent = "✗ " + msg;
       line("✗ " + msg);
-      if (gated) line("→ open the licence page above, accept it, then press Install again.");
-      // Re-render so the buttons come back, but keep the log on screen to be read.
-      render({ keepLog: true }).then(() => done(false));
+      // Re-render so the buttons come back, but keep the log on screen to be read. A gated
+      // repository raises the access prompt under the log; Resume repeats this same install.
+      render({ keepLog: true }).then(() => {
+        if (gate) {
+          const host = document.createElement("div");
+          $("instPanel").append(host);
+          accessPrompt(host, gate, () => { runInstall(ids).then(done); });
+        } else done(false);
+      });
     });
   });
 }
@@ -221,6 +274,7 @@ async function render({ keepLog = false } = {}) {
   if (keepLog && priorLog != null) { $("instLog").textContent = priorLog; $("instTitle").textContent = priorTitle; }
 
   $("depRefresh").onclick = () => render();
+  wireTokenForm();
   for (const b of out.querySelectorAll("[data-profile]")) b.onclick = () => {
     if (busy) return;
     const p = profs.find((x) => x.id === b.dataset.profile);

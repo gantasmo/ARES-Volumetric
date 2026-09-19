@@ -60,12 +60,17 @@ if ($busy) {
         $h = SamHealth
         if ($h) { Write-Output "Existing SAM instance is up (ok=$($h.ok))."; Done; exit 0 }
     }
-    Fail "Port $Port is occupied by a process that never answered /health. Free it (Get-NetTCPConnection -LocalPort $Port) and retry."
+    $owner = $null
+    try { $owner = (Get-Process -Id (Get-NetTCPConnection -LocalPort $Port -State Listen -ErrorAction Stop | Select-Object -First 1).OwningProcess -ErrorAction Stop).ProcessName } catch {}
+    Fail "Port $Port is held by another process ($owner) that does not answer /health; the service cannot bind."
 }
 
 $Py = $null
 foreach ($c in $PyCandidates) { if (Test-Path $c) { $Py = $c; break } }
-if (-not $Py) { Fail "WanGP python not found. Looked for:`n$($PyCandidates -join "`n")`nInstall/repair the Pinokio 'wan' app, or edit `$PyCandidates in run-sam-service.ps1." }
+# serve.mjs samEnsure() installs the python-env component before it launches this script, so an
+# absent interpreter here is a fault to report, never an instruction: the tail of this transcript
+# is relayed into the job log in the app.
+if (-not $Py) { Fail "Python environment absent. Checked: $($PyCandidates -join '; ')" }
 Write-Output "Using python: $Py"
 
 # No weights pre-check here on purpose. main.py resolves SAM 3 from SAM3_DIR, the repo-local

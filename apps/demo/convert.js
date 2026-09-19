@@ -7,7 +7,7 @@
  * now imported from ./probe.js instead of driving their own tab).
  */
 import { initHistoryPanel, recordHistory } from "./history.js";
-import { depStatus } from "./settings.js";
+import { accessPrompt, collectFile, fetchJsonEnsuring, sseErrorData } from "./ensure.js";
 import { probeFile, renderProbe, FOURDS_STATUS } from "./probe.js";
 
 const $ = (id) => document.getElementById(id);
@@ -150,18 +150,25 @@ async function probe4dsPath(p) {
   if (!note) return; // row was replaced by a newer import in the meantime
   note.innerHTML = "Checking codec status…"; note.style.color = "";
   go.disabled = true;
+  // The probe installs what it lacks by itself: the Python environment through /install, the
+  // licensed codec DLL through the native file dialog. Progress shows in this status line.
   let info;
-  try { info = await fetch("/probe-4ds?path=" + encodeURIComponent(p)).then((r) => r.json()); }
-  catch { note.textContent = "Probe failed — is the ARES dev server running?"; note.style.color = "var(--bad)"; return; }
+  const status = (t) => { const n = $("cv4dsCodecNote"); if (n) n.textContent = String(t).trim().slice(0, 140); };
+  try { info = await fetchJsonEnsuring("/probe-4ds?path=" + encodeURIComponent(p), { onLog: status, onStep: (s) => status(`${s.label}: ${s.index + 1} of ${s.total}`) }); }
+  catch { note.textContent = "Probe failed: ARES dev server not reachable"; note.style.color = "var(--bad)"; return; }
+  if (!$("cv4dsCodecNote")) return;
   if (info.error) {
-    note.innerHTML = `${info.error}${info.missing ? ": " + info.missing.join("; ") : ""} — <a href="#" id="cv4dsSettingsLink">Settings</a>`;
     note.style.color = "var(--warn)";
-    const link = $("cv4dsSettingsLink");
-    if (link) link.onclick = (e) => { e.preventDefault(); const b = document.querySelector('#tabs button[data-tab="settings"]'); if (b) b.click(); };
+    if (info.needsFile) {
+      // The dialog was dismissed. The codec is licensed and cannot be fetched, so the row keeps a
+      // control that reopens the dialog.
+      note.innerHTML = `${info.error} · <button class="u" id="cv4dsLocate" style="padding:1px 8px">Locate…</button>`;
+      $("cv4dsLocate").onclick = () => probe4dsPath(p);   // the probe reopens the dialog itself
+    } else note.textContent = info.error;
     return;
   }
-  note.innerHTML = `✓ ${info.nbFrames} frames @ ${info.framerate.toFixed(2)}fps · ${info.textureSize}² ${info.textureEncoding} — ready to convert` +
-    (info.nbFrames >= 200 ? ` <small style="color:var(--text-faint)">(full clip ≈ ${(info.nbFrames / 2 / 60).toFixed(1)} min to decode at ~2 fps — use max frames to bound a test run)</small>` : "");
+  note.innerHTML = `${info.nbFrames} frames · ${info.framerate.toFixed(2)} fps · ${info.textureSize}² ${info.textureEncoding}` +
+    (info.nbFrames >= 200 ? ` <span title="Decode runs at ~2 fps; bound a test run with the frames field.">· ≈${(info.nbFrames / 2 / 60).toFixed(1)} min decode</span>` : "");
   note.style.color = "var(--good)";
   maxInp.placeholder = `all ${info.nbFrames}`;
   maxInp.max = String(info.nbFrames);
@@ -225,10 +232,11 @@ async function run4dsConvert() {
     $("cv4dsShowcase").onclick = async (ev) => { const ok = await addToShowcase(name + ".ares", name); ev.target.textContent = ok ? "Added" : "✗ failed"; ev.target.disabled = ok; };
     if (history) history.refresh();
   });
-  es.addEventListener("error", (e) => {
-    let msg = "conversion failed — is the ARES dev server running and the codec available? (check Settings)";
-    try { const d = JSON.parse(e.data); msg = d.message || msg; } catch { /* connection close */ }
-    finish(false, msg);
+  es.addEventListener("error", async (e) => {
+    const d = sseErrorData(e);
+    finish(false, (d && d.message) || "decode failed");
+    // The licensed codec DLL is the one input the server cannot fetch: collect it and run again.
+    if (d && d.needsFile && (await collectFile(d.needsFile, { onLog: line }))) run4dsConvert();
   });
   es.onerror = () => { /* SSE stream closed by server */ };
 }
@@ -536,15 +544,8 @@ async function runBatch() {
 async function runEnhance() {
   const path = $("cvPath").value.trim();
   if (!path) { $("cvPath").focus(); $("cvPath").style.borderColor = "var(--bad)"; return; }
-  // Graceful dependency gate: warn with a download pointer instead of failing mid-run.
-  if ($("enTier").value === "ncnn") {
-    const dep = await depStatus("realesrgan").catch(() => null);
-    if (dep && !dep.present) {
-      $("enDone").innerHTML = `<div class="note" style="color:var(--warn);margin-top:8px">The Fast tier needs Real-ESRGAN (43 MB), which is not installed.
-        Open <b>⚙ Settings</b> and press Install on “Real-ESRGAN ncnn-vulkan” — it downloads and unpacks itself.</div>`;
-      return;
-    }
-  }
+  // No dependency gate here: /enhance installs the selected tier's runtime and weights inside
+  // its own stream ("[setup] …" lines in the log below) and then runs.
   const q = new URLSearchParams({
     dir: path,
     tier: $("enTier").value,
@@ -584,9 +585,9 @@ async function runEnhance() {
     if (history) history.refresh();
   });
   es.addEventListener("error", (e) => {
-    let msg = "enhance failed — is the ARES dev server running and the folder path correct?";
-    try { const d = JSON.parse(e.data); msg = d.message + (d.hint ? " — " + d.hint : ""); } catch { /* connection/404/503: keep generic */ }
-    finish(false, msg);
+    const d = sseErrorData(e);
+    finish(false, d ? d.message + (d.hint ? " · " + d.hint : "") : "enhance failed: stream closed");
+    if (d && d.gated) accessPrompt(done, d, runEnhance);
   });
   es.onerror = () => { /* SSE stream closed by server */ };
 }
@@ -594,13 +595,13 @@ async function runEnhance() {
 /** Pre-start the local Forge (generative tier) so the first hero-frame enhance skips cold start. */
 function prewarmForge() {
   const btn = $("enForge"), done = $("enDone");
-  btn.disabled = true; const orig = btn.textContent; btn.textContent = "Starting Forge…";
-  done.innerHTML = `<div class="note" style="margin-top:8px">starting Forge (headless, ~30–60 s)…</div>`;
+  btn.disabled = true; const orig = btn.textContent; btn.textContent = "Starting…";
+  done.innerHTML = `<div class="note2" style="margin-top:8px">Forge: starting (headless API)</div>`;
   const es = new EventSource("/forge/start");
   const stop = (html) => { es.close(); btn.disabled = false; btn.textContent = orig; done.innerHTML = html; };
-  es.addEventListener("log", (e) => { done.innerHTML = `<div class="note" style="margin-top:8px">${JSON.parse(e.data)}</div>`; });
-  es.addEventListener("done", () => stop(`<div class="note" style="margin-top:8px;color:var(--good)">✓ Forge ready — the Generative tier will use it.</div>`));
-  es.addEventListener("error", (e) => { let m = "could not start Forge"; try { m = JSON.parse(e.data).message || m; } catch { /* connection close */ } stop(`<div class="note" style="margin-top:8px;color:var(--bad)">✗ ${m}</div>`); });
+  es.addEventListener("log", (e) => { done.innerHTML = `<div class="note2" style="margin-top:8px">${JSON.parse(e.data)}</div>`; });
+  es.addEventListener("done", () => stop(`<div class="note2" style="margin-top:8px;color:var(--good)">Forge ready</div>`));
+  es.addEventListener("error", (e) => { const d = sseErrorData(e); stop(`<div class="note2" style="margin-top:8px;color:var(--bad)">${(d && d.message) || "Forge start failed"}</div>`); });
   es.onerror = () => { /* SSE stream closed by server */ };
 }
 

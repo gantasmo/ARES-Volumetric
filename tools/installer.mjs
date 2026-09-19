@@ -21,9 +21,10 @@
  *     in the Python env (and the env pulls in a CUDA wheel index chosen for THIS GPU) without
  *     the user knowing any of that exists.
  */
-import { spawn } from "node:child_process";
+import { spawn, spawnSync } from "node:child_process";
+import { createHash } from "node:crypto";
 import { createWriteStream, existsSync, readdirSync, readFileSync, statSync } from "node:fs";
-import { mkdir, readdir, readFile, rename, unlink } from "node:fs/promises";
+import { mkdir, readdir, readFile, rename, rm, unlink, writeFile } from "node:fs/promises";
 import { homedir } from "node:os";
 import { dirname, join } from "node:path";
 
@@ -41,7 +42,157 @@ export function paths(ROOT) {
     reqs: join(svc, "requirements.txt"),
     bin: join(ROOT, "tools", "bin"),
     esrganDir: join(ROOT, "tools", "bin", "realesrgan-ncnn-vulkan"),
+    ffmpegDir: join(ROOT, "tools", "bin", "ffmpeg"),     // pinned static build, never on PATH
+    gitDir: join(ROOT, "tools", "bin", "git"),           // MinGit, used when the machine has no git
+    encoderStamp: join(ROOT, "tools", "bin", ".encoder-build"),
+    ext: join(ROOT, "tools", "ext"),          // git clones of third-party source trees live here
   };
+}
+
+// ------------------------------------------------------- tool resolvers ----
+// Every external tool resolves through one function, and every one of them accepts a private
+// copy under tools/bin. That is what lets the installer fetch a tool with no administrator
+// rights and no PATH edit: the server hands the resolved absolute path to whatever it spawns.
+
+/** The encoders the app uses: VP9 and AV1 texture video, Opus audio. A build without all three
+ *  is rejected, so a job never starts against an ffmpeg that fails halfway through. */
+export const FFMPEG_ENCODERS = ["libvpx-vp9", "libsvtav1", "libopus"];
+const ffProbeCache = new Map();   // "<exe>|<mtime>" -> missing encoder names, or null when it does not run
+function ffmpegMissingEncoders(exe) {
+  let key = exe;
+  try { key = exe + "|" + statSync(exe).mtimeMs; } catch { /* bare command name */ }
+  if (ffProbeCache.has(key)) return ffProbeCache.get(key);
+  let missing = null;
+  try {
+    const r = spawnSync(exe, ["-hide_banner", "-encoders"], { windowsHide: true, encoding: "utf8", timeout: 10000 });
+    if (r.status === 0 && r.stdout) missing = FFMPEG_ENCODERS.filter((c) => !r.stdout.split(/\r?\n/).some((l) => l.split(/\s+/).includes(c)));
+  } catch { missing = null; }
+  ffProbeCache.set(key, missing);
+  return missing;
+}
+
+/** ffmpeg.exe inside the private install. The release zip wraps everything in one versioned
+ *  folder; installZip hoists it, and this still looks one level down in case it did not. */
+function localFfmpeg(P) {
+  const exe = process.platform === "win32" ? "ffmpeg.exe" : "ffmpeg";
+  const spots = [join(P.ffmpegDir, "bin", exe), join(P.ffmpegDir, exe)];
+  try {
+    for (const e of readdirSync(P.ffmpegDir, { withFileTypes: true })) if (e.isDirectory()) spots.push(join(P.ffmpegDir, e.name, "bin", exe));
+  } catch { /* not installed */ }
+  return spots.find((p) => existsSync(p)) || null;
+}
+
+/**
+ * ffmpeg + ffprobe, in this order: FFMPEG / FFMPEG_PATH override, tools/bin/ffmpeg, the legacy
+ * C:\FFmpeg\bin, PATH. A candidate is accepted only when it runs, carries every encoder in
+ * FFMPEG_ENCODERS, and has an ffprobe. Returns { ffmpeg, ffprobe, source } with absolute paths,
+ * or null. `findFfmpeg.rejected` holds the reason each skipped candidate was skipped.
+ */
+export function findFfmpeg(ROOT) {
+  const P = paths(ROOT);
+  const abs = (v) => (!v ? null : /[\\/]/.test(v) ? (existsSync(v) ? v : null) : whichSync(v.replace(/\.exe$/i, "")));
+  const envFf = process.env.FFMPEG || process.env.FFMPEG_PATH || "";
+  const legacy = "C:\\FFmpeg\\bin\\ffmpeg.exe";
+  const candidates = [
+    { source: "FFMPEG override", exe: abs(envFf), asked: envFf },
+    { source: "tools/bin/ffmpeg", exe: localFfmpeg(P) },
+    { source: "C:\\FFmpeg\\bin", exe: process.platform === "win32" && existsSync(legacy) ? legacy : null },
+    { source: "PATH", exe: whichSync("ffmpeg") },
+  ];
+  const rejected = [];
+  for (const c of candidates) {
+    if (!c.exe) { if (c.asked) rejected.push(`${c.source}: ${c.asked} does not exist`); continue; }
+    const missing = ffmpegMissingEncoders(c.exe);
+    if (missing === null) { rejected.push(`${c.source}: ${c.exe} does not run`); continue; }
+    if (missing.length) { rejected.push(`${c.source}: ${c.exe} lacks ${missing.join(", ")}`); continue; }
+    const envProbe = process.env.FFPROBE || process.env.FFPROBE_PATH || "";
+    const sibling = c.exe.replace(/ffmpeg(\.exe)?$/i, (m, ext) => "ffprobe" + (ext || ""));
+    const ffprobe = (c.source === "FFMPEG override" && abs(envProbe))
+      || (sibling !== c.exe && existsSync(sibling) ? sibling : null) || whichSync("ffprobe");
+    if (!ffprobe) { rejected.push(`${c.source}: no ffprobe beside ${c.exe}`); continue; }
+    findFfmpeg.rejected = rejected;
+    return { ffmpeg: c.exe, ffprobe, source: c.source };
+  }
+  findFfmpeg.rejected = rejected;
+  return null;
+}
+findFfmpeg.rejected = [];
+
+/** git: PATH first, then the private MinGit under tools/bin/git. */
+export function findGit(ROOT) {
+  const local = join(paths(ROOT).gitDir, "cmd", "git.exe");
+  return whichSync("git") || (existsSync(local) ? local : null);
+}
+
+/** npm without relying on PATH: the server already runs under node, and every official Node
+ *  distribution ships npm beside it. Returns { cmd, prefix } to spawn, or null. */
+export function findNpm() {
+  const cli = join(dirname(process.execPath), "node_modules", "npm", "bin", "npm-cli.js");
+  if (existsSync(cli)) return { cmd: process.execPath, prefix: [cli] };
+  const onPath = whichSync("npm");
+  return onPath ? { cmd: onPath, prefix: [] } : null;
+}
+
+/** vcvars64.bat is the proof that the C++ workload is installed. The BuildTools folder alone is
+ *  not: the bootstrapper creates it before any compiler exists. */
+function findVcvars() {
+  for (const root of ["C:\\Program Files\\Microsoft Visual Studio", "C:\\Program Files (x86)\\Microsoft Visual Studio"]) {
+    let years = [];
+    try { years = readdirSync(root); } catch { continue; }
+    for (const year of years) for (const ed of ["BuildTools", "Community", "Professional", "Enterprise"]) {
+      const p = join(root, year, ed, "VC", "Auxiliary", "Build", "vcvars64.bat");
+      if (existsSync(p)) return p;
+    }
+  }
+  return null;
+}
+
+/** Encoder build state. Stale means a source file under packages/encoder/src or packages/core/src
+ *  is newer than both dist/cli.js and the last build attempt, so a route can rebuild before it
+ *  spawns the CLI. A tree with no sources (a release bundle) is never stale. */
+export function encoderState(ROOT) {
+  const cli = join(ROOT, "packages", "encoder", "dist", "cli.js");
+  if (!existsSync(cli)) return { built: false, stale: false, cli };
+  let built = 0;
+  for (const f of [cli, paths(ROOT).encoderStamp]) { try { built = Math.max(built, statSync(f).mtimeMs); } catch { /* no stamp yet */ } }
+  let newest = 0;
+  const walk = (d) => {
+    let entries = [];
+    try { entries = readdirSync(d, { withFileTypes: true }); } catch { return; }
+    for (const e of entries) {
+      const p = join(d, e.name);
+      if (e.isDirectory()) walk(p);
+      else if (/\.ts$/.test(e.name)) { try { newest = Math.max(newest, statSync(p).mtimeMs); } catch { /* raced */ } }
+    }
+  };
+  for (const pkg of ["encoder", "core"]) walk(join(ROOT, "packages", pkg, "src"));
+  return { built: true, stale: newest > built, cli };
+}
+
+/** True when a Hugging Face token is available to the downloaders. */
+export function hfTokenPresent() {
+  if (process.env.HF_TOKEN) return true;
+  try { return readFileSync(hfTokenFile(), "utf8").trim().length > 0; } catch { return false; }
+}
+
+/** PATH lookup without spawning anything, so the catalog can stay synchronous. */
+export function whichSync(exe) {
+  const isWin = process.platform === "win32";
+  const exts = isWin ? [".exe", ".cmd", ".bat", ""] : [""];
+  for (const dir of (process.env.PATH || "").split(isWin ? ";" : ":")) {
+    if (!dir) continue;
+    for (const e of exts) {
+      const full = join(dir.replace(/^"|"$/g, ""), exe + e);
+      try { if (existsSync(full) && statSync(full).isFile()) return full; } catch { /* unreadable PATH entry */ }
+    }
+  }
+  return null;
+}
+
+/** Where huggingface_hub keeps the CLI token. HF_TOKEN in the environment wins over it. */
+export function hfTokenFile() {
+  if (process.env.HF_HOME) return join(process.env.HF_HOME, "token");
+  return join(homedir(), ".cache", "huggingface", "token");
 }
 
 /** The shared Hugging Face cache — the same one `hf download`, transformers, and diffusers use.
@@ -197,16 +348,55 @@ export function catalog(ROOT, gpu) {
     .find((d) => existsSync(join(d, "config.json")) && existsSync(join(d, "model.safetensors")));
   const liteSnap = hfSnapshot("vil-uob/sam3-litetext-s0", ["config.json"]);
   const dreamSnap = hfSnapshot("Lykon/dreamshaper-8", ["model_index.json"]);
+  const gitExe = findGit(ROOT);
+  const ff = findFfmpeg(ROOT);
+  const enc = encoderState(ROOT);
+  // The env counts as installed only once the packages the service imports are in it: a venv whose
+  // pip step was interrupted has python.exe and nothing else.
+  const envReady = existsSync(P.envPy)
+    && ["torch", "transformers", "uvicorn"].every((m) => existsSync(join(P.envDir, "Lib", "site-packages", m)));
 
   const items = [
+    {
+      id: "git",
+      group: "Runtime",
+      label: "Git",
+      enables: "cloning the source trees the components below install from",
+      why: "MinGit 2.55.0 unpacked into tools/bin/git when the machine has no git: no administrator, no PATH edit",
+      sizeMB: 37,
+      ...(gitExe ? found(true, gitExe) : found(false)),
+      install: {
+        kind: "zip", into: P.gitDir,
+        url: "https://github.com/git-for-windows/git/releases/download/v2.55.0.windows.5/MinGit-2.55.0.5-64-bit.zip",
+        sha256: "56d7b226b7693196cfc71fef26568f536c4a021ab6c37ff2db4287bed908e96e",
+      },
+    },
+    {
+      id: "ffmpeg",
+      group: "Runtime",
+      label: "FFmpeg 9.0.1 (libvpx-vp9, libsvtav1, libopus)",
+      enables: "texture video, audio mux, video probing, depth frame extraction",
+      // The FULL build on purpose: gyan.dev's "essentials" build ships libaom but not libsvtav1
+      // (checked on 8.0 and 9.0.1), and the AV1 texture path encodes with libsvtav1. The shared
+      // variant carries the same encoders in 93 MB where the static one is 240 MB.
+      why: "gyan.dev full shared build (GPL-3.0) unpacked into tools/bin/ffmpeg: no administrator, no PATH edit",
+      sizeMB: 93,
+      ...(ff ? found(true, ff.ffmpeg) : found(false)),
+      ...(ff ? { source: ff.source } : {}),
+      install: {
+        kind: "zip", into: P.ffmpegDir, flatten: true,
+        url: "https://github.com/GyanD/codexffmpeg/releases/download/9.0.1/ffmpeg-9.0.1-full_build-shared.zip",
+        sha256: "6fd54b3b4f49117a307877b570f5e1659090f178973298658b41f5c559b5b5ab",
+      },
+    },
     {
       id: "python-env",
       group: "Runtime",
       label: "Python environment (PyTorch + transformers)",
       enables: "every local model: segmentation, upscaling, detail",
-      why: `PyTorch built for ${idx} — ${gpu?.cudaWhy || "default CUDA build"}`,
+      why: `PyTorch built for ${idx}: ${gpu?.cudaWhy || "default CUDA build"}. CPython ${PRIVATE_PYTHON.version} is unpacked into tools/bin when the machine has no usable interpreter`,
       sizeMB: 3400,
-      ...(existsSync(P.envPy) ? found(true, P.envDir) : found(false)),
+      ...(envReady ? found(true, P.envDir) : found(false)),
       install: { kind: "python-env", cudaIndex: idx },
     },
     {
@@ -339,10 +529,13 @@ export function catalog(ROOT, gpu) {
   const forgeRoot = process.env.FORGE_ROOT || join(homedir(), "webui_forge");
   const status = [
     {
-      id: "encoder", group: "Project", label: "Encoder build (tsc output)", statusOnly: true,
+      id: "encoder", group: "Project", label: "Encoder build (tsc output)",
       enables: "Convert tab encodes, editor Bake",
-      why: "rebuilt by `npm run build` — seconds, no download",
-      ...(existsSync(join(P.ROOT, "packages", "encoder", "dist", "cli.js")) ? found(true, join(P.ROOT, "packages", "encoder", "dist")) : found(false)),
+      why: enc.stale ? "sources are newer than the build: rebuilt before the next job" : "TypeScript build of packages/core and packages/encoder, rebuilt when the sources change",
+      sizeMB: 0,
+      ...(enc.built && !enc.stale ? found(true, join(P.ROOT, "packages", "encoder", "dist")) : found(false)),
+      ...(enc.stale ? { stale: true } : {}),
+      install: { kind: "npm", args: ["run", "build"], cwd: P.ROOT },
     },
     {
       id: "synth-clip", group: "Project", label: "Synthetic demo clip (demo.ares)", statusOnly: true,
@@ -366,16 +559,19 @@ export function catalog(ROOT, gpu) {
     {
       id: "4ds-codec", group: "External", label: "4DViews codec (BridgeCodec4DS.dll)", statusOnly: true, optional: true,
       enables: "Convert tab's .4ds → .ares conversion",
-      why: "licensed SDK — copy your own DLL into tools/4ds/bin/; no installer can fetch it",
+      why: "licensed 4DViews SDK file: located once with the file dialog in the Convert tab and copied into tools/4ds/bin",
       requires: ["python-env"],
       ...(fourdsDll ? found(true, fourdsDll, statSync(fourdsDll).size) : found(false)),
     },
     {
-      id: "forge", group: "External", label: "SD-Forge (generative enhance)", statusOnly: true, optional: true,
-      enables: "the Convert tab's Generative img2img tier",
-      why: "a separate application — set FORGE_ROOT if it lives elsewhere",
-      ...(existsSync(join(forgeRoot, "system", "python", "python.exe")) ? found(true, forgeRoot) : found(false)),
-      link: "https://github.com/lllyasviel/stable-diffusion-webui-forge",
+      id: "forge", group: "External", label: "SD-Forge (generative enhance)", optional: true,
+      enables: "the Convert tab's generative img2img tier",
+      why: "cloned into tools/ext/webui_forge; the first start builds its own virtual environment on CPython 3.10",
+      sizeMB: 120,
+      requires: ["git"],
+      ...(existsSync(join(forgeRoot, "system", "python", "python.exe")) ? found(true, forgeRoot)
+        : existsSync(join(P.ext, "webui_forge", ".git")) ? found(true, join(P.ext, "webui_forge")) : found(false)),
+      install: { kind: "git", url: "https://github.com/lllyasviel/stable-diffusion-webui-forge.git", into: join(P.ext, "webui_forge") },
     },
     {
       id: "sam31", group: "External", label: "SAM 3.1 checkpoint", statusOnly: true, optional: true,
@@ -384,7 +580,6 @@ export function catalog(ROOT, gpu) {
       // transformers 5.16 ships sam3 / sam3_tracker / sam3_lite_text but no sam3_1. Still parked.
       why: "no code path loads it: transformers has no SAM 3.1 architecture yet",
       ...fileFound(join(P.REPO, "sam3.1", "sam3.1_multiplex.pt")),
-      link: "https://huggingface.co/facebook/sam3.1",
     },
   ];
 
@@ -465,23 +660,74 @@ export function resolve(items, wanted) {
 
 // ------------------------------------------------------------ installers ----
 
-const sh = (cmd, args, opts, onLine) => new Promise((done) => {
+const sh = (cmd, args, opts, onLine, stdin) => new Promise((done) => {
   const p = spawn(cmd, args, { windowsHide: true, ...opts });
   const relay = (d) => String(d).split(/\r?\n/).forEach((l) => l.trim() && onLine(l.trim().slice(0, 300)));
   p.stdout?.on("data", relay);
   p.stderr?.on("data", relay);
   p.on("error", (e) => { onLine("ERROR: " + e.message); done(1); });
   p.on("close", (c) => done(c ?? 1));
+  // Secrets go in on stdin, never in argv — argv is visible to every process on the machine.
+  if (stdin != null) { try { p.stdin.write(stdin); p.stdin.end(); } catch { /* child already gone */ } }
   return p;
 });
 
+/** Run a command and return { code, lines } without relaying anything. */
+const capture = async (cmd, args, opts = {}) => {
+  const lines = [];
+  const code = await sh(cmd, args, opts, (l) => lines.push(l));
+  return { code, lines };
+};
+
+/**
+ * The CPython this installer unpacks when the machine has no usable interpreter. It is the
+ * official python.org build as published on nuget.org: a plain zip with the full standard library
+ * (venv and ensurepip included, which the "embeddable" zip lacks), so it needs no installer run,
+ * no administrator and no PATH edit. 3.10 exists only for SD-Forge, whose pinned wheels stop there.
+ */
+export const PRIVATE_PYTHON = {
+  version: "3.12.10", dir: "python-3.12", sizeMB: 14,
+  url: "https://api.nuget.org/v3-flatcontainer/python/3.12.10/python.3.12.10.nupkg",
+  sha256: "0eb85c2dfccccf1b17352de4c397f69194035b7d37149eacc16f1147d93de3b8",
+};
+export const FORGE_PYTHON = {
+  version: "3.10.11", dir: "python-3.10", sizeMB: 16,
+  url: "https://api.nuget.org/v3-flatcontainer/python/3.10.11/python.3.10.11.nupkg",
+  sha256: "7c6f99b160a36a7e09492dfcff2b0a3a60bb5229ca44cdcc3ecb32871a6144d0",
+};
+const privatePythonExe = (ROOT, spec) => join(paths(ROOT).bin, spec.dir, "tools", "python.exe");
+
+/** Unpack a private CPython under tools/bin when it is not already there. Resolves with the
+ *  interpreter path, or { error }. */
+export async function ensurePrivatePython(ROOT, onLine, spec = PRIVATE_PYTHON) {
+  const exe = privatePythonExe(ROOT, spec);
+  if (existsSync(exe)) return { exe };
+  onLine(`CPython ${spec.version}: fetching the python.org build from nuget.org (${spec.sizeMB} MB)`);
+  const r = await unpackZip(ROOT, { url: spec.url, sha256: spec.sha256, into: join(paths(ROOT).bin, spec.dir), tag: spec.dir }, onLine);
+  if (!r.ok) return { error: `CPython ${spec.version}: ${r.error}` };
+  const v = await capture(exe, ["--version"]);
+  if (v.code !== 0) return { error: `CPython ${spec.version}: unpacked interpreter does not run (exit ${v.code})` };
+  onLine(`CPython ${spec.version} ready: ${exe}`);
+  return { exe };
+}
+
 /** Find an interpreter to build the venv with. `py -3` is the Windows launcher and is the most
- *  reliable when several Pythons are installed; plain `python` on Windows may be the Store stub. */
-async function findPython(onLine) {
-  for (const [cmd, args] of [["py", ["-3", "-c", "import sys;print(sys.executable)"]], ["python", ["-c", "import sys;print(sys.executable)"]], ["python3", ["-c", "import sys;print(sys.executable)"]]]) {
-    let out = "";
-    const code = await sh(cmd, args, {}, (l) => { out += l; });
-    if (code === 0 && out.trim()) { onLine(`using ${cmd} → ${out.trim()}`); return { cmd, prefix: args.slice(0, args.length - 2) }; }
+ *  reliable when several Pythons are installed; plain `python` on Windows may be the Store stub,
+ *  which exits non-zero here and is skipped. Only 3.11 to 3.13 with a working venv module is
+ *  accepted, because those are the versions every pinned wheel in requirements.txt ships for;
+ *  anything else falls through to the private interpreter. */
+async function findPython(ROOT, onLine) {
+  const probe = "import sys,venv,ensurepip;print(sys.executable);print('%d.%d'%sys.version_info[:2])";
+  const tries = [["py", ["-3"]], ["python", []], ["python3", []], [privatePythonExe(ROOT, PRIVATE_PYTHON), []]];
+  for (const [cmd, prefix] of tries) {
+    if (/[\\/]/.test(cmd) && !existsSync(cmd)) continue;
+    const r = await capture(cmd, [...prefix, "-c", probe]);
+    if (r.code !== 0 || r.lines.length < 2) continue;
+    const [exe, ver] = r.lines.slice(-2);
+    const minor = Number((/^3\.(\d+)$/.exec(ver) || [])[1]);
+    if (!(minor >= 11 && minor <= 13)) { onLine(`${cmd}: CPython ${ver} is outside 3.11 to 3.13, skipped`); continue; }
+    onLine(`interpreter: ${exe} (CPython ${ver})`);
+    return { cmd, prefix, exe, version: ver };
   }
   return null;
 }
@@ -490,15 +736,17 @@ async function installPythonEnv(ROOT, item, onLine) {
   const P = paths(ROOT);
   const idx = item.install.cudaIndex;
   if (!existsSync(P.envPy)) {
-    const py = await findPython(onLine);
+    let py = await findPython(ROOT, onLine);
     if (!py) {
-      onLine("no Python found on PATH.");
-      return { ok: false, error: "Python 3.11+ is required and was not found. Install it (winget install Python.Python.3.13) and run this again." };
+      onLine("no usable CPython on this machine: unpacking a private one");
+      const priv = await ensurePrivatePython(ROOT, onLine);
+      if (priv.error) return { ok: false, error: priv.error };
+      py = { cmd: priv.exe, prefix: [] };
     }
     onLine("creating the virtual environment…");
     const code = await sh(py.cmd, [...py.prefix, "-m", "venv", P.envDir], { cwd: P.svc }, onLine);
     if (code !== 0) return { ok: false, error: "venv creation failed (exit " + code + ")" };
-  } else onLine("virtual environment already present — installing into it");
+  } else onLine("virtual environment present: completing its packages");
 
   onLine("upgrading pip…");
   await sh(P.envPy, ["-m", "pip", "install", "--upgrade", "pip", "--disable-pip-version-check"], { cwd: P.svc }, onLine);
@@ -512,7 +760,7 @@ async function installPythonEnv(ROOT, item, onLine) {
  *  and the files land in the shared cache where every other tool already looks for them. */
 async function installHf(ROOT, item, onLine) {
   const P = paths(ROOT);
-  if (!existsSync(P.envPy)) return { ok: false, error: "the Python environment must be installed first" };
+  if (!existsSync(P.envPy)) return { ok: false, error: "Python environment absent (dependency order error)" };
   const { repo, allow, ignore } = item.install;
   // A JS null stringifies to `null`, which is a NameError in Python — absent patterns must be None.
   const pyList = (a) => (a && a.length ? JSON.stringify(a) : "None");
@@ -532,24 +780,33 @@ except HfHubHTTPError as e:
     print("HTTP %s: %s" % (code, e)); sys.exit(4 if code in (401, 403) else 1)
 `.trim()], { cwd: P.svc }, onLine);
   if (code === 3 || code === 4) {
-    return { ok: false, gated: true, error: `${repo} is gated. Click "Accept licence", approve it with the account your HF token belongs to, then run this again.` };
+    // The caller turns this into the in-app access prompt (token field + licence link) and
+    // resumes the same job afterwards, so the message only names the state.
+    const needsToken = !hfTokenPresent();
+    return {
+      ok: false, gated: true, needsToken,
+      error: needsToken ? `${repo}: gated repository, access token required` : `${repo}: gated repository, licence not accepted for the stored token`,
+    };
   }
   if (code !== 0) return { ok: false, error: `download failed (exit ${code})` };
   return { ok: true };
 }
 
 /** Stream a URL to disk. Writes to .part and renames on success, so an interrupted download can
- *  never be mistaken for an installed component by the detection above. */
-async function download(url, dest, onLine) {
+ *  never be mistaken for an installed component by the detection above. A pinned `sha256` is
+ *  checked before the rename: a binary that does not match its pin never reaches its final path. */
+async function download(url, dest, onLine, sha256) {
   await mkdir(dirname(dest), { recursive: true });
   const part = dest + ".part";
   const res = await fetch(url, { redirect: "follow" });
   if (!res.ok || !res.body) throw new Error(`HTTP ${res.status} for ${url}`);
   const total = Number(res.headers.get("content-length") || 0);
   let seen = 0, lastPct = -1;
+  const hash = sha256 ? createHash("sha256") : null;
   const out = createWriteStream(part);
   for await (const chunk of res.body) {
     seen += chunk.length;
+    if (hash) hash.update(chunk);
     if (!out.write(chunk)) await new Promise((r) => out.once("drain", r));
     if (total) {
       const pct = Math.floor((seen / total) * 100 / 5) * 5;
@@ -557,46 +814,180 @@ async function download(url, dest, onLine) {
     }
   }
   await new Promise((r) => out.end(r));
+  if (hash) {
+    const got = hash.digest("hex");
+    if (got !== sha256.toLowerCase()) {
+      try { await unlink(part); } catch { /* already gone */ }
+      throw new Error(`sha256 mismatch for ${url}: expected ${sha256}, got ${got}`);
+    }
+    onLine("  sha256 verified");
+  }
   try { await unlink(dest); } catch { /* not there */ }
   await rename(part, dest);
   return seen;
 }
 
 async function installUrl(ROOT, item, onLine) {
-  const { url, into, as } = item.install;
+  const { url, into, as, sha256 } = item.install;
   const dest = join(into, as);
   onLine(`downloading ${as} (${item.sizeMB} MB)…`);
-  try { const n = await download(url, dest, onLine); onLine(`saved ${mb(n)} MB → ${dest}`); return { ok: true }; }
+  try { const n = await download(url, dest, onLine, sha256); onLine(`saved ${mb(n)} MB → ${dest}`); return { ok: true }; }
   catch (e) { return { ok: false, error: String(e.message || e) }; }
 }
 
-async function installZip(ROOT, item, onLine) {
-  const { url, into, flatten } = item.install;
-  const tmp = join(paths(ROOT).bin, "_download.zip");
-  onLine(`downloading (${item.sizeMB} MB)…`);
-  try { await download(url, tmp, onLine); } catch (e) { return { ok: false, error: String(e.message || e) }; }
-  await mkdir(into, { recursive: true });
+/**
+ * Download a zip and unpack it into `into`. The archive is extracted beside the target and
+ * swapped in only when complete, so detection never sees a half-unpacked tool and a re-install
+ * replaces a broken one. bsdtar (System32\tar.exe, Windows 10 1803+) reads zip and is many times
+ * faster than Expand-Archive, which stays as the fallback.
+ */
+async function unpackZip(ROOT, { url, into, flatten, sha256, tag = "zip" }, onLine) {
+  const P = paths(ROOT);
+  const stamp = `${tag}-${Date.now().toString(36)}`;
+  const tmp = join(P.bin, `_dl-${stamp}.zip`);
+  const staging = into + ".new-" + stamp;
+  const drop = async (p) => { try { await rm(p, { recursive: true, force: true }); } catch { /* best effort */ } };
+  try { await download(url, tmp, onLine, sha256); } catch (e) { return { ok: false, error: String(e.message || e) }; }
+  await mkdir(staging, { recursive: true });
   onLine("extracting…");
-  // Expand-Archive is present on every supported Windows and needs no bundled unzip.
-  const code = await sh("powershell.exe",
-    ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
-     `Expand-Archive -LiteralPath '${tmp}' -DestinationPath '${into}' -Force`], {}, onLine);
-  try { await unlink(tmp); } catch { /* leave it */ }
-  if (code !== 0) return { ok: false, error: "extract failed (exit " + code + ")" };
+  const sysTar = join(process.env.SystemRoot || "C:\\Windows", "System32", "tar.exe");
+  let code = existsSync(sysTar) ? await sh(sysTar, ["-xf", tmp, "-C", staging], {}, onLine) : 1;
+  if (code !== 0) {
+    code = await sh("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command",
+      `Expand-Archive -LiteralPath '${tmp}' -DestinationPath '${staging}' -Force`], {}, onLine);
+  }
+  await drop(tmp);
+  if (code !== 0) { await drop(staging); return { ok: false, error: "extract failed (exit " + code + ")" }; }
+  let from = staging;
   if (flatten) {
-    // Some releases wrap everything in one top-level folder; hoist it so the exe path is stable.
+    // Some releases wrap everything in one top-level folder; use its contents as the root so the
+    // exe path is stable across versions.
     try {
-      const entries = await readdir(into, { withFileTypes: true });
+      const entries = await readdir(staging, { withFileTypes: true });
       const dirs = entries.filter((e) => e.isDirectory());
-      const hasExe = entries.some((e) => e.isFile() && e.name.endsWith(".exe"));
-      if (!hasExe && dirs.length === 1) {
-        const inner = join(into, dirs[0].name);
-        for (const f of await readdir(inner)) await rename(join(inner, f), join(into, f));
-        onLine(`flattened ${dirs[0].name}/`);
+      if (dirs.length === 1 && !entries.some((e) => e.isFile() && e.name.endsWith(".exe"))) {
+        from = join(staging, dirs[0].name);
+        onLine(`root folder: ${dirs[0].name}/`);
       }
     } catch { /* layout was already flat */ }
   }
+  const old = into + ".old-" + stamp;
+  try {
+    if (existsSync(into)) await rename(into, old);
+    await rename(from, into);
+  } catch (e) {
+    if (existsSync(old) && !existsSync(into)) { try { await rename(old, into); } catch { /* leave .old in place */ } }
+    await drop(staging);
+    return { ok: false, error: `could not move the unpacked files into ${into}: ${e.code || e.message}` };
+  }
+  await drop(old);
+  if (from !== staging) await drop(staging);
   return { ok: true };
+}
+
+async function installZip(ROOT, item, onLine) {
+  onLine(`downloading (${item.sizeMB} MB)…`);
+  return unpackZip(ROOT, { ...item.install, tag: item.id }, onLine);
+}
+
+/** Re-read the machine+user PATH from the registry.
+ *  winget puts a newly installed tool on the MACHINE PATH, but this process captured PATH when
+ *  the server started, so without this the very next step still cannot see the tool. */
+async function refreshPath(onLine) {
+  let out = "";
+  const code = await sh("powershell.exe", ["-NoProfile", "-Command",
+    "[Environment]::GetEnvironmentVariable('Path','Machine') + ';' + [Environment]::GetEnvironmentVariable('Path','User')"],
+    {}, (l) => { out += l; });
+  if (code === 0 && out.trim().length > 10) {
+    process.env.PATH = out.trim();
+    onLine("PATH refreshed from the registry");
+  }
+}
+
+/** Install a system tool with winget, or with the vendor bootstrapper when winget is absent or
+ *  did not produce the tool. Success is judged by PROBING afterwards, never by an exit code:
+ *  winget reports a non-zero "no applicable update" when the package is already present. */
+async function installWinget(ROOT, item, onLine) {
+  const { id, probe, verify, override, bootstrapper } = item.install;
+  const verified = () => (verify === "vcvars" ? !!findVcvars() : probe ? !!whichSync(probe) : null);
+  if (verified() === true) { onLine(`${item.label}: already present`); return { ok: true }; }
+  let wingetCode = null;
+  if (whichSync("winget")) {
+    onLine(`winget install ${id} …`);
+    const args = ["install", "--id", id, "-e", "--source", "winget",
+      "--accept-package-agreements", "--accept-source-agreements", "--disable-interactivity"];
+    if (override) args.push("--override", override);
+    wingetCode = await sh("winget", args, {}, onLine);
+    await refreshPath(onLine);
+    if (verified() !== false) { onLine(`${id} installed`); return { ok: true }; }
+  } else onLine("winget absent on this machine");
+  if (bootstrapper) {
+    const exe = join(paths(ROOT).bin, `_${item.id}-setup.exe`);
+    onLine(`${item.label}: running the vendor bootstrapper`);
+    try { await download(bootstrapper, exe, onLine); } catch (e) { return { ok: false, error: String(e.message || e) }; }
+    const code = await sh(exe, (override || "").split(/\s+/).filter(Boolean), {}, onLine);
+    try { await unlink(exe); } catch { /* still locked: left for the next run to overwrite */ }
+    await refreshPath(onLine);
+    // 3010 = installed, reboot pending. The compiler is on disk either way.
+    if (verified() !== false) { onLine(`${item.label} installed${code === 3010 ? " (Windows restart pending)" : ""}`); return { ok: true }; }
+    return { ok: false, error: `${item.label}: bootstrapper exit ${code}, component not detected afterwards` };
+  }
+  return { ok: false, error: `${id}: not detected after installation${wingetCode === null ? " (winget absent, no bootstrapper defined)" : ` (winget exit ${wingetCode})`}` };
+}
+
+/** Shallow-clone a source tree, optionally installing it into the Python environment.
+ *  A repo that is already cloned is fetched rather than re-cloned, so a re-run is cheap. */
+async function installGit(ROOT, item, onLine) {
+  const P = paths(ROOT);
+  const { url, into, ref, recurse, pip } = item.install;
+  const git = findGit(ROOT);
+  if (!git) return { ok: false, error: "git absent (dependency order error)" };
+  if (existsSync(join(into, ".git"))) {
+    onLine("already cloned: fetching the latest commit…");
+    await sh(git, ["-C", into, "fetch", "--depth", "1", "origin"], {}, onLine);
+    await sh(git, ["-C", into, "reset", "--hard", "FETCH_HEAD"], {}, onLine);
+  } else {
+    await mkdir(dirname(into), { recursive: true });
+    const args = ["clone", "--depth", "1"];
+    if (ref) args.push("--branch", ref);
+    if (recurse) args.push("--recurse-submodules", "--shallow-submodules");
+    args.push(url, into);
+    onLine(`git clone ${url} …`);
+    const code = await sh(git, args, {}, onLine);
+    if (code !== 0) return { ok: false, error: `git clone failed (exit ${code})` };
+  }
+  if (pip) {
+    if (!existsSync(P.envPy)) return { ok: false, error: "Python environment absent (dependency order error)" };
+    onLine("installing it into the Python environment…");
+    // A source build has to find the private git and the compiler without any PATH edit.
+    const env = { ...process.env, PATH: dirname(git) + ";" + (process.env.PATH || "") };
+    const code = await sh(P.envPy, ["-m", "pip", "install", ...pip], { cwd: into, env }, onLine);
+    if (code !== 0) return { ok: false, error: `pip install failed (exit ${code})` };
+  }
+  return { ok: true };
+}
+
+/** The TypeScript build (`npm run build` = `tsc -b`). tsc runs straight through this node
+ *  process, so npm is only needed when node_modules is missing, and then it is the npm that
+ *  ships beside node. A failed rebuild keeps an existing dist in use: another engineer's
+ *  half-written source must not take the Convert tab down. */
+async function installNpm(ROOT, item, onLine) {
+  const P = paths(ROOT);
+  const cwd = item.install.cwd || ROOT;
+  const tsc = join(cwd, "node_modules", "typescript", "bin", "tsc");
+  if (!existsSync(tsc)) {
+    const npm = findNpm();
+    if (!npm) return { ok: false, error: "npm not found beside node.exe: node_modules cannot be restored" };
+    onLine("node_modules absent: npm install …");
+    const code = await sh(npm.cmd, [...npm.prefix, "install", "--no-audit", "--no-fund"], { cwd }, onLine);
+    if (code !== 0 || !existsSync(tsc)) return { ok: false, error: `npm install failed (exit ${code})` };
+  }
+  onLine("tsc -b …");
+  const code = await sh(process.execPath, [tsc, "-b"], { cwd }, onLine);
+  try { await mkdir(P.bin, { recursive: true }); await writeFile(P.encoderStamp, new Date().toISOString()); } catch { /* stamp is an optimisation */ }
+  if (code === 0) return { ok: true };
+  if (encoderState(ROOT).built) { onLine(`tsc exit ${code}: the existing build stays in use`); return { ok: true, warning: `tsc exit ${code}` }; }
+  return { ok: false, error: `encoder build failed (tsc exit ${code})` };
 }
 
 export async function installOne(ROOT, item, onLine) {
@@ -605,8 +996,37 @@ export async function installOne(ROOT, item, onLine) {
     case "hf": return installHf(ROOT, item, onLine);
     case "url": return installUrl(ROOT, item, onLine);
     case "zip": return installZip(ROOT, item, onLine);
+    case "winget": return installWinget(ROOT, item, onLine);
+    case "git": return installGit(ROOT, item, onLine);
+    case "npm": return installNpm(ROOT, item, onLine);
     default: return { ok: false, error: "no installer for " + item.id };
   }
+}
+
+/** Store a Hugging Face token the way `hf auth login` does, so every downloader picks it up.
+ *  Written through huggingface_hub when the venv exists (it validates the token and writes the
+ *  same file the library reads); otherwise straight to the token file. The token is never
+ *  logged, echoed, or returned. */
+export async function saveHfToken(ROOT, token, onLine = () => {}) {
+  const t = String(token || "").trim();
+  if (!/^hf_[A-Za-z0-9]{20,}$/.test(t)) {
+    return { ok: false, error: "invalid token format (expected hf_…)" };
+  }
+  const P = paths(ROOT);
+  if (existsSync(P.envPy)) {
+    let who = "", failed = false;
+    const code = await sh(P.envPy, ["-c",
+      "import sys;from huggingface_hub import HfApi,login;t=sys.stdin.read().strip();"
+      + "u=HfApi().whoami(token=t);login(token=t,add_to_git_credential=False);print('USER '+u.get('name','?'))"],
+      { stdio: ["pipe", "pipe", "pipe"] }, (l) => { if (l.startsWith("USER ")) who = l.slice(5); else if (/error|Error|Invalid/.test(l)) failed = true; },
+      t + "\n");
+    if (code === 0 && who) { onLine(`signed in as ${who}`); return { ok: true, user: who }; }
+    if (failed || code !== 0) return { ok: false, error: "token rejected by Hugging Face" };
+  }
+  const file = hfTokenFile();
+  await mkdir(dirname(file), { recursive: true });
+  await writeFile(file, t, "utf8");
+  return { ok: true, user: null };
 }
 
 // ----------------------------------------------------------- preflight ----
@@ -621,7 +1041,7 @@ export async function preflight(ROOT) {
   if (out.hfToken && !process.env.HF_TOKEN) {
     try { out.hfUser = (await readFile(tokenFile, "utf8")).trim() ? "stored token" : null; } catch { /* unreadable */ }
   }
-  const py = await findPython(() => {});
+  const py = await findPython(ROOT, () => {});
   out.python = py ? py.cmd : null;
   return out;
 }

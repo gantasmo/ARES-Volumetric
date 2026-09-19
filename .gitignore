@@ -38,6 +38,8 @@ id_ed25519
 tools/4ds/bin/
 # Vendored realesrgan-ncnn-vulkan (BSD-3) — 50 MB of upstream weights + exe.
 tools/bin/
+# git clones of third-party source trees, fetched by the Settings installer
+tools/ext/
 
 # --- Generated data: clips & their sidecars -------------------------------
 # .ares clips are encoder output (~3 GB across 34 files here) and several are

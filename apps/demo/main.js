@@ -7,6 +7,7 @@
 // matrix the pixels do, so a guide can never drift from the geometry it claims to cut.
 import { AresPlayer, rleEncodeMask, keepPredicateAt, orbitViewProj, orbitViewHeight, growKeyframe, mirrorKeyframe } from "@ares/core";
 import { aact } from "./log.js";
+import { accessPrompt, sseErrorData } from "./ensure.js";
 
 const $ = (id) => document.getElementById(id);
 const canvas = $("view");
@@ -883,22 +884,46 @@ function initEditor(player) {
     samStatus.style.color = h && h.error ? "var(--bad)" : "";
     if (h && h.ok) { samStatus.textContent = `ready · ${h.model} on ${h.device}`; samStart.style.display = "none"; }
     else if (h && h.loading) { samStatus.textContent = "model loading…"; samStart.style.display = "none"; }
-    else if (h && h.error) { samStatus.textContent = "load failed"; samStatus.title = "The SAM service failed to load its model — see tools/sam-service/sam-service.log for the traceback. Press Start SAM to retry."; samStart.style.display = ""; }
+    else if (h && h.error) { samStatus.textContent = "load failed"; samStatus.title = "SAM model load failed: " + h.error; samStart.style.display = ""; }
     else { samStatus.textContent = "not running"; samStart.style.display = ""; }
     syncSamTextGate(h);
     // Keep polling while EITHER the tracker or the independent, later-loading text/concept model
     // is still coming up — SAM_TEXT's model loads AFTER the tracker, so h.ok can go true first.
     if (h && (h.loading || h.textLoading)) samPoll = setTimeout(samRefresh, 3000);
   }
-  samStart.onclick = () => {
+  /**
+   * Bring the SAM service up from wherever it is: /sam/start installs what is absent (Python
+   * environment, weights) inside its own stream, launches the service hidden and waits for the
+   * model. Every tool that needs the service calls this itself, so nothing asks for the Start
+   * button to be pressed first. `purpose` "track" additionally requires SAM 3.
+   * Resolves { ok, message }. A gated repository raises the access prompt; Resume repeats the start.
+   */
+  let samStarting = null;
+  function samAutoStart(purpose = "sam") {
+    if (samStarting) return samStarting;
     samStart.disabled = true;
     samStatus.style.color = "";
     samStatus.textContent = "starting…";
-    const es = new EventSource("/sam/start");
-    es.addEventListener("log", (e) => { try { samStatus.textContent = JSON.parse(e.data); } catch {} });
-    es.addEventListener("done", () => { es.close(); samStart.disabled = false; samRefresh(); });
-    es.addEventListener("error", () => { es.close(); samStart.disabled = false; samRefresh(); });
-  };
+    samStarting = new Promise((resolve) => {
+      const es = new EventSource("/sam/start" + (purpose === "track" ? "?for=track" : ""));
+      const end = (r) => { es.close(); samStarting = null; samStart.disabled = false; resolve(r); };
+      es.addEventListener("log", (e) => { try { samStatus.textContent = String(JSON.parse(e.data)).replace("[setup] ", "").trim().slice(0, 80); } catch {} });
+      es.addEventListener("done", () => { end({ ok: true }); samRefresh(); });
+      es.addEventListener("error", (e) => {
+        const d = sseErrorData(e);
+        const message = (d && d.message) || "SAM service start failed";
+        if (d && d.gated) {
+          let host = $("samGateHost");
+          if (!host) { host = document.createElement("div"); host.id = "samGateHost"; samStatus.closest(".row").after(host); }
+          accessPrompt(host, d, () => samAutoStart(purpose));
+        }
+        end({ ok: false, message });
+        samRefresh().then(() => { samStatus.style.color = "var(--bad)"; samStatus.textContent = message.slice(0, 80); samStatus.title = message; });
+      });
+    });
+    return samStarting;
+  }
+  samStart.onclick = () => { samAutoStart(); };
 
   // Viewport shading — ONE mutually-exclusive segmented control in the header (owner ask #15):
   // shaded (textured, lit) / unlit (texture verbatim) / clay (untextured, judge FORM) / wire
@@ -2397,15 +2422,16 @@ function initEditor(player) {
     // clicking from the new viewpoint starts a fresh selection there.
     if (samSel && samSel.camKey !== camKeyNow()) samSelClear();
     if (!samSel) {
-      // Health gate: degrade with guidance, never break the tool. The dev server auto-starts the
-      // service on refused POSTs, but a clear "start it below" beats a silent multi-second stall.
+      // Health gate: a cold service is started here (components installed first when absent) and
+      // the click carries on once the model is up, so the first click on a fresh machine works.
       let h = null;
       try { h = await fetch("/sam/health").then((r) => r.json()); } catch { /* server down */ }
       if (!h || !h.ok) {
         samSelRow.style.display = "flex";
-        samSelInfo.textContent = h && h.loading ? "SAM model is loading — try again shortly" : "SAM service not running — press Start SAM below";
-        samRefresh();
-        return;
+        samSelInfo.textContent = h && h.loading ? "SAM model loading…" : "SAM service starting…";
+        const started = await samAutoStart();
+        if (!started.ok) { samSelInfo.textContent = "✗ " + started.message; return; }
+        if (samSel) return;   // another click got through while this one waited
       }
       samSel = {
         capture: player.captureFrame(1024),
@@ -2595,10 +2621,10 @@ function initEditor(player) {
     samTextHint.style.display = ready ? "none" : "";
     if (ready) return;
     // Terse status + the WHY in a tooltip (rail carries no prose — design law).
-    const s = !h ? ["offline", "The SAM service isn't running. Press Start SAM above; click-to-select needs it too."]
-      : !h.textEnabled ? ["text: off", "Text-prompt segmentation is disabled on the service (SAM_TEXT=0). Click-to-select still works. Set SAM_TEXT=1 and restart the SAM service to enable it."]
-      : h.textLoading ? ["loading…", "The text/concept model is still loading — it initialises after the click tracker. This takes a few seconds on first use."]
-      : h.textError ? ["text: failed", "The text model failed to load — see tools/sam-service/sam-service.log. Click-to-select is unaffected."]
+    const s = !h ? ["offline", "SAM service offline. It starts with the first selection."]
+      : !h.textEnabled ? ["text: off", "Text-prompt segmentation disabled by the service configuration (SAM_TEXT=0). Click-to-select is unaffected."]
+      : h.textLoading ? ["loading…", "The text/concept model is still loading: it initialises after the click tracker. This takes a few seconds on first use."]
+      : h.textError ? ["text: failed", "Text model load failed: " + h.textError + ". Click-to-select is unaffected."]
       : ["text: n/a", "Text-prompt segmentation is unavailable on this service build. Click-to-select is unaffected."];
     samTextHint.textContent = s[0];
     samTextHint.title = s[1];
@@ -3054,7 +3080,11 @@ function initEditor(player) {
       open.onclick = () => { location.search = "?src=" + name + ".ares"; };
       log.after(open);
     });
-    es.addEventListener("error", () => { es.close(); log.textContent += "✗ bake failed (see server log)\n"; });
+    es.addEventListener("error", (e) => {
+      es.close();
+      const d = sseErrorData(e);
+      log.textContent += "✗ bake failed" + (d ? ": " + (d.message || "encoder exit " + d.code) : ": stream closed") + "\n";
+    });
   };
 
   /** Del/Backspace precedence rule (Del applies the deletion): a pending SAM
@@ -3095,11 +3125,24 @@ async function main() {
     // Settings all still work. Point at Settings, which can generate the synth clip.
     const el = $("err");
     el.style.display = "block";
-    el.innerHTML = `Failed to load <b>${SRC.split("/").pop()}</b>: ${(e && e.message ? e.message : e)}<br><br>
-      Open <a href="#" id="errSettings">Settings</a> to check components — the synthetic demo clip
-      can be generated there — or pick another source from the Convert tab's history.`;
-    document.getElementById("errSettings").onclick = (ev) => { ev.preventDefault(); setTab("settings"); };
+    const why = `Failed to load <b>${SRC.split("/").pop()}</b>: ${(e && e.message ? e.message : e)}`;
+    el.innerHTML = why;
     console.error(e);
+    // The DEFAULT clip being absent is the fresh-install state, and the app recovers from it by
+    // itself: the newest clip in the library opens, and with an empty library the synthetic demo
+    // clip is generated (/setup/demo-clip builds the encoder first when it has to) and opened.
+    // An explicit ?src= that fails stays an error: that is the clip that was asked for.
+    if (!new URLSearchParams(location.search).get("src")) {
+      let clips = [];
+      try { clips = await fetch("/list-ares").then((r) => r.json()); } catch { /* server down: keep the error */ }
+      const other = Array.isArray(clips) ? clips.find((c) => c.src !== SRC) : null;
+      if (other) { location.search = "?src=" + encodeURIComponent(other.src); return; }
+      el.innerHTML = why + `<br><br>Library empty: generating demo.ares<pre id="errLog" class="cvlog" style="max-height:120px;margin-top:6px"></pre>`;
+      const es = new EventSource("/setup/demo-clip");
+      es.addEventListener("log", (ev) => { try { const l = $("errLog"); l.textContent += JSON.parse(ev.data) + "\n"; l.scrollTop = l.scrollHeight; } catch {} });
+      es.addEventListener("done", () => { es.close(); location.search = "?src=demo.ares"; });
+      es.addEventListener("error", (ev) => { es.close(); const d = sseErrorData(ev); $("errLog").textContent += "✗ " + ((d && d.message) || "stream closed") + "\n"; });
+    }
     return;
   }
 

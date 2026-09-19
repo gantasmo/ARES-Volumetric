@@ -19,7 +19,7 @@ import { join, normalize, extname, dirname, basename, sep } from "node:path";
 import zlib from "node:zlib";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { catalog, gpuProbe, installOne, preflight, profiles, recommend, resolve } from "./installer.mjs";
+import { catalog, encoderState, ensurePrivatePython, findFfmpeg, findGit, FORGE_PYTHON, gpuProbe, hfTokenPresent, installOne, paths as installPaths, preflight, profiles, recommend, resolve, saveHfToken } from "./installer.mjs";
 
 const ROOT = dirname(dirname(fileURLToPath(import.meta.url))); // ares/
 
@@ -308,6 +308,94 @@ async function analyseDir(dir0) {
 const REALESRGAN_DIR = join(ROOT, "tools", "bin", "realesrgan-ncnn-vulkan");
 const REALESRGAN_EXE = join(REALESRGAN_DIR, "realesrgan-ncnn-vulkan.exe");
 const FFMPEG = process.env.FFMPEG || "ffmpeg";
+
+// ---- ffmpeg / ffprobe: ONE resolver --------------------------------------------------------
+// installer.mjs findFfmpeg() owns the search order (FFMPEG override, tools/bin/ffmpeg, the legacy
+// C:\FFmpeg\bin, PATH) and rejects a build without libvpx-vp9 / libsvtav1 / libopus. Nothing in
+// this file spawns a bare "ffmpeg": the resolved absolute paths go to every child through toolEnv()
+// (the encoder CLI reads FFMPEG / FFPROBE) and to the Python service in the /depth/run body.
+// A miss is never cached, so the path appears the moment ensureComponents(["ffmpeg"]) installs it.
+let ffToolsCache = null;
+function ffTools({ fresh = false } = {}) {
+  if (fresh || !ffToolsCache) ffToolsCache = findFfmpeg(ROOT);
+  return ffToolsCache;
+}
+function toolEnv(extra = {}) {
+  const ff = ffTools();
+  return {
+    ...process.env,
+    ...(ff ? { FFMPEG: ff.ffmpeg, FFMPEG_PATH: ff.ffmpeg, FFPROBE: ff.ffprobe, FFPROBE_PATH: ff.ffprobe } : {}),
+    ...extra,
+  };
+}
+
+// ---- component ensure: every work route calls this before it starts ------------------------
+// The rule it implements: a job never stops to tell the person that something is absent. It
+// resolves the component ids the job needs through the catalog's `requires` graph, installs what
+// is absent inside the route's own SSE stream ("[setup] …" log lines plus `setup` events), and
+// returns so the job carries on. The one thing it cannot supply is a credential: a gated
+// Hugging Face repository comes back as { gated, needsToken, url } and the client raises its
+// access prompt, then re-issues the same request.
+//   ensureComponents(ids: string[], send?: (event, data) => void)
+//     -> { ok: true, installed: string[] }
+//      | { ok: false, error, id?, label?, gated?, needsToken?, url? }
+let gpuCache = null, gpuCacheAt = 0;
+async function gpuCached() {
+  if (!gpuCache || Date.now() - gpuCacheAt > 60000) { gpuCache = await gpuProbe(); gpuCacheAt = Date.now(); }
+  return gpuCache;
+}
+const ensureInFlight = new Map();   // component id -> running install, shared by concurrent routes
+async function ensureComponents(ids, send) {
+  const say = (t) => { if (send) send("log", "[setup] " + t); };
+  const want = [...new Set(ids.filter(Boolean))];
+  let items = catalog(ROOT, await gpuCached());
+  const unknown = want.filter((id) => !items.some((i) => i.id === id));
+  if (unknown.length) return { ok: false, error: `unknown component: ${unknown.join(", ")}` };
+  const installable = (it) => it.install && it.install.kind !== "route" && !it.statusOnly;
+  const todo = resolve(items, want).filter((it) => installable(it) && !it.present);
+  if (!todo.length) return { ok: true, installed: [] };
+  say(`absent: ${todo.map((t) => t.label).join(", ")}`);
+  if (send) send("setup", { state: "plan", todo: todo.map((t) => ({ id: t.id, label: t.label, sizeMB: t.sizeMB || 0 })) });
+  for (const [index, it] of todo.entries()) {
+    if (send) send("setup", { state: "start", id: it.id, label: it.label, index, total: todo.length, sizeMB: it.sizeMB || 0 });
+    say(`${it.label}${it.sizeMB ? ` (${it.sizeMB} MB)` : ""}`);
+    let job = ensureInFlight.get(it.id);
+    if (job) say(`${it.label}: install already running, waiting for it`);
+    else {
+      job = installOne(ROOT, it, (l) => say("  " + l)).catch((e) => ({ ok: false, error: String((e && e.message) || e) }))
+        .finally(() => ensureInFlight.delete(it.id));
+      ensureInFlight.set(it.id, job);
+    }
+    const r = await job;
+    if (it.id === "ffmpeg") ffTools({ fresh: true });
+    if (!r.ok) {
+      say(`${it.label}: ${r.error}`);
+      return { ok: false, id: it.id, label: it.label, error: r.error, gated: !!r.gated, needsToken: !!r.needsToken, url: it.gated?.url || null };
+    }
+    if (send) send("setup", { state: "done", id: it.id, label: it.label, index: index + 1, total: todo.length });
+    say(`${it.label}: ready`);
+  }
+  // Judge by detection, never by the installer's own word: the job is about to depend on it.
+  items = catalog(ROOT, await gpuCached());
+  const still = todo.filter((t) => !items.find((i) => i.id === t.id)?.present);
+  if (still.length) return { ok: false, id: still[0].id, label: still[0].label, error: `${still[0].label}: not detected after installation` };
+  return { ok: true, installed: todo.map((t) => t.id) };
+}
+/** The `error` event a route sends when ensureComponents could not finish. */
+const ensureErrorPayload = (r) => ({
+  message: r.error, stage: "setup", component: r.id || null, label: r.label || null,
+  gated: !!r.gated, needsToken: !!r.needsToken, url: r.url || null,
+});
+/** ensureComponents for an SSE route: on failure the error event is sent and the stream closed.
+ *  Resolves true when the job may proceed. */
+async function ensureOrEnd(ids, send, res) {
+  const r = await ensureComponents(ids, send);
+  if (r.ok) return true;
+  send("error", ensureErrorPayload(r));
+  res.end();
+  return false;
+}
+
 // Run a child to completion; resolve on exit 0. onChild exposes it so /enhance can cancel it.
 function runProc(exe, args, opts, onChild) {
   return new Promise((resolve, reject) => {
@@ -320,13 +408,53 @@ function runProc(exe, args, opts, onChild) {
   });
 }
 
+/** Like runProc, but relays whole stdout/stderr LINES to `onLine` and resolves with the exit
+ *  code instead of rejecting. Used for workers whose progress is their stdout. */
+function runProcLines(exe, args, opts, onChild, onLine) {
+  return new Promise((resolve) => {
+    const c = spawn(exe, args, { windowsHide: true, ...opts });
+    if (onChild) onChild(c);
+    let buf = "";
+    const feed = (d) => {
+      buf += d;
+      const lines = buf.split(/\r?\n/);
+      buf = lines.pop() ?? "";                       // keep the partial line for the next chunk
+      for (const l of lines) if (l.trim()) onLine(l.trim().slice(0, 400));
+    };
+    c.stdout?.on("data", feed);
+    c.stderr?.on("data", feed);
+    c.on("error", (e) => { onLine("ERROR " + e.message); resolve(1); });
+    c.on("close", (code) => { if (buf.trim()) onLine(buf.trim().slice(0, 400)); resolve(code ?? 1); });
+  });
+}
+
 // ---- Forge (generative "hero" tier only) — auto-launched headless, no terminal ------------
-const FORGE_ROOT = process.env.FORGE_ROOT || join(homedir(), "webui_forge");            // set FORGE_ROOT to your install
-const FORGE_PY = join(FORGE_ROOT, "system", "python", "python.exe");
-const FORGE_WEBUI = join(FORGE_ROOT, "webui");
-const FORGE_CKPT_DIR = process.env.FORGE_CKPT_DIR || join(FORGE_ROOT, "webui", "models", "Stable-diffusion");
+// Two layouts run here. A PACKAGED install (the one-click archive: system/python + webui/) is
+// used as it is when FORGE_ROOT or ~/webui_forge holds one. Otherwise the catalog's `forge`
+// component is a git clone under tools/ext/webui_forge, and forgeEnsure() builds that clone its
+// own virtual environment on a private CPython 3.10 (Forge's pinned wheels stop at 3.10), lets
+// launch.py install its packages on the first start, and marks the venv ready afterwards.
+const FORGE_CLONE = join(ROOT, "tools", "ext", "webui_forge");
 const FORGE_URL = process.env.FORGE_URL || "http://127.0.0.1:7861";
-const FORGE_PATH_PREPEND = [join(FORGE_ROOT, "system", "git", "bin"), join(FORGE_ROOT, "system", "python"), join(FORGE_ROOT, "system", "python", "Scripts")].join(";");
+function forgeLayout() {
+  const packaged = [process.env.FORGE_ROOT, join(homedir(), "webui_forge")].filter(Boolean)
+    .find((d) => existsSync(join(d, "system", "python", "python.exe")));
+  if (packaged) {
+    return {
+      kind: "packaged", root: packaged, cwd: join(packaged, "webui"), py: join(packaged, "system", "python", "python.exe"), ready: true,
+      path: [join(packaged, "system", "git", "bin"), join(packaged, "system", "python"), join(packaged, "system", "python", "Scripts")],
+      ckptDir: process.env.FORGE_CKPT_DIR || join(packaged, "webui", "models", "Stable-diffusion"),
+    };
+  }
+  const root = process.env.FORGE_ROOT && existsSync(join(process.env.FORGE_ROOT, "launch.py")) ? process.env.FORGE_ROOT : FORGE_CLONE;
+  const git = findGit(ROOT);
+  return {
+    kind: "clone", root, cwd: root, py: join(root, "venv", "Scripts", "python.exe"),
+    ready: existsSync(join(root, "venv", ".ares-ready")),
+    path: [join(root, "venv", "Scripts"), ...(git ? [dirname(git)] : [])],
+    ckptDir: process.env.FORGE_CKPT_DIR || join(root, "models", "Stable-diffusion"),
+  };
+}
 let forgeChild = null;
 function forgeHealthy(timeoutMs = 1500) {
   return new Promise((resolve) => {
@@ -337,31 +465,59 @@ function forgeHealthy(timeoutMs = 1500) {
     rq.end();
   });
 }
-// Ensure Forge's API is up: health-check, else spawn it detached+hidden and poll. `send` streams
-// SSE status. Mirrors the repo's hidden-PowerShell launcher path (tools/launch.ps1).
+// Ensure Forge's API is up: health-check, else install what is absent, spawn it hidden and poll.
+// `send` streams SSE status. Resolves true, or { error, ...ensure failure fields }.
 async function forgeEnsure(send) {
+  const log = (t) => { if (send) send("log", t); };
   if (await forgeHealthy()) return true;
-  if (!existsSync(FORGE_PY)) { send && send("log", `Forge not found at ${FORGE_ROOT} — set FORGE_ROOT to your webui_forge install`); return false; }
-  if (!forgeChild || forgeChild.exitCode !== null) {
-    send && send("log", "starting Forge (headless API, cold start ~30–60 s)…");
-    const args = ["launch.py", "--nowebui", "--skip-install"];
-    if (existsSync(FORGE_CKPT_DIR)) args.push("--ckpt-dir", FORGE_CKPT_DIR);
-    forgeChild = spawn(FORGE_PY, args, {
-      cwd: FORGE_WEBUI,
-      env: { ...process.env, PATH: FORGE_PATH_PREPEND + ";" + process.env.PATH },
-      detached: true, stdio: "ignore", windowsHide: true,
-    });
-    forgeChild.unref();
-  } else {
-    send && send("log", "waiting for Forge to finish starting…");
+  let lay = forgeLayout();
+  if (lay.kind === "clone" && !existsSync(join(lay.root, "launch.py"))) {
+    const r = await ensureComponents(["forge"], send);
+    if (!r.ok) return r;
+    lay = forgeLayout();
   }
-  const deadline = Date.now() + 120000;
+  if (lay.kind === "clone" && !existsSync(lay.py)) {
+    const py = await ensurePrivatePython(ROOT, (l) => log("[setup]   " + l), FORGE_PYTHON);
+    if (py.error) return { ok: false, error: py.error };
+    log("[setup] Forge: creating its virtual environment");
+    const code = await runProcLines(py.exe, ["-m", "venv", join(lay.root, "venv")], { cwd: lay.root }, null, (l) => log("[setup]   " + l));
+    if (code !== 0 || !existsSync(lay.py)) return { ok: false, error: `Forge venv creation failed (exit ${code})` };
+  }
+  const firstRun = !lay.ready;
+  if (!forgeChild || forgeChild.exitCode !== null) {
+    log(firstRun ? "Forge: first start, installing its packages (several GB, tens of minutes)…" : "Forge: starting (headless API, cold start 30 to 60 s)…");
+    const args = ["launch.py", "--nowebui", ...(firstRun ? [] : ["--skip-install"])];
+    if (existsSync(lay.ckptDir)) args.push("--ckpt-dir", lay.ckptDir);
+    const env = { ...process.env, PATH: lay.path.join(";") + ";" + process.env.PATH };
+    // Forge pins a cu121 torch, which has no kernels for Blackwell (sm_120): give it a build that does.
+    const gpu = await gpuCached();
+    if (firstRun && gpu.cc >= 12) env.TORCH_COMMAND = "pip install torch torchvision --index-url https://download.pytorch.org/whl/cu128";
+    if (firstRun) {
+      // Piped so the package install is visible in the job log; the reader stays attached for the
+      // life of the child, whether or not the browser is still listening.
+      forgeChild = spawn(lay.py, args, { cwd: lay.cwd, env, windowsHide: true });
+      const relay = (d) => String(d).split(/\r?\n/).forEach((l) => l.trim() && log("[forge] " + l.trim().slice(0, 300)));
+      forgeChild.stdout.on("data", relay);
+      forgeChild.stderr.on("data", relay);
+      forgeChild.on("error", () => { /* surfaced by the health deadline below */ });
+    } else {
+      forgeChild = spawn(lay.py, args, { cwd: lay.cwd, env, detached: true, stdio: "ignore", windowsHide: true });
+      forgeChild.on("error", () => { /* surfaced by the health deadline below */ });
+      forgeChild.unref();
+    }
+  } else log("Forge: start already in progress, waiting");
+  const limitS = firstRun ? 3600 : 180;
+  const deadline = Date.now() + limitS * 1000;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 2000));
-    if (await forgeHealthy()) { send && send("log", "Forge API ready"); return true; }
+    if (await forgeHealthy()) {
+      if (firstRun && lay.kind === "clone") { try { await writeFile(join(lay.root, "venv", ".ares-ready"), new Date().toISOString()); } catch { /* next start repeats the install check */ } }
+      log("Forge API ready");
+      return true;
+    }
+    if (forgeChild && forgeChild.exitCode !== null) return { ok: false, error: `Forge exited with code ${forgeChild.exitCode} before its API answered` };
   }
-  send && send("log", "Forge did not become ready within 120 s (check tools/… or start it once manually)");
-  return false;
+  return { ok: false, error: `Forge API not ready after ${limitS} s` };
 }
 
 // ---- SAM segmentation service — auto-launched hidden from the app, no terminal ------------
@@ -384,14 +540,68 @@ function samHealth(timeoutMs = 1500) {
     rq.end();
   });
 }
-async function samEnsure(send) {
+/** The last lines of the service transcript, so a failed start is explained in the job log. */
+async function samLogTail(n = 12) {
+  try {
+    const txt = await readFile(join(ROOT, "tools", "sam-service", "sam-service.log"), "utf8");
+    return txt.replace(/\0/g, "").split(/\r?\n/).map((l) => l.trim()).filter(Boolean).slice(-n);
+  } catch { return []; }
+}
+/** Stop the service that owns SAM_URL's port. Used when weights arrive after a start that latched
+ *  a load failure: the service loads its model once, so new weights need a new process. Only a
+ *  python process is ever stopped. */
+async function samStop(send) {
+  let port = 7263; try { port = Number(new URL(SAM_URL).port) || 80; } catch { /* default */ }
+  const ps = `$c = Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; ` +
+    `if ($c) { $p = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue; if ($p -and $p.ProcessName -like 'python*') { Stop-Process -Id $p.Id -Force } }`;
+  await runProcLines("powershell.exe", ["-NoProfile", "-Command", ps], {}, null, () => {});
+  samChild = null;
+  for (let i = 0; i < 10 && (await samHealth(800)); i++) await new Promise((r) => setTimeout(r, 500));
+  if (send) send("log", "SAM service stopped for a model reload");
+}
+/**
+ * samEnsure(send, { purpose, components })
+ *   purpose "sam"   (default) a segmentation backend must load: SAM 3, else ViT-H
+ *   purpose "track" the video tracker, which is SAM 3 only
+ *   purpose "depth" the depth routes only: a latched SAM load failure does not block them
+ *   components      extra catalog ids the job needs (a depth model, SAM 3 for a subject mask)
+ * Installs whatever is absent first (Python environment, weights), then health-checks, spawns the
+ * hidden launcher and polls. Resolves true, or { ok:false, error, gated?, needsToken?, url? }.
+ */
+let samRestarted = false;   // one automatic restart per latched failure, never a loop
+async function samEnsure(send, { purpose = "sam", components = [] } = {}) {
+  const log = (t) => { if (send) send("log", t); };
+  const need = ["python-env", ...components];
+  if (purpose === "track") need.push("sam3");
+  if (purpose === "sam") {
+    const items = catalog(ROOT, await gpuCached());
+    const have = (id) => !!items.find((i) => i.id === id)?.present;
+    // Any loadable backend is enough to start. With none on disk: SAM 3 when a Hugging Face token
+    // is stored (it is gated), otherwise the ungated ViT-H so the first click works without one.
+    if (!have("sam3") && !have("vit-h")) need.push(hfTokenPresent() ? "sam3" : "vit-h");
+  }
+  const ens = await ensureComponents(need, send);
+  if (!ens.ok) return ens;
+
   let h = await samHealth();
-  if (h && h.ok) return true;
-  if (h && h.error) { send && send("log", `SAM model load failed: ${h.error} — see tools/sam-service/sam-service.log`); return false; }
+  // A latched load failure with weights now on disk (installed just now, or from Settings while
+  // the service was up) is stale: the service loads once, so it is restarted to pick them up.
+  if (h && h.error && purpose !== "depth") {
+    const items = catalog(ROOT, await gpuCached());
+    if (["sam3", "vit-h"].some((id) => items.find((i) => i.id === id)?.present) && !samRestarted) {
+      samRestarted = true;
+      await samStop(send);
+      h = null;
+    }
+  }
+  const usable = (x) => !!x && (x.ok || (purpose === "depth" && !x.loading));
+  if (usable(h)) return true;
+  const failed = async (x) => ({ ok: false, error: `SAM model load failed: ${x.error}`, log: await samLogTail() });
+  if (h && h.error) return failed(h);
   if (!h) {
-    if (!existsSync(SAM_PS1)) { send && send("log", `SAM launcher missing: ${SAM_PS1}`); return false; }
+    if (!existsSync(SAM_PS1)) return { ok: false, error: `SAM launcher absent from this checkout: ${SAM_PS1}` };
     if (!samChild || samChild.exitCode !== null) {
-      send && send("log", "starting SAM service (model load ~40 s on first start)…");
+      log("starting SAM service (model load ~40 s on first start)…");
       // NOT detached. Measured 2026-09-18 (Windows PowerShell 5.1.26100): powershell.exe spawned
       // with `detached: true` exits 0 within a second without running the script at all, whatever
       // the window style or stdio (five variants tried, tools/sam-service/sam-service.log never
@@ -399,25 +609,33 @@ async function samEnsure(send) {
       // `detached` the same command binds the port in ~3 s and reports ready in ~13 s. Windows does
       // not kill a child when its parent exits, so the service still outlives this process; it now
       // shares this process's (hidden) console instead of a new process group.
+      // toolEnv(): the service inherits the resolved FFMPEG / FFPROBE, so depth.py finds them
+      // even when a request omits the `ffmpeg` field.
       samChild = spawn("powershell.exe",
         ["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", SAM_PS1],
-        { stdio: "ignore", windowsHide: true });
+        { stdio: "ignore", windowsHide: true, env: toolEnv() });
       samChild.unref();
     } else {
-      send && send("log", "waiting for the SAM service to finish starting…");
+      log("waiting for the SAM service to finish starting…");
     }
   } else {
-    send && send("log", "SAM service is loading the model…");
+    log("SAM service is loading the model…");
   }
   const deadline = Date.now() + 180000;
   while (Date.now() < deadline) {
     await new Promise((r) => setTimeout(r, 2000));
     h = await samHealth();
-    if (h && h.ok) { send && send("log", `SAM ready (${h.model} on ${h.device})`); return true; }
-    if (h && h.error) { send && send("log", `SAM model load failed: ${h.error} — see tools/sam-service/sam-service.log`); return false; }
+    if (h && h.ok) { samRestarted = false; log(`SAM ready (${h.model} on ${h.device})`); return true; }
+    if (usable(h)) { log("SAM service up (depth routes)"); return true; }
+    if (h && h.error) return failed(h);
   }
-  send && send("log", "SAM did not become ready within 180 s — see tools/sam-service/sam-service.log");
-  return false;
+  return { ok: false, error: "SAM service not ready after 180 s", log: await samLogTail() };
+}
+/** Send a samEnsure / forgeEnsure failure down an SSE stream: the transcript tail as log lines,
+ *  then the error event (gated fields included, so the client can raise its access prompt). */
+function sendEnsureFailure(send, r) {
+  for (const l of r.log || []) send("log", "[service] " + l);
+  send("error", ensureErrorPayload(r));
 }
 
 // ---- 4DViews .4ds codec (Task I: Convert tab wiring for tools/4ds/decode_4ds.py) -----------
@@ -433,11 +651,18 @@ function fourdsDllPath() {
   if (existsSync(FOURDS_DLL_FALLBACK)) return FOURDS_DLL_FALLBACK;
   return null;
 }
-function fourdsMissing() {
-  const missing = [];
-  if (!existsSync(FOURDS_PY)) missing.push("SAM-service Python env (tools/sam-service/env/Scripts/python.exe) — see ⚙ Settings → SAM service Python env");
-  if (!fourdsDllPath()) missing.push("BridgeCodec4DS.dll — copy it from your 4DViews SDK into tools\\4ds\\bin\\ (or set FOURDS_DLL)");
-  return missing;
+/** What a .4ds job still lacks, in the two forms the client acts on by itself: `needs` =
+ *  component ids it installs through /install before retrying, `needsFile` = a file only the
+ *  person has (the licensed codec DLL), collected with the native file dialog and copied into
+ *  place by POST /setup/4ds-codec. FOURDS_DLL still points at one in place. */
+function fourdsNeeds() {
+  return {
+    needs: existsSync(FOURDS_PY) ? [] : ["python-env"],
+    needsFile: fourdsDllPath() ? null : {
+      id: "4ds-codec", label: "BridgeCodec4DS.dll (4DViews SDK)", route: "/setup/4ds-codec",
+      filter: "4DViews codec (BridgeCodec4DS.dll)|BridgeCodec4DS.dll|DLL files (*.dll)|*.dll",
+    },
+  };
 }
 // Run `decode_4ds.py --info` (no decode) and parse its JSON. Used by /probe-4ds and to pick the
 // bake fps in /convert-4ds.
@@ -634,8 +859,9 @@ async function handle(req, res) {
   if (path === "/sam/start") {
     res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
     const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
-    const ok = await samEnsure(send);
-    send(ok ? "done" : "error", ok ? { url: SAM_URL } : { message: "SAM service could not be started — see tools/sam-service/sam-service.log" });
+    // ?for=track additionally requires SAM 3 (the video tracker has no ViT-H path).
+    const r = await samEnsure(send, { purpose: url.searchParams.get("for") === "track" ? "track" : "sam" });
+    if (r === true) send("done", { url: SAM_URL }); else sendEnsureFailure(send, r);
     res.end();
     return;
   }
@@ -676,10 +902,10 @@ async function handle(req, res) {
       const refused = e.code === "ECONNREFUSED";
       // Auto-start on real work (POST /segment); plain health GETs stay passive so
       // status polling never spawns anything.
-      if (refused && req.method === "POST") samEnsure(null);
+      if (refused && req.method === "POST") samEnsure(null, { purpose: path.startsWith("/sam/track/") ? "track" : path.startsWith("/sam/depth/") ? "depth" : "sam" }).catch(() => {});
       res.writeHead(refused ? 503 : 502, { ...HEADERS, "Content-Type": "application/json" });
       res.end(JSON.stringify(refused
-        ? { error: "sam service not running", starting: req.method === "POST", hint: "GET /sam/start streams launch progress" }
+        ? { error: "sam service not running", starting: req.method === "POST", start: "/sam/start" }
         : { error: "sam proxy failed", detail: e.message }));
     });
     req.pipe(up);
@@ -1119,6 +1345,28 @@ async function handle(req, res) {
     return;
   }
 
+  // Store a Hugging Face access token so gated repos can download.
+  //   POST /hf-token  {"token":"hf_…"}  ->  { ok, user } | { ok:false, error }
+  // The token arrives once, is handed to huggingface_hub on STDIN (never argv, which any process
+  // on the machine can read), and is never echoed back, logged, or written to history. This
+  // exists so a gated model is a dialog inside the app rather than a trip to a terminal to run
+  // `hf auth login`.
+  if (path === "/hf-token" && req.method === "POST") {
+    let body = "";
+    req.on("data", (d) => { body += d; if (body.length > 8192) req.destroy(); });
+    req.on("end", async () => {
+      const jsonOut = (o, code = 200) => { res.writeHead(code, { ...HEADERS, "Content-Type": "application/json" }); res.end(JSON.stringify(o)); };
+      try {
+        const { token } = JSON.parse(body || "{}");
+        const r = await saveHfToken(ROOT, token);
+        // Deliberately no token in the log line — only whether it worked.
+        console.log(`[ares-dev] hf token ${r.ok ? "stored" + (r.user ? ` for ${r.user}` : "") : "rejected"}`);
+        jsonOut(r, r.ok ? 200 : 400);
+      } catch { jsonOut({ ok: false, error: "malformed request" }, 400); }
+    });
+    return;
+  }
+
   // Install one or more components: GET /install?ids=a,b,c — SSE, one line at a time.
   // `resolve` expands each id through its `requires` graph and orders dependencies first, so
   // asking for a model that needs the Python env installs the env without being told to.
@@ -1151,9 +1399,10 @@ data: ${JSON.stringify(data)}
         send("step", { id: it.id, label: it.label, index: done, total: todo.length });
         line(`── ${it.label} (${it.sizeMB || "?"} MB) ──`);
         const r = await installOne(ROOT, it, line);
+        if (it.id === "ffmpeg") ffTools({ fresh: true });
         if (!r.ok) {
           line(`✗ ${it.label}: ${r.error}`);
-          send("error", { message: r.error, id: it.id, gated: !!r.gated, url: it.gated?.url });
+          send("error", { message: r.error, id: it.id, component: it.id, label: it.label, gated: !!r.gated, needsToken: !!r.needsToken, url: it.gated?.url });
           res.end();
           return;
         }
@@ -1169,27 +1418,36 @@ data: ${JSON.stringify(data)}
     return;
   }
 
-  // Guided installs (Settings tab). Each route streams SSE progress and refuses to touch
-  // anything that already exists — a failed or repeated install can never break a working state.
+  // Guided installs (Settings tab). Each route streams SSE progress and goes through
+  // ensureComponents, so it installs only what is absent and a repeat is a no-op.
   if (path === "/setup/sam-env") {
+    // The environment is the catalog's `python-env`: interpreter discovery (or the private
+    // CPython), the venv, and the PyTorch build chosen for THIS GPU all live in installer.mjs.
     res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
     const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
-    const svcDir = join(ROOT, "tools", "sam-service");
-    const envPy = join(svcDir, "env", "Scripts", "python.exe");
-    if (existsSync(envPy)) { send("done", { message: "env already present — nothing to do" }); res.end(); return; }
-    const reqs = join(svcDir, "requirements.txt");
-    if (!existsSync(reqs)) { send("error", { message: "requirements.txt missing in tools/sam-service/" }); res.end(); return; }
-    send("log", "creating venv (python -m venv env)…");
-    const script = `Set-Location '${svcDir}'; python -m venv env; if ($LASTEXITCODE -ne 0) { exit 1 }; ` +
-      `.\\env\\Scripts\\python.exe -m pip install --upgrade pip; ` +
-      `.\\env\\Scripts\\pip.exe install -r requirements.txt --extra-index-url https://download.pytorch.org/whl/cu124`;
-    const child = spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-Command", script], { windowsHide: true });
-    const relay = (d) => String(d).split(/\r?\n/).forEach((l) => l.trim() && send("log", l.trim().slice(0, 300)));
-    child.stdout.on("data", relay);
-    child.stderr.on("data", relay);
-    child.on("error", (e) => { send("error", { message: e.message }); res.end(); });
-    child.on("close", (code) => { send(code === 0 ? "done" : "error", code === 0 ? { message: "env ready — press Start SAM in the editor" } : { message: "pip exited " + code }); res.end(); });
-    req.on("close", () => { try { child.kill(); } catch { /* ignore */ } });
+    if (!(await ensureOrEnd(["python-env"], send, res))) return;
+    send("done", { message: "Python environment ready" });
+    res.end();
+    return;
+  }
+  // The licensed 4DViews codec: POST /setup/4ds-codec {"path":"<abs BridgeCodec4DS.dll>"} copies
+  // the picked file into tools/4ds/bin. The path comes from the native dialog (/pick), never typed.
+  if (path === "/setup/4ds-codec" && req.method === "POST") {
+    let body = ""; req.on("data", (d) => { body += d; if (body.length > 10000) req.destroy(); });
+    await new Promise((r) => req.on("end", r));
+    res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
+    let src = ""; try { src = String(JSON.parse(body || "{}").path || "").trim(); } catch { /* malformed */ }
+    try {
+      const st = src ? await stat(src) : null;
+      if (!st || !st.isFile() || !/\.dll$/i.test(src)) { res.end(JSON.stringify({ ok: false, error: "not a DLL file" })); return; }
+      const head = Buffer.alloc(2);
+      const fh = await open(src, "r");
+      try { await fh.read(head, 0, 2, 0); } finally { await fh.close(); }
+      if (head.toString("latin1") !== "MZ") { res.end(JSON.stringify({ ok: false, error: "not a Windows executable image" })); return; }
+      await mkdir(dirname(FOURDS_DLL_LOCAL), { recursive: true });
+      await copyFile(src, FOURDS_DLL_LOCAL);
+      res.end(JSON.stringify({ ok: true, path: FOURDS_DLL_LOCAL }));
+    } catch (e) { res.end(JSON.stringify({ ok: false, error: String((e && e.message) || e) })); }
     return;
   }
   if (path === "/setup/demo-clip") {
@@ -1197,9 +1455,9 @@ data: ${JSON.stringify(data)}
     const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
     const out = join(ROOT, "apps", "demo", "demo.ares");
     if (existsSync(out)) { send("done", { message: "demo.ares already present", out: "/apps/demo/demo.ares" }); res.end(); return; }
-    const cli = join(ROOT, "packages", "encoder", "dist", "cli.js");
-    if (!existsSync(cli)) { send("error", { message: "encoder not built — run npx tsc -b in ares/ first" }); res.end(); return; }
-    const child = spawn(process.execPath, [cli, "synth", "-o", out], { cwd: ROOT, windowsHide: true });
+    if (!(await ensureOrEnd(["encoder"], send, res))) return;
+    const cli = encoderState(ROOT).cli;
+    const child = spawn(process.execPath, [cli, "synth", "-o", out], { cwd: ROOT, windowsHide: true, env: toolEnv() });
     const relay = (d) => String(d).split(/\r?\n/).forEach((l) => l.trim() && send("log", l.trim()));
     child.stdout.on("data", relay);
     child.stderr.on("data", relay);
@@ -1255,8 +1513,8 @@ data: ${JSON.stringify(data)}
   if (path === "/forge/start") {
     res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
     const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
-    const ok = await forgeEnsure(send);
-    send(ok ? "done" : "error", ok ? { url: FORGE_URL } : { message: "Forge could not be started" });
+    const r = await forgeEnsure(send);
+    if (r === true) send("done", { url: FORGE_URL }); else sendEnsureFailure(send, r);
     res.end();
     return;
   }
@@ -1290,7 +1548,7 @@ data: ${JSON.stringify(data)}
     req.on("close", () => { try { child?.kill(); } catch { /* ignore */ } });
     // One stage = one child process whose output relays to the same SSE stream.
     const runStage = (stageArgs) => new Promise((resolve, reject) => {
-      child = spawn(process.execPath, stageArgs, { cwd: ROOT, windowsHide: true });
+      child = spawn(process.execPath, stageArgs, { cwd: ROOT, windowsHide: true, env: toolEnv() });
       child.stdout.on("data", relay);
       child.stderr.on("data", relay);
       child.on("error", reject);
@@ -1299,6 +1557,9 @@ data: ${JSON.stringify(data)}
     (async () => {
       let tmpDir = null;
       try {
+        // The encoder build (rebuilt when its sources are newer) and ffmpeg (texture video, audio)
+        // are installed here, inside this stream, when absent.
+        if (!(await ensureOrEnd(["encoder", "ffmpeg"], send, res))) return;
         let encDir = dir;
         if (coherent) {
           // The runner needs the actual frames dir (it does not descend like the encoder does)
@@ -1389,10 +1650,12 @@ data: ${JSON.stringify(data)}
     let ok = false;
     try { ok = !!p && /\.4ds$/i.test(p) && statSync(p).isFile(); } catch { ok = false; }
     if (!ok) { res.writeHead(400, { ...HEADERS, "Content-Type": "application/json" }); res.end(JSON.stringify({ error: `not a .4ds file: ${p}` })); return; }
-    const missing = fourdsMissing();
-    if (missing.length) {
-      res.writeHead(503, { ...HEADERS, "Content-Type": "application/json" });
-      res.end(JSON.stringify({ error: "4DViews codec unavailable", missing }));
+    // Not an error to read: `needs` is installed by the client through /install and `needsFile`
+    // is collected with the file dialog, then this request is repeated (apps/demo/ensure.js).
+    const lack = fourdsNeeds();
+    if (lack.needs.length || lack.needsFile) {
+      res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
+      res.end(JSON.stringify({ error: lack.needsFile ? "4DViews codec DLL not located" : "Python environment absent", ...lack }));
       return;
     }
     try {
@@ -1450,10 +1713,7 @@ data: ${JSON.stringify(data)}
     try { srcOk = !!srcPath && /\.4ds$/i.test(srcPath) && statSync(srcPath).isFile(); } catch { srcOk = false; }
     if (!srcOk) { res.writeHead(400, { ...HEADERS, "Content-Type": "text/plain" }); res.end(`not a .4ds file: ${srcPath}`); return; }
     if (!/^[a-z0-9_-]+$/i.test(rawName)) { res.writeHead(400, { ...HEADERS, "Content-Type": "text/plain" }); res.end(`bad output name (letters/digits/-/_ only): "${rawName}"`); return; }
-    const missing = fourdsMissing();
-    if (missing.length) { res.writeHead(503, { ...HEADERS, "Content-Type": "text/plain" }); res.end("4DViews codec unavailable: " + missing.join("; ")); return; }
     const encoderCli = join(ROOT, "packages", "encoder", "dist", "cli.js");
-    if (!existsSync(encoderCli)) { res.writeHead(503, { ...HEADERS, "Content-Type": "text/plain" }); res.end("encoder not built — run npx tsc -b in ares/ first"); return; }
 
     const name = await versionedOutName(join(ROOT, "apps", "demo"), rawName); // auto -vN, never overwrite
     const outRel = `apps/demo/${name}.ares`;
@@ -1465,8 +1725,13 @@ data: ${JSON.stringify(data)}
     req.on("close", () => { closed = true; try { if (child) child.kill(); } catch { /* ignore */ } });
 
     try {
+      send("start", { path: srcPath, name, out: "/" + outRel, maxFrames: maxFramesArg || null, mirrorX });
+      if (!(await ensureOrEnd(["python-env", "encoder", "ffmpeg"], send, res))) return;
+      // The codec DLL is licensed and cannot be fetched: the client collects it with a file dialog
+      // (needsFile) and re-issues this request. /probe-4ds asks first, so this is the backstop.
+      const lack = fourdsNeeds();
+      if (lack.needsFile) { send("error", { message: "4DViews codec DLL not located", stage: "setup", needsFile: lack.needsFile }); res.end(); return; }
       tmpDir = await mkdtemp(join(tmpdir(), "ares-4ds-"));
-      send("start", { path: srcPath, name, out: "/" + outRel, maxFrames: maxFramesArg || null, mirrorX, tmp: tmpDir });
 
       // --- decode phase: decode_4ds.py prints "[decode_4ds] N/M frames (...)" progress lines:
       // forward every line as a log event and pull frame/of out of the matching ones as progress.
@@ -1475,7 +1740,7 @@ data: ${JSON.stringify(data)}
       if (mirrorX) decodeArgs.push("--mirror-x");
       send("log", `[server] decoding (this can take a while: ~2 fps): ${basename(FOURDS_PY)} decode_4ds.py ${basename(srcPath)} -o <tmp>${maxFramesArg ? " --max-frames " + maxFramesArg : ""}${mirrorX ? " --mirror-x" : ""}`);
       await new Promise((resolve, reject) => {
-        const c = spawn(FOURDS_PY, decodeArgs, { windowsHide: true });
+        const c = spawn(FOURDS_PY, decodeArgs, { windowsHide: true, env: toolEnv() });
         child = c;
         let buf = "";
         const onData = (d) => {
@@ -1516,7 +1781,7 @@ data: ${JSON.stringify(data)}
       // to native texture size + crf 28 (fix 3) instead of the encoder's own generic 1024/crf32.
       const encodeArgs = [encoderCli, "encode", tmpDir, "-o", outAbs, "--fps", String(fps), "--tex-size", String(texSize), "--crf", String(crf)];
       await new Promise((resolve, reject) => {
-        const c = spawn(process.execPath, encodeArgs, { cwd: ROOT, windowsHide: true });
+        const c = spawn(process.execPath, encodeArgs, { cwd: ROOT, windowsHide: true, env: toolEnv() });
         child = c;
         const relay = (d) => String(d).split(/\r?\n/).forEach((l) => l.trim() && send("log", l));
         c.stdout.on("data", relay);
@@ -1610,7 +1875,8 @@ data: ${JSON.stringify(data)}
 
       // Tier prechecks: sd auto-launches Forge; ncnn just needs the vendored binary present.
       if (tier === "sd") {
-        if (!(await forgeEnsure(send))) { send("error", { message: "Forge unavailable for the generative tier", hint: "use the Fast (Real-ESRGAN) tier — it needs no server — or set FORGE_ROOT to your webui_forge install" }); res.end(); return; }
+        const f = await forgeEnsure(send);
+        if (f !== true) { sendEnsureFailure(send, f); res.end(); return; }
       } else if (!existsSync(REALESRGAN_EXE)) {
         send("error", { message: "Real-ESRGAN upscaler missing", hint: "expected tools/bin/realesrgan-ncnn-vulkan/realesrgan-ncnn-vulkan.exe (re-run the vendor step)" }); res.end(); return;
       }
