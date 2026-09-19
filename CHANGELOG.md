@@ -1,6 +1,6 @@
 # Changelog
 
-## 0.1.0 — 2026-09-07
+## 0.1.0: 2026-09-07
 
 **ARES Volumetric plays volumetric video in a browser, from a single file.** A capture that would
 normally arrive as thousands of meshes and gigabytes of PNGs becomes one `.ares` file: quantized,
@@ -9,7 +9,7 @@ GOP-aligned stream, with an optional Opus audio track. The player fetches that o
 vertex positions in the vertex shader, and uploads each decoded video frame straight to the GPU. A
 real 272-frame capture is 49.7 MB in one request, against 1.58 GB across 544 files as raw OBJ+PNG.
 
-This is the first versioned cut — the format, the browser runtime, the `ares` CLI, the Three.js and
+This is the first versioned cut, the format, the browser runtime, the `ares` CLI, the Three.js and
 React wrappers, the demo app and the specification, as they stand after the 2026-09-07 audit
 ([AUDIT.md](AUDIT.md)). **Added** below is what this release contains rather than a delta from an
 earlier version; **Fixed** is relative to the unversioned initial public drop (commit `0907ee5`).

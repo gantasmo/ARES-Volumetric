@@ -10,7 +10,7 @@
 const $ = (id) => document.getElementById(id);
 const esc = (s) => String(s ?? "").replace(/[&<>"]/g, (c) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;" }[c]));
 const fmtDur = (s) => {
-  if (s == null) return "—";
+  if (s == null) return ": ";
   s = Math.floor(s); const h = Math.floor(s / 3600), m = Math.floor((s % 3600) / 60);
   return h ? `${h}h ${m}m` : m ? `${m}m ${s % 60}s` : `${s}s`;
 };
@@ -30,7 +30,7 @@ function openStream(url, header) {
   if (box) box.textContent = (header ? header + "\n" : "");
   es = new EventSource(url);
   es.addEventListener("log", (e) => { try { logLine(JSON.parse(e.data)); } catch { /* */ } });
-  es.addEventListener("done", (e) => { let c = 0; try { c = JSON.parse(e.data).code; } catch { /* */ } logLine(c === 0 ? "✓ done" : "— finished (exit " + c + ")"); stopStream(); });
+  es.addEventListener("done", (e) => { let c = 0; try { c = JSON.parse(e.data).code; } catch { /* */ } logLine(c === 0 ? "✓ done" : "; finished (exit " + c + ")"); stopStream(); });
   es.addEventListener("error", (e) => { try { logLine("✗ " + (JSON.parse(e.data).message || "stream error")); } catch { logLine("✗ stream closed"); } stopStream(); });
 }
 
@@ -39,7 +39,7 @@ async function render() {
   if (!out) return;
   let d;
   try { d = await fetch("/runpod/status").then((r) => r.json()); }
-  catch { out.innerHTML = `<div class="card"><div class="note" style="color:var(--bad)">Compute needs the ARES dev server running.</div></div>`; return; }
+  catch { out.innerHTML = `<div class="card"><div class="note" style="color:var(--bad)">Dev server not reachable.</div></div>`; return; }
   if (!d.ok) { out.innerHTML = `<div class="card"><div class="note" style="color:var(--bad)">RunPod: ${esc(d.error)}</div></div>`; return; }
 
   const bal = Number(d.balance || 0);
@@ -90,7 +90,7 @@ async function render() {
     try {
       const r = await fetch("/runpod/launch", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ name: "ares-sam3d" }) }).then((x) => x.json());
       if (!r.ok) { logLine("✗ launch failed: " + r.error); return; }
-      logLine("✓ launched pod " + r.pod.id + " — booting; opening logs…");
+      logLine("✓ launched pod " + r.pod.id + ": booting; opening logs…");
       setTimeout(render, 1500);
       setTimeout(() => openStream("/runpod/logs?id=" + encodeURIComponent(r.pod.id), "▶︎ logs for " + r.pod.id), 1600);
     } catch (e) { logLine("✗ launch error: " + e.message); }

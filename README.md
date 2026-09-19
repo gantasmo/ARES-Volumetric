@@ -48,7 +48,7 @@ Two companion documents summarize the project at different depths:
 ```
 
 Toolchain: npm workspaces (npm ships with Node; pnpm and yarn are not used here),
-TypeScript 7.x (`tsc -b` project references), Node 22.15 or newer (tested on 24 LTS) — the SPZ
+TypeScript 7.x (`tsc -b` project references), Node 22.15 or newer (tested on 24 LTS), the SPZ
 importer uses zstd from `node:zlib`. The browser packages themselves need no particular Node.
 
 ## Status
@@ -98,7 +98,7 @@ after lossless vertex reorder, 49.6 MB after oct16 normals + AV1, and `daniel-s0
 One launcher, four modes. On Windows, double-click **`ARES.vbs`** at the repo root: it finds
 Node (installing the LTS build via winget if the machine has none), installs dependencies and
 builds when they are stale, synthesizes a demo clip if the checkout has no `.ares` file, starts
-the COOP/COEP dev server or reuses a running one, and opens the browser — all windowless.
+the COOP/COEP dev server or reuses a running one, and opens the browser: all windowless.
 Every step is logged to `tools/launch.log`, and `ARES-console.cmd` runs the same flow with a
 visible console.
 
@@ -120,7 +120,7 @@ npm run serve                    # just the dev server: no build, no browser
 ```
 
 The demo lives at `http://127.0.0.1:8137/apps/demo/` (the server walks up to port 8147 if
-8137 is taken). Capture data and `.ares` clips are not tracked in this repo — the tools that
+8137 is taken). Capture data and `.ares` clips are not tracked in this repo, the tools that
 read the reference capture take its path from `ARES_SRC_DIR`. A synth clip can be generated
 without any capture data, and is all the demo needs to run:
 
@@ -162,12 +162,12 @@ preview, box marquee, surface brush, and SAM click-to-select with a Blender-styl
 toggle, wireframe, and timeline ranges whose keyframed regions interpolate over time. The
 SAM tool captures the held frame on click, requests a mask from the local SAM 3 service
 (Shift-click adds exclusion points), previews it as a tint, and applies it as an RLE-coded
-bitmap region keyframed into the active range — the same evaluator drives the live preview
+bitmap region keyframed into the active range, the same evaluator drives the live preview
 and the bake. Edits persist as a non-destructive `.edits.json` sidecar and bake to a new
 `.ares` through the encoder. The panel's SAM row starts and monitors the service without
 leaving the app. Beyond selection: a lasso, a measure tool, grow / shrink / invert / mirror of
 the active range, camera bookmarks, per-range mute, names and keyframe interpolation (linear,
-hold, smooth), a bake-side sculpt action (move, inflate, smooth, flatten, pinch — weld-aware and
+hold, smooth), a bake-side sculpt action (move, inflate, smooth, flatten, pinch: weld-aware and
 feathered like paint), analysis views (normals, UV checker, depth, point cloud), and an Export
 section (frame to OBJ, still to PNG, turntable to WebM). An FX section applies playback effects to
 meshes and splats alike (clip plane, dissolve, tint, rim, scanlines, wobble, splat jitter and size),
@@ -257,7 +257,7 @@ automatically; `--track` forces persistent topology via nearest-point surface tr
 per-frame UV transfer; everything else falls back to intra frames. `--smooth` applies
 weld-aware Taubin smoothing (safe on atlased meshes; plain per-vertex filters crack UV
 seams). `--repack-detect image` detects atlas repacks by image difference instead of
-topology hash — required for stable-layout content, where the topology heuristic
+topology hash: required for stable-layout content, where the topology heuristic
 false-positives every frame. `--trim-in/--trim-out` cut frames while rebasing the edit
 list; the transform flags (`--up-axis`, `--center`, `--scale`, `--rotate`, `--translate`)
 bake the same evaluator the viewer previews with, so preview and bake cannot drift.
@@ -270,9 +270,9 @@ layout.
 WebCodecs into Web Audio and lets the audio clock lead the video; the transport gains a mute
 (U) and a volume slider, and the Convert tab has an audio row with a native file picker.
 
-**Gaussian splats.** A folder of one splat file per frame — Niantic SPZ (Scaniverse, World Labs
+**Gaussian splats.** A folder of one splat file per frame: Niantic SPZ (Scaniverse, World Labs
 Marble), 3DGS PLY (any trainer, Polycam, Luma), `.splat`, glTF/GLB carrying
-`KHR_gaussian_splatting`, or PlayCanvas SOG (`.sog` bundle or directory) — encodes as the splat
+`KHR_gaussian_splatting`, or PlayCanvas SOG (`.sog` bundle or directory): encodes as the splat
 profile automatically; a lone SOG directory is one frame. `--sh-degree` caps the spherical
 harmonic bands carried (0 is the view-independent fast path), `--splat-min-alpha` drops the
 near-transparent outlier haze generated captures carry before the quantization box is fitted,
@@ -301,12 +301,12 @@ container is no longer write-only.
 Beyond encoding well-formed mesh sequences, two pipelines rebuild difficult source
 material into good `.ares` input:
 
-- **Targeted temporal** ([docs/targeted-temporal.md](docs/targeted-temporal.md)) — for
+- **Targeted temporal** ([docs/targeted-temporal.md](docs/targeted-temporal.md)): for
   per-frame-reconstructed captures whose topology resets every frame: motion-metric span
   selection, per-span registration (nearest-pull for static spans, ARAP for moving ones),
   gated boundary transitions, and image-based repack detection so coherent spans
   inter-code their texture (−28 % texture at identical settings on the reference clip).
-- **RGBD rebuild** ([docs/rgbd-rebuild-pipeline.md](docs/rgbd-rebuild-pipeline.md)) — for
+- **RGBD rebuild** ([docs/rgbd-rebuild-pipeline.md](docs/rgbd-rebuild-pipeline.md)): for
   legacy 2.5D depth-sensor captures: hue-depth decode, subject masking (black background
   before any depth estimation), photoreal video upscale, video-consistent depth fused to
   metric sensor scale by a tiled locally-affine robust fit, shading detail integrated
@@ -317,21 +317,21 @@ material into good `.ares` input:
 
 The near-term queue (owner-steered):
 
-1. **LOD ladder** — one-command multi-tier export (one source → N tiers via `--decimate`,
+1. **LOD ladder**, one-command multi-tier export (one source → N tiers via `--decimate`,
    `--tex-size`, `--crf`) plus a playback tier picker (2-tier minimal version of spec
    9.3; the container GOP index already supports it).
-2. **SVF/HoloVideo texture passthrough** — a byte-level teardown of a licensed capture
+2. **SVF/HoloVideo texture passthrough**: a byte-level teardown of a licensed capture
    showed its texture is standard H.264 with the mesh riding in type-24 NAL units:
    stripping those yields a pure video track the runtime can carry natively (zero
    transcode; geometry still goes through the Unity exporter until the mesh NAL format
    is reversed).
-3. **In-scene sculpt + texture-paint ops** — two new op kinds in the existing edit-op
+3. **In-scene sculpt + texture-paint ops**, two new op kinds in the existing edit-op
    system; world-anchored (never texel-coordinate) so they survive per-frame atlas
    repacks. First acceptance target: healing residual face defects in registered spans.
-4. **RGBD track continuation** — full first take, then the remaining takes as a batch;
+4. **RGBD track continuation**: full first take, then the remaining takes as a batch;
    a watertight per-take asset (PSHuman-class) to replace the projected back texture;
    multi-frame UV texture accumulation on takes where the subject rotates.
-5. **Reference-guided texture restoration** — re-unwrap to a stable atlas, then temporal
+5. **Reference-guided texture restoration**: re-unwrap to a stable atlas, then temporal
    restoration conditioned on reference photos of the subject (the capture textures are
    irreversibly AI-upscaled; reference photos are obtainable ground truth).
 

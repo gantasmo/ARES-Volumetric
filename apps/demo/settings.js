@@ -48,10 +48,10 @@ function hardwareCard() {
       <div class="row" style="margin-bottom:6px"><h3 style="margin:0;flex:1">Your machine</h3>
         <span class="note" style="margin:0">${esc(gpu.label)}</span></div>
       <div class="kv">
-        ${gpuRows || `<div class="k">GPU</div><div class="v">none detected — models will run on the CPU</div>`}
-        <div class="k">precision</div><div class="v">${esc(gpu.dtype)} <small style="color:var(--text-faint)">— ${esc(gpu.dtypeWhy)}</small></div>
-        ${gpu.cudaIndex ? `<div class="k">PyTorch build</div><div class="v">${esc(gpu.cudaIndex)} <small style="color:var(--text-faint)">— ${esc(gpu.cudaWhy)}</small></div>` : ""}
-        <div class="k">Hugging Face</div><div class="v">${pre?.hfToken ? "token stored — gated models can download" : "not signed in"}</div>
+        ${gpuRows || `<div class="k">GPU</div><div class="v">none detected: models will run on the CPU</div>`}
+        <div class="k">precision</div><div class="v">${esc(gpu.dtype)} <small style="color:var(--text-faint)">· ${esc(gpu.dtypeWhy)}</small></div>
+        ${gpu.cudaIndex ? `<div class="k">PyTorch build</div><div class="v">${esc(gpu.cudaIndex)} <small style="color:var(--text-faint)">· ${esc(gpu.cudaWhy)}</small></div>` : ""}
+        <div class="k">Hugging Face</div><div class="v">${pre?.hfToken ? "token stored: gated models can download" : "not signed in"}</div>
       </div>
       ${blockers.map((b) => `<div class="note2" style="color:var(--warn);margin-top:6px">${b}</div>`).join("")}
     </div>`;
@@ -63,7 +63,7 @@ function profileCards() {
     const isRec = p.id === recommended;
     const names = p.included.map((id) => byId[id]?.label).filter(Boolean);
     const dropped = p.dropped.length
-      ? `<div class="note2" style="color:var(--warn)">Left out — this GPU cannot hold ${p.dropped.map((d) => `${esc(d.label)} (needs ${gb(d.needMB)})`).join(", ")}.</div>`
+      ? `<div class="note2" style="color:var(--warn)">Left out: this GPU cannot hold ${p.dropped.map((d) => `${esc(d.label)} (needs ${gb(d.needMB)})`).join(", ")}.</div>`
       : "";
     return `
       <div class="prof${isRec ? " rec" : ""}${p.complete ? " done" : ""}">
@@ -84,7 +84,7 @@ function profileCards() {
   };
   return `<div class="card">
       <div class="row" style="margin-bottom:2px"><h3 style="margin:0;flex:1">One click</h3></div>
-      <div class="note" style="margin:0 0 8px">Each one installs everything it needs, in order — Python environment included. Anything you already have is skipped.</div>
+      <div class="note" style="margin:0 0 8px">Each one installs everything it needs, in order: Python environment included. Anything you already have is skipped.</div>
       <div class="profs">${profs.map(card).join("")}</div>
     </div>`;
 }
@@ -118,7 +118,7 @@ function componentRows() {
       <div class="row" style="margin-bottom:2px"><h3 style="margin:0;flex:1">Or pick your own</h3>
         <button class="u" id="cmpInstall"${chosen.length ? "" : " disabled"}>
           ${chosen.length ? `Install ${chosen.length} · ${gb(totalMB)}` : "Install selected"}</button></div>
-      <div class="note" style="margin:0 0 6px">Dependencies come along automatically — ticking a model pulls in the Python environment if it is missing.</div>
+      <div class="note" style="margin:0 0 6px">Dependencies come along automatically: ticking a model pulls in the Python environment if it is missing.</div>
       ${groups.map((g) => `<div class="cgroup">${esc(g)}</div>` + installable.filter((d) => d.group === g).map(row).join("")).join("")}
     </div>`;
 }
@@ -160,7 +160,7 @@ function runInstall(ids) {
     es.addEventListener("log", (e) => { try { line(JSON.parse(e.data)); } catch { /* ignore */ } });
     es.addEventListener("plan", (e) => { try { total = JSON.parse(e.data).todo.length; } catch { /* ignore */ } });
     es.addEventListener("step", (e) => {
-      try { const s = JSON.parse(e.data); title.textContent = `${s.label} — ${s.index + 1} of ${s.total}`; bar.style.width = ((s.index / s.total) * 100).toFixed(0) + "%"; } catch { /* ignore */ }
+      try { const s = JSON.parse(e.data); title.textContent = `${s.label}: ${s.index + 1} of ${s.total}`; bar.style.width = ((s.index / s.total) * 100).toFixed(0) + "%"; } catch { /* ignore */ }
     });
     es.addEventListener("stepDone", (e) => {
       try { const s = JSON.parse(e.data); bar.style.width = ((s.index / s.total) * 100).toFixed(0) + "%"; } catch { /* ignore */ }
@@ -193,7 +193,7 @@ async function render({ keepLog = false } = {}) {
   const priorTitle = keepLog ? $("instTitle")?.textContent : null;
   try { await load(); }
   catch {
-    out.innerHTML = `<div class="card"><div class="note" style="color:var(--bad)">Component check needs the ARES dev server (start it with ARES.vbs, or npm start).</div></div>`;
+    out.innerHTML = `<div class="card"><div class="note" style="color:var(--bad)">Dev server not reachable: component status unavailable.</div></div>`;
     return;
   }
 
@@ -214,7 +214,7 @@ async function render({ keepLog = false } = {}) {
         <button class="u" id="depRefresh">Refresh</button></div>
       <div class="kv">
         <div class="k">SAM segmentation</div><div class="v" id="depSam">checking…</div>
-        <div class="k">dev server</div><div class="v">this page — encode, enhance, pickers, history</div>
+        <div class="k">dev server</div><div class="v">this page: encode, enhance, pickers, history</div>
       </div>
     </div>`;
 

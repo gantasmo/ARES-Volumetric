@@ -22,10 +22,10 @@ const core = join(ROOT, "packages/core/dist");
 const three = join(ROOT, "packages/three/dist");
 
 async function ensureBuilt(p) {
-  try { await stat(p); } catch { throw new Error(`${p} missing — run \`npm run build\` first`); }
+  try { await stat(p); } catch { throw new Error(`${p} missing: run \`npm run build\` first`); }
 }
 
-const banner = { js: "/* ARES Volumetric — MIT. Bundles @ares/core + meshoptimizer (MIT). */" };
+const banner = { js: "/* ARES Volumetric: MIT. Bundles @ares/core + meshoptimizer (MIT). */" };
 
 async function one(entry, outfile, opts) {
   for (const minify of [false, true]) {

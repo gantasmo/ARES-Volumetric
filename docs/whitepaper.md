@@ -60,7 +60,7 @@ page.
 The strongest empirical anchor comes from a byte-level teardown of a shipping 4DViews
 `.4ds` file, performed with a structural parser (`tools/probe-4ds.cjs`) that reads only
 container skeleton: header fields, frame directory, and block lengths. It never decodes
-mesh or texture content — ordinary interoperability practice — and it self-validates by
+mesh or texture content: ordinary interoperability practice; and it self-validates by
 reconciling geometry + texture + overhead to the exact file size with zero bytes left over.
 The file examined (455 frames, 15.2 s, 1440x1440 texture) splits as follows:
 
@@ -418,7 +418,7 @@ small is the documented fallback).
 
 Near-term: the visual evaluation gate across encode
 recipes (in progress; smoothing-off is the keeper so far), SAM toolset follow-ons (feature
-cache, text prompts, temporal propagation — the click tool itself shipped 2026-07-10),
+cache, text prompts, temporal propagation, the click tool itself shipped 2026-07-10),
 meshopt decimation behind a `--decimate` flag (locked atlas-seam borders, UVs untouched;
 estimated 5-10 MB off the ~34 MB geometry, to be confirmed with the baseline harness
 before any number is quoted), and temporal denoise via approximate nearest-point

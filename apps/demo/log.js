@@ -102,7 +102,7 @@ export function installLogCapture() {
   }
 
   window.addEventListener("beforeunload", () => { if (BUF.length) flush(); });
-  emit({ t: Date.now(), src: "app", lvl: "info", msg: `session start — ${location.pathname}${location.search}` });
+  emit({ t: Date.now(), src: "app", lvl: "info", msg: `session start: ${location.pathname}${location.search}` });
 }
 
 // Global handle so anything (including the console, and me) can write a line without an import.

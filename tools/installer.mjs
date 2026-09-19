@@ -137,7 +137,7 @@ function summarize(gpus) {
     return {
       gpus: [], count: 0, vramMB: 0, cc: 0, arch: "none", label: "no NVIDIA GPU detected",
       // Everything still installs; it just runs on the CPU, so say so rather than blocking.
-      dtype: "float32", dtypeWhy: "no CUDA device — models run on the CPU in float32",
+      dtype: "float32", dtypeWhy: "no CUDA device: models run on the CPU in float32",
       cudaIndex: null, cudaWhy: "no CUDA device detected",
     };
   }
@@ -158,14 +158,14 @@ function summarize(gpus) {
     dtype: bf16Native ? "bfloat16" : "float16",
     dtypeWhy: bf16Native
       ? `${arch.name} (sm_${String(cc).replace(".", "")}) has native bf16 tensor cores`
-      : `${arch.name} (sm_${String(cc).replace(".", "")}) has no native bf16 path — fp16 is the fast one here, at the same VRAM`,
+      : `${arch.name} (sm_${String(cc).replace(".", "")}) has no native bf16 path: fp16 is the fast one here, at the same VRAM`,
     // PyTorch's own build table (.ci/manywheel/build_env_setup.py): cu126 builds SASS for
     // {50,60,70,75,80,86,90}, cu130 for {75,80,86,90,100,120}. Anything Turing or newer takes
     // cu130 (it also covers Blackwell); older cards have to stay on cu126, which still has them.
     cudaIndex: cc >= 7.5 ? "cu130" : "cu126",
     cudaWhy: cc >= 7.5
       ? `sm_${String(cc).replace(".", "")} is in PyTorch's cu130 build set (75–120)`
-      : `sm_${String(cc).replace(".", "")} was dropped by CUDA 13 — cu126 still ships it`,
+      : `sm_${String(cc).replace(".", "")} was dropped by CUDA 13: cu126 still ships it`,
   };
 }
 
@@ -213,12 +213,12 @@ export function catalog(ROOT, gpu) {
       id: "sam3",
       group: "Segmentation",
       label: "SAM 3 (facebook/sam3)",
-      enables: "click-to-select and text-prompted selection in the editor — the primary backend",
+      enables: "click-to-select and text-prompted selection in the editor, the primary backend",
       why: "the full model; what the editor uses by default",
       sizeMB: 3281,          // model.safetensors only — sam3.pt is a second copy the loader never reads
       vramMB: 1653,          // measured: tracker 914 MB + concept sharing the vision tower
       requires: ["python-env"],
-      gated: { url: "https://huggingface.co/facebook/sam3", why: "Meta gates this repo — accept the licence once, with the same account your HF token belongs to" },
+      gated: { url: "https://huggingface.co/facebook/sam3", why: "Meta gates this repo: accept the licence once, with the same account your HF token belongs to" },
       ...(sam3Legacy ? found(true, sam3Legacy, dirBytes(sam3Legacy))
         : sam3Snap ? found(true, sam3Snap, dirBytes(sam3Snap))
         : found(false)),
@@ -229,7 +229,7 @@ export function catalog(ROOT, gpu) {
         const at = sam3Legacy || sam3Snap;
         const pt = at && join(at, "sam3.pt");
         return pt && existsSync(pt)
-          ? { diskNote: `includes sam3.pt (${mb(statSync(pt).size)} MB), which the transformers loader never reads — safe to delete` }
+          ? { diskNote: `includes sam3.pt (${mb(statSync(pt).size)} MB), which the transformers loader never reads: safe to delete` }
           : {};
       })(),
       install: {
@@ -243,7 +243,7 @@ export function catalog(ROOT, gpu) {
       id: "sam3-lite",
       group: "Segmentation",
       label: "SAM 3 LiteText S0 (ungated)",
-      enables: "text-prompted selection without Meta's licence — click-to-select still needs SAM 3 or ViT",
+      enables: "text-prompted selection without Meta's licence: click-to-select still needs SAM 3 or ViT",
       why: "Apache-2.0, no sign-up; the fallback when the gated repo is not an option",
       sizeMB: 2022,
       vramMB: 1100,
@@ -319,7 +319,7 @@ export function catalog(ROOT, gpu) {
       group: "Texture enhance",
       label: "DreamShaper 8 (generative detail)",
       enables: "the /detail SD 1.5 img2img pass",
-      why: "fp16 weights only — the fp32 copies and the disabled safety checker are 5.8 GB the code never loads",
+      why: "fp16 weights only, the fp32 copies and the disabled safety checker are 5.8 GB the code never loads",
       sizeMB: 2034,
       vramMB: 2600,
       optional: true,
@@ -360,7 +360,7 @@ export function catalog(ROOT, gpu) {
     {
       id: "capture", group: "Project", label: "Source capture frames", statusOnly: true, optional: true,
       enables: "re-encoding, editor Bake, enhance experiments",
-      why: "your own data — any per-frame OBJ/PLY + atlas PNG folder works",
+      why: "your own data: any per-frame OBJ/PLY + atlas PNG folder works",
       ...(existsSync(join(P.REPO, "Daniel_Microsoft_Volcap", "Daniel_Volcap")) ? found(true, join(P.REPO, "Daniel_Microsoft_Volcap", "Daniel_Volcap")) : found(false)),
     },
     {
@@ -382,7 +382,7 @@ export function catalog(ROOT, gpu) {
       enables: "nothing yet",
       // Re-checked 2026-09-08: facebook/sam3.1 is still published as library `checkpoint`, and
       // transformers 5.16 ships sam3 / sam3_tracker / sam3_lite_text but no sam3_1. Still parked.
-      why: "no code path loads it — transformers has no SAM 3.1 architecture yet",
+      why: "no code path loads it: transformers has no SAM 3.1 architecture yet",
       ...fileFound(join(P.REPO, "sam3.1", "sam3.1_multiplex.pt")),
       link: "https://huggingface.co/facebook/sam3.1",
     },
@@ -423,7 +423,7 @@ export function profiles(items, gpu) {
     },
     {
       id: "smallest", label: "Smallest",
-      blurb: "Ungated and light — no licence to accept, least disk and VRAM.",
+      blurb: "Ungated and light, no licence to accept, least disk and VRAM.",
       want: ["python-env", "sam3-lite", "esrgan-general", "esrgan-ncnn"],
     },
   ];
@@ -502,7 +502,7 @@ async function installPythonEnv(ROOT, item, onLine) {
 
   onLine("upgrading pip…");
   await sh(P.envPy, ["-m", "pip", "install", "--upgrade", "pip", "--disable-pip-version-check"], { cwd: P.svc }, onLine);
-  onLine(`installing PyTorch (${idx}) and the rest — this is the long one, several minutes…`);
+  onLine(`installing PyTorch (${idx}) and the service packages: several minutes…`);
   const code = await sh(P.envPy, ["-m", "pip", "install", "-r", P.reqs, "--extra-index-url", `https://download.pytorch.org/whl/${idx}`], { cwd: P.svc }, onLine);
   if (code !== 0) return { ok: false, error: "pip install failed (exit " + code + ")" };
   return { ok: true };

@@ -181,19 +181,19 @@ export function initDiagnostics() {
 
   // The clip actually loaded, live. First segment because it's the thing the bar is most often read
   // for — "what am I looking at". Fed by main.js via setDiagClip() from the player's own stats.
-  const clipSeg = seg("The clip currently loaded — name · delivered size · frames · duration. Live, from the player.");
-  const bakeSeg = seg("Coherent bake — stage, frame, and measured ETA. Goes idle shortly after a bake finishes.");
-  const gpuSeg = seg("GPU — utilization · temperature · VRAM used / total");
-  const ramSeg = seg("System RAM — used / total");
-  const diskSeg = seg("Disk (project drive) — free space");
-  const rpSeg = seg("RunPod — on/off, active pod GPU + hourly cost, account balance");
+  const clipSeg = seg("The clip currently loaded: name · delivered size · frames · duration. Live, from the player.");
+  const bakeSeg = seg("Coherent bake: stage, frame, and measured ETA. Goes idle shortly after a bake finishes.");
+  const gpuSeg = seg("GPU: utilization · temperature · VRAM used / total");
+  const ramSeg = seg("System RAM: used / total");
+  const diskSeg = seg("Disk (project drive): free space");
+  const rpSeg = seg("RunPod: on/off, active pod GPU + hourly cost, account balance");
 
   // ---- Activity log toggle. Lives ON the bar (no new chrome, one toggle). The audit trail of
   // what actually happened lives behind this door.
   const logBtn = document.createElement("button");
   logBtn.id = "diagLogBtn";
   logBtn.style.cssText = "all:unset;cursor:pointer;color:var(--text-dim);padding:0 5px;font-size:11px;white-space:nowrap";
-  logBtn.title = "Activity log — everything the app, the bakes, and the tooling did. Server-persisted: survives tab changes and reloads.";
+  logBtn.title = "Activity log: everything the app, the bakes, and the tooling did. Server-persisted: survives tab changes and reloads.";
 
   const wrap = document.createElement("div");
   wrap.style.cssText = "display:flex;align-items:center;gap:14px;flex:1;overflow:hidden";
@@ -294,7 +294,7 @@ export function initDiagnostics() {
       const g = d.gpu; const hot = g.temp >= 84;
       gpuSeg.innerHTML = `<span style="color:var(--text-dim)">GPU</span> <span>${g.util}%</span> <span style="color:${hot ? "var(--bad)" : "var(--text-mid)"}">${g.temp}°</span> <span>${gb(g.vramUsedMB)}/${gb(g.vramTotalMB)}G</span>`;
       dim(gpuSeg, true);
-    } else { gpuSeg.innerHTML = `<span style="color:var(--text-dim)">GPU —</span>`; dim(gpuSeg, false); }
+    } else { gpuSeg.innerHTML = `<span style="color:var(--text-dim)">GPU: </span>`; dim(gpuSeg, false); }
 
     // ---- RAM ----
     if (d.ram) { ramSeg.innerHTML = `<span style="color:var(--text-dim)">RAM</span> <span>${gb(d.ram.usedMB)}/${gb(d.ram.totalMB)}G</span>`; }
@@ -304,7 +304,7 @@ export function initDiagnostics() {
 
     // ---- RunPod ----
     const rp = d.runpod;
-    if (!rp || rp.error) { rpSeg.innerHTML = `<span style="color:var(--text-dim)">RunPod —</span>`; dim(rpSeg, false); }
+    if (!rp || rp.error) { rpSeg.innerHTML = `<span style="color:var(--text-dim)">RunPod: </span>`; dim(rpSeg, false); }
     else {
       const on = rp.pods && rp.pods.length;
       rpSeg.innerHTML = `<span style="color:var(--text-dim)">RunPod</span> <span>${on ? `${rp.pods[0].gpu || "pod"} $${(rp.pods[0].costPerHr || 0).toFixed(2)}/hr` : "off"}</span> <span style="color:var(--text-dim)">$${(rp.balance || 0).toFixed(2)}</span>`;
@@ -313,10 +313,10 @@ export function initDiagnostics() {
   };
 
   // ---- Now playing. Pushed by main.js from the player's live stats; nothing here polls.
-  clipSeg.innerHTML = `<span style="color:var(--text-dim)">▶︎ —</span>`;
+  clipSeg.innerHTML = `<span style="color:var(--text-dim)">▶︎: </span>`;
   dim(clipSeg, false);
   setClipSeg = (c) => {
-    if (!c || !c.name) { clipSeg.innerHTML = `<span style="color:var(--text-dim)">▶︎ —</span>`; dim(clipSeg, false); return; }
+    if (!c || !c.name) { clipSeg.innerHTML = `<span style="color:var(--text-dim)">▶︎: </span>`; dim(clipSeg, false); return; }
     const bits = [`<span style="color:var(--text-dim)">▶︎</span>`, `<span style="color:var(--text)">${c.name}</span>`];
     if (c.sizeMB) bits.push(`<span>${c.sizeMB >= 1024 ? (c.sizeMB / 1024).toFixed(2) + "G" : c.sizeMB.toFixed(0) + "M"}</span>`);
     if (c.frames) bits.push(`<span style="color:var(--text-dim)">${c.frames}f · ${fmtT(c.durationS)}</span>`);

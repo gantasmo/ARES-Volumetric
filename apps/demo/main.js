@@ -89,7 +89,7 @@ async function afterImport(r, { open: openIt = true } = {}) {
   await refreshLibraryInfo();
   renderSourceBar();
   window.dispatchEvent(new CustomEvent("ares:library-changed"));
-  aact(r.already ? `already in the library: ${r.src}` : `imported ${r.src}${r.renamed ? " (renamed — a clip by that name already existed)" : ""}`);
+  aact(r.already ? `already in the library: ${r.src}` : `imported ${r.src}${r.renamed ? " (renamed: a clip by that name already existed)" : ""}`);
   if (openIt) openClip(r.src);
   return true;
 }
@@ -157,7 +157,7 @@ function wireLibraryDrop() {
     stop(e); host.classList.remove("libDrop");
     const files = Array.from(e.dataTransfer.files || []);
     const ares = files.filter((f) => /\.ares$/i.test(f.name));
-    if (!ares.length) { alert(files.length ? "Drop a .ares clip — that was " + files[0].name : "Drop a .ares clip here."); return; }
+    if (!ares.length) { alert(files.length ? "Drop a .ares clip: that was " + files[0].name : "Drop a .ares clip here."); return; }
     // One at a time: importing opens the clip, and opening navigates away.
     importAresFile(ares[0]);
   });
@@ -288,7 +288,7 @@ function starBtn(s) {
 function editControls(s) {
   const wrap = document.createElement("span"); wrap.className = "mctl";
   const fsel = document.createElement("select"); fsel.className = "fsel"; fsel.title = "move to folder";
-  for (const [v, t] of [["", "— none"], ...allFolders().map((f) => [f, f]), ["__new__", "＋ New…"]]) {
+  for (const [v, t] of [["", "· none"], ...allFolders().map((f) => [f, f]), ["__new__", "＋ New…"]]) {
     const o = document.createElement("option"); o.value = v; o.textContent = t; if ((s.folder || "") === v) o.selected = true; fsel.append(o);
   }
   fsel.onclick = (e) => e.stopPropagation();
@@ -329,8 +329,8 @@ function ensureDetailEl() {
 }
 const hideDetail = () => { if (detailEl) detailEl.style.display = "none"; };
 function fmtDateTime(ms) {
-  if (!ms) return "—";
-  try { return new Date(ms).toLocaleString(undefined, { year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }); } catch { return "—"; }
+  if (!ms) return "·";
+  try { return new Date(ms).toLocaleString(undefined, { year: "numeric", month: "short", day: "numeric", hour: "numeric", minute: "2-digit" }); } catch { return "·"; }
 }
 const cdRow = (k, v) => (v == null || v === "" ? "" : `<div class="cdrow"><span class="cdk">${k}</span><span class="cdv">${v}</span></div>`);
 function buildDetailHTML(s, meta) {
@@ -378,7 +378,7 @@ function renderListItem(s, cur) {
   const lab = document.createElement("span"); lab.className = "lab"; lab.textContent = s.label; b.append(lab);
   if (!showcaseEdit) { const z = document.createElement("span"); z.className = "sz"; z.textContent = missing ? "missing" : fmtMB(clipBytes(s.src)); b.append(z); }
   b.setAttribute("aria-pressed", String(cur === s.src));
-  b.onclick = () => { if (showcaseEdit) renameInline(lab, s); else if (missing) alert(`"${s.label}" (${s.src}) is no longer on disk — remove it in edit mode (✎).`); else navTo(s.src); };
+  b.onclick = () => { if (showcaseEdit) renameInline(lab, s); else if (missing) alert(`"${s.label}" (${s.src}) is no longer on disk: remove it in edit mode (✎).`); else navTo(s.src); };
   attachDetailHover(b, s);   // rich hover: full provenance + added/made timestamps
   row.append(b);
   if (showcaseEdit) row.append(editControls(s));
@@ -394,7 +394,7 @@ function renderGridItem(s, cur) {
     th.append(img);
   } else { const ph = document.createElement("div"); ph.className = "ph"; ph.textContent = (s.label[0] || "?").toUpperCase(); th.append(ph); }
   th.append(starBtn(s));
-  th.onclick = () => { if (showcaseEdit) return; if (missing) alert(`"${s.label}" (${s.src}) is no longer on disk — remove it in edit mode (✎).`); else navTo(s.src); };
+  th.onclick = () => { if (showcaseEdit) return; if (missing) alert(`"${s.label}" (${s.src}) is no longer on disk: remove it in edit mode (✎).`); else navTo(s.src); };
   card.append(th);
   attachDetailHover(card, s);   // rich hover: full provenance + added/made timestamps
   const lab = document.createElement("div"); lab.className = "glab"; lab.textContent = s.label;
@@ -459,7 +459,7 @@ async function openAddPicker() {
   row.id = "srcAddRow";
   row.style.cssText = "display:flex;flex-direction:column;gap:4px;padding:5px 6px;border-bottom:1px solid var(--border)";
   const sel = document.createElement("select"); sel.className = "inp"; sel.style.cssText = "width:100%;box-sizing:border-box";
-  if (!avail.length) { const o = document.createElement("option"); o.value = ""; o.textContent = "(no other .ares — Convert one first)"; sel.append(o); }
+  if (!avail.length) { const o = document.createElement("option"); o.value = ""; o.textContent = "(no other .ares: Convert one first)"; sel.append(o); }
   for (const f of avail) { const o = document.createElement("option"); o.value = f.src; o.textContent = `${f.src} (${(f.bytes / 1048576).toFixed(1)} MB)`; sel.append(o); }
   const label = document.createElement("input");
   label.placeholder = "label";
@@ -750,13 +750,13 @@ function renderHUD(s) {
     ["Geometry", (s.geometryMode || "meshopt intra") + " · " + aresGeomMB.toFixed(1) + " MB",
       "Draco " + dracoGeom.toFixed(1) + " MB " + est],
     ["Texture", hasVideo ? s.textureLabel + " · " + aresTexMB.toFixed(1) + " MB · <span class='good'>HW</span>" : s.textureLabel,
-      hasVideo ? "PNG ×" + dracoFiles + " · " + sizeMB(dracoTex) + (raw.measured ? " <small>measured ✓</small>" : "") : "—"],
+      hasVideo ? "PNG ×" + dracoFiles + " · " + sizeMB(dracoTex) + (raw.measured ? " <small>measured ✓</small>" : "") : "·"],
     ["Geom decode / frame", s.decodeMsPerFrame.toFixed(2) + " ms <small>main thread</small>",
       "~" + (s.decodeMsPerFrame * DRACO_DECODE_MULT).toFixed(1) + " ms <small>needs Worker</small>"],
     ["Dequantize", "<span class='good'>GPU shader</span>", "CPU"],
     ["Time to first frame", "<span class='good'>" + s.ttffMs.toFixed(0) + " ms</span>", "1.5–4 s <small>est.</small>"],
     ["Render", s.fps.toFixed(0) + " fps · " + s.cpuMsPerFrame.toFixed(2) + " ms CPU/f", "per-frame fetch+parse"],
-    ["Frame", (s.frameIndex + 1) + " / " + s.frameCount, "—"],
+    ["Frame", (s.frameIndex + 1) + " / " + s.frameCount, "·"],
   ];
   $("cmpBody").replaceChildren(...rows.map((r) => buildRow(r[0], r[1], r[2])));
 
@@ -768,17 +768,17 @@ function renderHUD(s) {
       [raw.measured ? `Raw ${raw.kind}` : "Raw OBJ+PNG", raw.total, BAR_COLORS.raw,
         raw.measured ? `measured · ${raw.files} files` : "measured on a DIFFERENT capture",
         raw.measured
-          ? `THIS clip's own source: ${raw.files} files, ${raw.frames} frames — geom ${raw.geom.toFixed(0)} + tex ${raw.tex.toFixed(0)} MB.${raw.dir ? "\n" + raw.dir : ""}`
-          : `No provenance sidecar for this clip — these are the 272-frame Daniel capture's numbers, NOT this clip's. Run: node tools/measure-source.mjs <clip>.ares`],
+          ? `THIS clip's own source: ${raw.files} files, ${raw.frames} frames: geom ${raw.geom.toFixed(0)} + tex ${raw.tex.toFixed(0)} MB.${raw.dir ? "\n" + raw.dir : ""}`
+          : `No provenance sidecar for this clip: these are the 272-frame Daniel capture's numbers, NOT this clip's. Run: node tools/measure-source.mjs <clip>.ares`],
       ["Draco-GLB", dracoTotal, BAR_COLORS.draco, raw.measured ? "geom est. · PNG measured" : BASE.draco.tag,
         `geom ${dracoGeom.toFixed(1)} + PNG ${dracoTex.toFixed(0)} · per-frame sequence. ` +
         (raw.measured
-          ? `Geometry scaled from a real draco3d encode (${BASE.draco.geom} MB over ${BASE_FRAMES}f × ~${(BASE_VERTS/1000).toFixed(1)}k verts) to this clip's ${(vertFrames/1e6).toFixed(1)}M vertex-frames. The PNG side is not an estimate — a Draco-GLB sequence ships this source's OWN atlases.`
+          ? `Geometry scaled from a real draco3d encode (${BASE.draco.geom} MB over ${BASE_FRAMES}f × ~${(BASE_VERTS/1000).toFixed(1)}k verts) to this clip's ${(vertFrames/1e6).toFixed(1)}M vertex-frames. The PNG side is not an estimate: a Draco-GLB sequence ships this source's OWN atlases.`
           : `Measured on the 272-frame Daniel capture.`)],
       // Cross-content by construction: measured on a DIFFERENT 4DViews capture and normalised to a
       // 9s equivalent. It's a fidelity-tier reference point, not this clip's origin — labelled so.
       ["4DViews", [BASE.fourdviews.low, BASE.fourdviews.high], BAR_COLORS.fourdviews, "other capture · 9s-equiv ref",
-        "native temporal codec. 720p streaming ~2 Mbps → 2.3 MB (est.). DESKTOP_HR MEASURED (real .4ds, 125 Mbps → ~135 MB/9s ≈ 2× ARES). Byte-proven internal split (9s-equiv): geometry ~5.5 MiB (temporal mesh, 4%) + texture ~130 MiB (per-frame 1440² GPU-block, 96%, NO video compression) — mirror image of ARES."],
+        "native temporal codec. 720p streaming ~2 Mbps → 2.3 MB (est.). DESKTOP_HR MEASURED (real .4ds, 125 Mbps → ~135 MB/9s ≈ 2× ARES). Byte-proven internal split (9s-equiv): geometry ~5.5 MiB (temporal mesh, 4%) + texture ~130 MiB (per-frame 1440² GPU-block, 96%, NO video compression): mirror image of ARES."],
       ["ARES", aresTotalMB, BAR_COLORS.ares, s.geometryMode && s.geometryMode.includes("temporal") ? "measured · P2" : "measured · intra",
         `geom ${aresGeomMB.toFixed(1)} + VP9 ${aresTexMB.toFixed(1)}`],
     ];
@@ -844,7 +844,7 @@ function renderHUD(s) {
   const head = `<b>${s.frameCount} frames · ${(s.vertexCount / 1000).toFixed(1)}k ${isSplatClip ? "splats" : "verts"} · ${dur.toFixed(1)}s.</b> `;
   const origin = raw.dir ? raw.dir.split(/[\\/]/).filter(Boolean).pop() : "";
   $("cmp").innerHTML = isSplatClip
-    ? head + `Gaussian splat profile — per-chunk AABB quantization, meshopt-coded attribute streams, sorted and composited on the GPU. Single request.`
+    ? head + `Gaussian splat profile: per-chunk AABB quantization, meshopt-coded attribute streams, sorted and composited on the GPU. Single request.`
     : !hasVideo
     ? head + `Single request, GPU-side dequant, hardware-ready texture path.`
     : raw.measured
@@ -852,11 +852,11 @@ function renderHUD(s) {
         `Converted from <b>${sizeMB(raw.total)}</b> of raw ${raw.kind} (<b>${raw.files} files</b>${origin ? `, <span title="${raw.dir}">${origin}</span>` : ""}) ` +
         `→ <b class="good">${(raw.total / aresTotalMB).toFixed(1)}× smaller</b> in 1 request. ` +
         `<small>Source split: geom ${raw.geom.toFixed(0)} + tex ${raw.tex.toFixed(0)} MB. ` +
-        `Measured on this clip's own source at encode time — not a reference figure.</small>`
+        `Measured on this clip's own source at encode time, not a reference figure.</small>`
       : head +
-        `<b class="warn">No provenance for this clip</b> — its real source size is unknown, so the bars below fall back to the ` +
+        `<b class="warn">No provenance for this clip</b>· its real source size is unknown, so the bars below fall back to the ` +
         `272-frame Daniel capture's measurements, which are <b>not this clip's</b>. ` +
-        `<small>Fix: <code>node tools/measure-source.mjs ${(SRC || "").replace("./", "")}</code> (needs the source folder to still exist).</small>`;
+        `<small>Provenance is recorded at encode time from the source folder.</small>`;
 }
 
 // --- Mesh editor v1: crop-box preview (GPU discard) + bake through the local encoder ---------
@@ -986,9 +986,9 @@ function initEditor(player) {
   const AXES = [["X", 0], ["Y", 1], ["Z", 2]];
   const AXIS_NAME = ["X", "Y", "Z"];
   const AXIS_TIP = {
-    X: "X crop — trim left/right.",
-    Y: "Y crop — trim vertically: the low plane cuts the FLOOR away, the high plane cuts anything above the subject.",
-    Z: "Z crop — trim front/back depth. Useful for stray background geometry behind the subject.",
+    X: "X crop: trim left/right.",
+    Y: "Y crop: trim vertically: the low plane cuts the FLOOR away, the high plane cuts anything above the subject.",
+    Z: "Z crop: trim front/back depth. Useful for stray background geometry behind the subject.",
   };
 
   // ---- Crop = rulers + viewport guides (like rulers in Photoshop / After Effects, not sliders
@@ -1363,7 +1363,7 @@ function initEditor(player) {
       const mm = (v) => cropMm(i, v) / worldPerMm;
       const txt = full ? "full" : `${mm(cropPct[i][0]).toFixed(0)}…${mm(cropPct[i][1]).toFixed(0)}`;
       const cls = `cr${isDepth ? " depth" : ""}${full ? "" : " set"}`;
-      return `<div class="${cls}" title="${AXIS_TIP[n]}${full ? "" : " Values in millimetres."}${isDepth ? " Currently pointing into the screen — orbit (1/3/7) to drag it." : ""}"><u>${n}</u><span>${txt}</span></div>`;
+      return `<div class="${cls}" title="${AXIS_TIP[n]}${full ? "" : " Values in millimetres."}${isDepth ? " Currently pointing into the screen: orbit (1/3/7) to drag it." : ""}"><u>${n}</u><span>${txt}</span></div>`;
     }).join("");
   }
 
@@ -1431,8 +1431,8 @@ function initEditor(player) {
         px[ax].push(p);
         if (!isFinite(p)) continue;
         const tip = map.aligned
-          ? `${AXIS_NAME[ax]} ${e ? "max" : "min"} plane — drag to move it. ${AXIS_TIP[AXIS_NAME[ax]]}`
-          : `${AXIS_NAME[ax]} ${e ? "max" : "min"} plane. The view is off-axis, so this line only marks where the plane crosses the clip's centre — it is not the cut itself. Press 1 / 3 / 7 for a straight-on view to place it exactly.`;
+          ? `${AXIS_NAME[ax]} ${e ? "max" : "min"} plane; drag to move it. ${AXIS_TIP[AXIS_NAME[ax]]}`
+          : `${AXIS_NAME[ax]} ${e ? "max" : "min"} plane. The view is off-axis, so this line only marks where the plane crosses the clip's centre: it is not the cut itself. Press 1 / 3 / 7 for a straight-on view to place it exactly.`;
         g += `<div class="cropGuide ${cls}${map.aligned ? "" : " off"}" data-ax="${ax}" data-edge="${e}" data-comp="${comp}" style="${cls === "gv" ? "left" : "top"}:${p}px" title="${tip}"><i></i><b>${AXIS_NAME[ax]} ${cropMm(ax, cropPct[ax][e]).toFixed(0)}</b></div>`;
       }
     }
@@ -1620,7 +1620,7 @@ function initEditor(player) {
       el.textContent = trimIsFull() ? "full" : `${trimIn}–${trimOutEff()} · ${kept}f · ${(kept / 30).toFixed(2)}s`;
       el.classList.toggle("on", !trimIsFull());
       el.title = trimIsFull()
-        ? "No trim — the whole clip plays and bakes."
+        ? "No trim, the whole clip plays and bakes."
         : `Trimmed to source frames ${trimIn}–${trimOutEff()} (${kept} of ${total} frames, ${(kept / 30).toFixed(2)}s). Playback loops inside this window and a bake encodes only it; the dimmed frames are dropped, and edit ranges shift onto the new numbering.`;
     }
     if (save) saveEdits();
@@ -1782,8 +1782,8 @@ function initEditor(player) {
     const trimHtml =
       (tIn > 0 ? `<div class="tlCut" style="left:0;width:${(tIn / total) * 100}%"></div>` : "") +
       (tOut < total - 1 ? `<div class="tlCut" style="left:${((tOut + 1) / total) * 100}%;right:0"></div>` : "") +
-      `<div class="tlTrimH in" data-trim="in" style="left:${(tIn / total) * 100}%" title="clip IN — drag to trim the start ( [ sets it at the playhead )"><i></i><b>in ${tIn}</b></div>
-       <div class="tlTrimH out" data-trim="out" style="left:${((tOut + 1) / total) * 100}%" title="clip OUT — drag to trim the end ( ] sets it at the playhead )"><i></i><b>out ${tOut}</b></div>`;
+      `<div class="tlTrimH in" data-trim="in" style="left:${(tIn / total) * 100}%" title="clip IN; drag to trim the start ( [ sets it at the playhead )"><i></i><b>in ${tIn}</b></div>
+       <div class="tlTrimH out" data-trim="out" style="left:${((tOut + 1) / total) * 100}%" title="clip OUT; drag to trim the end ( ] sets it at the playhead )"><i></i><b>out ${tOut}</b></div>`;
     // strip: ruler + one lane per range (bar spans [start,end], diamonds at keyframes, trim
     // handles on the active range) + the full-height playhead. All positions are % of the strip.
     $("rangeTrack").innerHTML = `<div id="tlRuler" style="position:relative;height:14px;margin-bottom:1px;cursor:ew-resize;user-select:none;touch-action:none"></div>
@@ -1810,7 +1810,7 @@ function initEditor(player) {
       const col = displayColor(r.color) || SEG_PALETTE[0];   // hex, never a var(): hex-alpha suffixes below
       const mark = r === activeRange ? "▶︎ " : "";
       const optSel = (v) => (v === action ? " selected" : "");
-      const bakeTag = `<span class="badge warn" style="margin:0" title="bake-only — the live preview intentionally only shows delete ranges (keepPredicateAt skips copy/recolor); this is exactly what Bake will apply">bake-only</span>`;
+      const bakeTag = `<span class="badge warn" style="margin:0" title="bake-only; the live preview intentionally only shows delete ranges (keepPredicateAt skips copy/recolor); this is exactly what Bake will apply">bake-only</span>`;
       let sub;
       if (action === "recolor") {
         const rc = r.recolor || { color: col, strength: 0.8, mode: "tint" };
@@ -1844,7 +1844,7 @@ function initEditor(player) {
           <input type="color" class="rpColor" data-ridx="${i}" value="${(pp.color || col).toLowerCase()}" title="paint color" style="width:var(--ctl);height:var(--ctl);padding:0;border:0;background:none;cursor:pointer">` : ""}
           <input type="range" class="rpStrength" data-ridx="${i}" min="0" max="1" step="0.01" value="${pp.strength ?? 0.8}" style="width:52px;accent-color:${col}" title="strength 0-1">
           <span class="rpStrengthVal" style="min-width:24px">${Number(pp.strength ?? 0.8).toFixed(2)}</span>
-          <input type="number" class="rpFeather inp" data-ridx="${i}" min="1" placeholder="auto" value="${pp.feather ?? ""}" style="width:42px" title="falloff feather in mm — blank = auto (half the mean stroke radius)">
+          <input type="number" class="rpFeather inp" data-ridx="${i}" min="1" placeholder="auto" value="${pp.feather ?? ""}" style="width:42px" title="falloff feather in mm; blank = auto (half the mean stroke radius)">
           <span title="soft-brush falloff half-width">mm</span>${bakeTag}`;
       } else if (action === "sculpt") {
         // World-anchored vertex displacement (sculpt+paint plan §A) — the range's volumes are the
@@ -1861,14 +1861,14 @@ function initEditor(player) {
             ? [0, 1, 2].map((ax) => `<input type="number" class="rsOff inp" data-ridx="${i}" data-ax="${ax}" step="1" value="${+Number(off[ax] || 0).toFixed(3)}" style="width:44px" title="offset ${"XYZ"[ax]} (${unit})">`).join("")
             : `<input type="number" class="rsAmt inp" data-ridx="${i}" step="${brush === "inflate" ? 1 : 0.05}" ${brush === "inflate" ? "" : 'min="0" max="1"'} value="${+Number(sp.amount ?? (brush === "inflate" ? 5 * worldPerMm : brush === "smooth" ? 1 : 0.5)).toFixed(3)}" style="width:52px" title="${brush === "inflate" ? "distance along the normal (" + unit + "); negative deflates" : brush === "smooth" ? "blend of the smoothed result, 0–1" : "fraction of the way, 0–1"}"><span>${brush === "inflate" ? unit : "×"}</span>`) +
           (brush === "smooth" ? `<input type="number" class="rsIter inp" data-ridx="${i}" min="1" max="50" value="${sp.iterations ?? 3}" style="width:36px" title="Laplacian passes"><span>it</span>` : "") +
-          `<input type="number" class="rsFeather inp" data-ridx="${i}" min="0" placeholder="auto" value="${sp.feather ?? ""}" style="width:42px" title="falloff feather (${unit}) — blank = auto (half the mean brush radius, else 5% of the region)"><span>feather</span>${bakeTag}`;
+          `<input type="number" class="rsFeather inp" data-ridx="${i}" min="0" placeholder="auto" value="${sp.feather ?? ""}" style="width:42px" title="falloff feather (${unit}); blank = auto (half the mean brush radius, else 5% of the region)"><span>feather</span>${bakeTag}`;
       } else {
         const ph = r.patchHoles;
         sub = `<label style="display:flex;gap:4px;align-items:center;cursor:pointer">
             <input type="checkbox" class="rphChk" data-ridx="${i}" ${ph ? "checked" : ""} style="margin:0">patch holes
           </label>${ph ? `
-          <input type="color" class="rphColor" data-ridx="${i}" value="${(ph.color || "#888888").toLowerCase()}" title="hole fill color — leave as-is to use the auto rim-average color" style="width:var(--ctl);height:var(--ctl);padding:0;border:0;background:none;cursor:pointer">
-          <button class="rphAuto u" data-ridx="${i}" title="clear the explicit color — use the auto rim-average fill">auto</button>` : ""}`;
+          <input type="color" class="rphColor" data-ridx="${i}" value="${(ph.color || "#888888").toLowerCase()}" title="hole fill color: leave as-is to use the auto rim-average color" style="width:var(--ctl);height:var(--ctl);padding:0;border:0;background:none;cursor:pointer">
+          <button class="rphAuto u" data-ridx="${i}" title="clear the explicit color: use the auto rim-average fill">auto</button>` : ""}`;
       }
       // Keyframe interpolation rides every action's sub-row: it is a property of the region's motion.
       const ip = r.interp || "linear";
@@ -1881,7 +1881,7 @@ function initEditor(player) {
       const escA = (t) => String(t).replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/</g, "&lt;");
       return `<div data-ridx="${i}" style="margin-top:${i ? 5 : 0}px;cursor:pointer;opacity:${muted ? ".55" : "1"}" title="click to make this range ▶︎ active (Delete/Backspace then removes it)">
         <div style="display:flex;gap:6px;align-items:center;font-size:11px;color:var(--text-mid)">
-          <input type="checkbox" class="renb" data-ridx="${i}" ${muted ? "" : "checked"} style="margin:0" title="on / muted — a muted range stays in the document but preview and bake ignore it">
+          <input type="checkbox" class="renb" data-ridx="${i}" ${muted ? "" : "checked"} style="margin:0" title="on / muted; a muted range stays in the document but preview and bake ignore it">
           <span style="width:8px;height:8px;border-radius:2px;background:${col};flex:none"></span>
           <input type="text" class="rlabel inp" data-ridx="${i}" value="${escA(r.label || "")}" placeholder="${escA(r.id || "range")}" maxlength="40" style="width:54px;min-width:0" title="name this range">
           <span style="flex:1;min-width:0;white-space:nowrap;overflow:hidden;text-overflow:ellipsis">${mark}${action} ${r.startFrame}–${r.endFrame} · ${r.keyframes.length} kf</span>
@@ -1898,7 +1898,7 @@ function initEditor(player) {
       </div>`;
     }).join("");
 
-    // Click a row (not one of its interactive controls) to make it the ▶ active range — the target
+    // Click a row (not one of its interactive controls) to make it the ▶ active range, the target
     // Delete/Backspace removes, and what Key/End sessions extend. Doesn't itself touch `edits`, so
     // no undo step (only the resulting button-state/mark change).
     for (const row of $("rangeList").children) {
@@ -1951,7 +1951,7 @@ function initEditor(player) {
       inp.onblur = () => gestureCommit();
       inp.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); inp.blur(); } e.stopPropagation(); };
     }
-    // sculpt payload controls — same coalescing law as paint's.
+    // sculpt payload controls: same coalescing law as paint's.
     for (const sel of $("rangeList").querySelectorAll(".rsBrush")) sel.onchange = () => {
       doMutation(() => {
         const r = edits.ranges[Number(sel.dataset.ridx)];
@@ -1982,7 +1982,7 @@ function initEditor(player) {
       inp.onblur = () => gestureCommit();
       inp.onkeydown = (e) => { if (e.key === "Enter") { e.preventDefault(); inp.blur(); } };
     }
-    // Everything below is bake-only payload (no live-preview effect) — mutate + debounced-save
+    // Everything below is bake-only payload (no live-preview effect): mutate + debounced-save
     // directly, skipping setEditPreview/full-rerender so a continuous drag (strength slider, color
     // picker) or in-progress typing (dst-frames text) never rebuilds the DOM out from under focus.
     // Discrete controls (checkbox/selects/the "auto" button) push ONE undo step per change via
@@ -2020,7 +2020,7 @@ function initEditor(player) {
       doMutation(() => { edits.ranges[Number(s.dataset.ridx)].recolor.mode = s.value; });
       saveEdits();
     };
-    // paint payload controls — same coalescing law as recolor's (discrete → doMutation,
+    // paint payload controls: same coalescing law as recolor's (discrete → doMutation,
     // continuous → gestureBegin/Commit). Brush change re-renders (the color input is tint-only).
     for (const s of $("rangeList").querySelectorAll(".rpBrush")) s.onchange = () => {
       doMutation(() => { edits.ranges[Number(s.dataset.ridx)].paint.brush = s.value; });
@@ -2783,7 +2783,7 @@ function initEditor(player) {
     host.replaceChildren(...camMarks.map((_, i) => {
       const b = document.createElement("button");
       b.className = "u ico"; b.textContent = String(i + 1);
-      b.title = `camera bookmark ${i + 1} — click to go there, Shift-click to remove`;
+      b.title = `camera bookmark ${i + 1}: click to go there, Shift-click to remove`;
       b.onclick = (e) => { if (e.shiftKey) { camMarks.splice(i, 1); camPersist(); camRender(); } else camGo(i); };
       return b;
     }));
@@ -2858,7 +2858,7 @@ function initEditor(player) {
     const host = $("fxKeys");
     host.replaceChildren(...t.keyframes.slice().sort((a, b) => a.frame - b.frame).map((k) => {
       const b = document.createElement("button");
-      b.className = "u"; b.textContent = String(k.frame); b.title = `effects keyframe at frame ${k.frame} — click to jump there`;
+      b.className = "u"; b.textContent = String(k.frame); b.title = `effects keyframe at frame ${k.frame}: click to jump there`;
       b.onclick = () => { tlSeek(k.frame); writeFxControls(k.params); applyFxControls(); };
       return b;
     }));
@@ -2908,7 +2908,7 @@ function initEditor(player) {
   const exportStatus = (msg) => { const el = $("exportStatus"); if (el) el.textContent = msg; };
   $("exportObj").onclick = () => {
     const fr = player.exportFrame();
-    if (!fr) { exportStatus("no mesh frame to export" + (player.isSplat && player.isSplat() ? " — use `ares export` for splat clips" : "")); return; }
+    if (!fr) { exportStatus("no mesh frame to export" + (player.isSplat && player.isSplat() ? "· use `ares export` for splat clips" : "")); return; }
     const n = fr.positions.length / 3;
     const parts = [`# ARES ${clipBase} frame ${fr.frameIndex}\no ${clipBase}_f${fr.frameIndex}\n`];
     const p = fr.positions;
@@ -3012,7 +3012,7 @@ function initEditor(player) {
     const box = activeRange ? null : cropBox();          // the crop belongs to the range while authoring
     const trimmed = !trimIsFull();
     const xformed = !xfIsDefault();
-    if (!box && !edits.ranges.length && !trimmed && !xformed) { log.textContent = "nothing to bake — transform, crop, trim the clip, or author a range first"; return; }
+    if (!box && !edits.ranges.length && !trimmed && !xformed) { log.textContent = "nothing to bake: transform, crop, trim the clip, or author a range first"; return; }
     // Empty name → derive from the loaded clip: <clip-base>-edit.
     const name = ($("bakeName").value.trim() || clipBase + "-edit").replace(/[^a-z0-9._-]/gi, "_");
     const q = new URLSearchParams({ dir, name, textureCodec: "av1", texSize: "1024", crf: "30", smooth: "0" });
@@ -3066,7 +3066,7 @@ function initEditor(player) {
 }
 
 async function main() {
-  if (!navigator.gpu) console.warn("[ares] WebGPU unavailable — using the WebGL2 fallback renderer (spec §10.4)");
+  if (!navigator.gpu) console.warn("[ares] WebGPU unavailable: using the WebGL2 fallback renderer (spec §10.4)");
 
   const [w, h] = fit();
   canvas.width = w; canvas.height = h;
@@ -3096,7 +3096,7 @@ async function main() {
   window.__ares = player; // debug handle
   const backend = (new URLSearchParams(location.search).get("gl2") === "1" || !navigator.gpu) ? "WebGL2 fallback" : "WebGPU";
   const splatClip = !!(player.isSplat && player.isSplat());
-  $("title").textContent = "playing " + SRC.split("/").pop() + " — " + (splatClip ? "Gaussian splat profile (SPLT), " : "meshopt geometry + WebCodecs texture, ") + backend;
+  $("title").textContent = "playing " + SRC.split("/").pop() + "·" + (splatClip ? "Gaussian splat profile (SPLT), " : "meshopt geometry + WebCodecs texture, ") + backend;
   if (splatClip) {
     // Splat clips have no triangles: the surface-selection tools and wireframe/unlit modes are
     // mesh concepts. Crop, transform, trim and the clay view keep working. Text, not hiding, so
@@ -3105,11 +3105,11 @@ async function main() {
     for (const b of document.querySelectorAll('#editPanel button.tool[data-tool]')) {
       if (b.dataset.tool === "nav") continue;
       b.disabled = true;
-      b.title += " — mesh clips only: a splat clip has no triangles to select.";
+      b.title += "· mesh clips only: a splat clip has no triangles to select.";
     }
     for (const mode of ["wire", "unlit", "normals", "uv", "depth", "points"]) {
       const b = document.querySelector(`#shadeSeg button[data-shade="${mode}"]`);
-      if (b) { b.disabled = true; b.title += " — not applicable to splat clips."; }
+      if (b) { b.disabled = true; b.title += "· not applicable to splat clips."; }
     }
     for (const id of ["selGrow", "selShrink", "selInvert", "selMirror", "exportObj"]) { const b = $(id); if (b) b.disabled = true; }
     const rail = document.getElementById("editPanel");
@@ -3142,7 +3142,7 @@ async function main() {
       player.setCamera({ azimuth: az, elevation: el, distance: d, target: [tx, ty, tz] });
       player.autoOrbit = false;
     } else {
-      console.warn("[ares] carried camera is out of scale for this clip — auto-framing instead");
+      console.warn("[ares] carried camera is out of scale for this clip: auto-framing instead");
     }
   }
   if (qs.get("t")) player.seek(Number(qs.get("t")));
@@ -3250,7 +3250,7 @@ async function main() {
     const m = LOOP_MODES[loopIdx];
     player.loopMode = m.mode;
     loopBtn.textContent = m.label;
-    loopBtn.title = `at the clip end: ${m.name} — click to cycle Loop → Ping-pong → Once`;
+    loopBtn.title = `at the clip end: ${m.name}: click to cycle Loop → Ping-pong → Once`;
     localStorage.setItem("ares.loopMode", m.mode);
   };
   applyLoopMode();

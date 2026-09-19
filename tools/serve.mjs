@@ -283,7 +283,7 @@ async function analyseDir(dir0) {
   const splatFiles = names.filter((f) => SPLAT_RE.test(f));
   const atlases = names.filter((f) => ATLAS_RE.test(f)), pngs = names.filter((f) => PNG_RE.test(f));
   let meshes = objs.length ? objs : plys;
-  let kind = objs.length ? "OBJ" : plys.length ? "PLY" : "—";
+  let kind = objs.length ? "OBJ" : plys.length ? "PLY" : "·";
   // Splat sequences (spec §6.8): a 3DGS PLY folder, or one SPZ/.splat/SOG/glTF file per frame, or
   // a single SOG directory (meta.json + webp images).
   let splat = false, splatCount = 0;
@@ -1060,7 +1060,7 @@ data: ${JSON.stringify(data)}
       const plan = resolve(items, wanted).filter((it) => !it.statusOnly && it.install);
       const todo = plan.filter((it) => !it.present);
       const skipped = plan.filter((it) => it.present);
-      for (const it of skipped) line(`✓ ${it.label} — already installed, skipping`);
+      for (const it of skipped) line(`✓ ${it.label}: already installed, skipping`);
       if (!todo.length) { send("done", { message: "everything requested is already installed" }); res.end(); return; }
       line(`installing ${todo.length} component${todo.length > 1 ? "s" : ""}: ${todo.map((t) => t.label).join(", ")}`);
       send("plan", { todo: todo.map((t) => ({ id: t.id, label: t.label, sizeMB: t.sizeMB })), skipped: skipped.map((t) => t.id) });
@@ -1170,7 +1170,7 @@ data: ${JSON.stringify(data)}
     return;
   }
 
-  // Pre-warm / start Forge (generative enhance tier) — SSE status, no terminal.
+  // Pre-warm / start Forge (generative enhance tier): SSE status, no terminal.
   if (path === "/forge/start") {
     res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
     const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
@@ -1181,12 +1181,12 @@ data: ${JSON.stringify(data)}
   }
 
   // GUI-triggered local encode (Convert tab). Runs the real encoder CLI on this machine and streams
-  // its progress back as Server-Sent Events — the user never opens a terminal. localhost-only.
+  // its progress back as Server-Sent Events, the user never opens a terminal. localhost-only.
   // coherent=1 (DEFAULT; visual verdict 2026-07-13: "Coherent A by far the best"): a stable-template
   // pre-pass (tools/coherent/coherent-clip.mjs) rewrites the clip into per-GOP shared-topology
   // frames with atlases rebaked into the template's UVs, THEN the normal encoder runs on that
-  // temp frames-dir — same two-stage-inside-one-SSE-stream shape as /convert-4ds. NOT used by
-  // /convert-4ds itself (4DViews topology resets need cross-reset correspondence — future work).
+  // temp frames-dir: same two-stage-inside-one-SSE-stream shape as /convert-4ds. NOT used by
+  // /convert-4ds itself (4DViews topology resets need cross-reset correspondence: future work).
   if (path === "/encode") {
     const q = url.searchParams;
     const dir = q.get("dir") || "";
@@ -1221,7 +1221,7 @@ data: ${JSON.stringify(data)}
         let encDir = dir;
         if (coherent) {
           // The runner needs the actual frames dir (it does not descend like the encoder does)
-          // and mesh-fNNNNN.obj + atlas-fNNNNN.png naming — it fails loudly (relayed) otherwise.
+          // and mesh-fNNNNN.obj + atlas-fNNNNN.png naming: it fails loudly (relayed) otherwise.
           const framesSrc = await resolveFramesDir(dir);
           tmpDir = await mkdtemp(join(tmpdir(), "ares-coherent-"));
           const cohFrames = join(tmpDir, "frames");
@@ -1230,12 +1230,12 @@ data: ${JSON.stringify(data)}
           cohPass("gop", "--gop"); cohPass("maxFrames", "--max-frames"); // geometry-GOP length intentionally matches the texture --gop default (30)
           cohPass("bake", "--bake"); // absent → runner default "exact" (the fast bake smears)
           send("start", { dir, out: "/" + outRel, args: "coherent pre-pass → encode", stage: "coherent" });
-          send("log", "[coherent] stable-template pre-pass (registration + atlas rebake) — this is the long stage…");
+          send("log", "[coherent] stable-template pre-pass (registration + atlas rebake): this is the long stage…");
           if (q.get("decimate")) send("log", "[coherent] note: decimate re-collapses each frame independently and can undo the shared topology (frames may fall back to intra)");
           const code = await runStage(cohArgs);
-          if (code !== 0) { send("error", { code, stage: "coherent", message: `coherent pre-pass exited ${code} — see log above` }); res.end(); return; }
+          if (code !== 0) { send("error", { code, stage: "coherent", message: `coherent pre-pass exited ${code}; see log above` }); res.end(); return; }
           encDir = cohFrames;
-          send("log", "[coherent] pre-pass done — encoding coherent frames…");
+          send("log", "[coherent] pre-pass done: encoding coherent frames…");
         }
         // Provenance enrichment: stamp the encoder's <out>.ares.meta.json sidecar with which pipeline
         // produced this clip and (coherent) the resolved registration recipe from the pre-pass manifest.
@@ -1268,7 +1268,7 @@ data: ${JSON.stringify(data)}
           args.push("--audio", audioPath);
           pass("audioOffset", "--audio-offset"); pass("audioBitrate", "--audio-bitrate");
         }
-        if (isSplatDir) send("log", "[encode] splat sequence detected — encoding as the Gaussian splat profile (coherent pre-pass and texture flags do not apply)");
+        if (isSplatDir) send("log", "[encode] splat sequence detected: encoding as the Gaussian splat profile (coherent pre-pass and texture flags do not apply)");
         // editsName → the sidecar saved via POST /edits/<name> (path stays server-side, sanitized).
         const editsName = q.get("editsName");
         if (editsName) args.push("--edits", join(ROOT, "apps", "demo", editsName.replace(/[^a-z0-9._-]/gi, "_") + ".edits.json"));
@@ -1276,7 +1276,7 @@ data: ${JSON.stringify(data)}
         if (!coherent) send("start", { dir, out: "/" + outRel, args: args.slice(1).join(" ") });
         const code = await runStage(args);
         if (code === 0) {
-          // meta records the FULL recipe — the history panel's "⧉ Use settings" re-applies it to
+          // meta records the FULL recipe, the history panel's "⧉ Use settings" re-applies it to
           // another clip's conversion.
           historyAdd({ kind: "encode", path: dir, name: name + ".ares", out: "/" + outRel, meta: {
             codec: q.get("textureCodec") || "vp9", texSize: q.get("texSize") || "", crf: q.get("crf") || "",
@@ -1299,7 +1299,7 @@ data: ${JSON.stringify(data)}
   }
 
   // 4DViews .4ds codec info (Task I). GET /probe-4ds?path=<abs .4ds> → decode_4ds.py --info's
-  // JSON {nbFrames, framerate, maxVertices, maxTriangles, textureSize, textureEncoding} — no
+  // JSON {nbFrames, framerate, maxVertices, maxTriangles, textureSize, textureEncoding}, no
   // decode, just a CreateSequence + query. Richer than the browser's byte-level structural probe
   // (probe.js) because it comes straight from the codec. Used by the Convert tab to size the
   // max-frames default and gate the Convert button before any decode work starts.
@@ -1329,7 +1329,7 @@ data: ${JSON.stringify(data)}
   // /enhance above (EventSource can't POST, so this follows their query-string convention rather
   // than the JSON-body shape sketched in the task brief). Pipeline: decode_4ds.py writes a
   // per-frame OBJ+PNG frames-dir into a fresh OS-temp directory, then the real encoder CLI bakes
-  // that dir into apps/demo/<name>.ares — the same two tools Task H already verified standalone,
+  // that dir into apps/demo/<name>.ares, the same two tools Task H already verified standalone,
   // just chained and streamed. The temp frames dir is ALWAYS removed in a finally, mirroring
   // cli.ts's own scratch-atlas-dir cleanup (`.finally(() => cleanupTexDir?.())`), success or fail.
   if (path === "/convert-4ds") {
@@ -1340,7 +1340,7 @@ data: ${JSON.stringify(data)}
     const mirrorX = q.get("mirrorX") === "1";
 
     // Optional codec-quality overrides (Task J fix 3). Default for .4ds converts is now the
-    // SOURCE atlas's NATIVE texture size (not a hardcoded 1024) and crf 28 (not 32) — measured:
+    // SOURCE atlas's NATIVE texture size (not a hardcoded 1024) and crf 28 (not 32): measured:
     // native size + crf28 cuts end-to-end UV-seam MAE from 8.14 to 5.75 (-29%) for +5% file size,
     // vs downscaling to 1024 which concentrates lanczos error on the seams before the codec even
     // runs. Query params are validated integers; a present-but-invalid value 400s rather than
@@ -1386,12 +1386,12 @@ data: ${JSON.stringify(data)}
       tmpDir = await mkdtemp(join(tmpdir(), "ares-4ds-"));
       send("start", { path: srcPath, name, out: "/" + outRel, maxFrames: maxFramesArg || null, mirrorX, tmp: tmpDir });
 
-      // --- decode phase: decode_4ds.py prints "[decode_4ds] N/M frames (...)" progress lines —
+      // --- decode phase: decode_4ds.py prints "[decode_4ds] N/M frames (...)" progress lines:
       // forward every line as a log event and pull frame/of out of the matching ones as progress.
       const decodeArgs = [FOURDS_SCRIPT, srcPath, "-o", tmpDir];
       if (maxFramesArg) decodeArgs.push("--max-frames", maxFramesArg);
       if (mirrorX) decodeArgs.push("--mirror-x");
-      send("log", `[server] decoding (this can take a while — ~2 fps): ${basename(FOURDS_PY)} decode_4ds.py ${basename(srcPath)} -o <tmp>${maxFramesArg ? " --max-frames " + maxFramesArg : ""}${mirrorX ? " --mirror-x" : ""}`);
+      send("log", `[server] decoding (this can take a while: ~2 fps): ${basename(FOURDS_PY)} decode_4ds.py ${basename(srcPath)} -o <tmp>${maxFramesArg ? " --max-frames " + maxFramesArg : ""}${mirrorX ? " --mirror-x" : ""}`);
       await new Promise((resolve, reject) => {
         const c = spawn(FOURDS_PY, decodeArgs, { windowsHide: true });
         child = c;
@@ -1414,7 +1414,7 @@ data: ${JSON.stringify(data)}
       });
       if (closed) return;
 
-      // fps for the bake comes from the codec itself (manifest.json), rounded to an integer —
+      // fps for the bake comes from the codec itself (manifest.json), rounded to an integer:
       // more reliable than trusting the .4ds probe's float fps for --fps. Same manifest also
       // reports the SOURCE atlas's native textureSize, the new default (fix 3) absent an explicit
       // texSize= override.
@@ -1427,7 +1427,7 @@ data: ${JSON.stringify(data)}
       } catch { /* keep default fps=30 if the manifest is somehow unreadable */ }
       const texSize = texSizeReq.value ?? nativeTexSize ?? 1024;
       const crf = crfReq.value ?? 28;
-      send("log", `[server] decode complete — ${framesDecoded ?? "?"} frame(s); encoding at ${fps}fps, ${texSize}px crf${crf}…`);
+      send("log", `[server] decode complete: ${framesDecoded ?? "?"} frame(s); encoding at ${fps}fps, ${texSize}px crf${crf}…`);
       send("progress", { stage: "encode" });
 
       // --- encode phase: the same encoder CLI /encode already spawns; .4ds converts now default
@@ -1452,7 +1452,7 @@ data: ${JSON.stringify(data)}
     } catch (e) {
       send("error", { message: String((e && e.message) || e) });
     } finally {
-      // Always reclaim the temp frames dir — success or failure — same discipline as cli.ts's
+      // Always reclaim the temp frames dir: success or failure; same discipline as cli.ts's
       // scratch atlas-dir cleanup. A full-length decode can be gigabytes of OBJ+PNG.
       if (tmpDir) { try { await rm(tmpDir, { recursive: true, force: true }); } catch { /* best-effort */ } }
     }
@@ -1462,10 +1462,10 @@ data: ${JSON.stringify(data)}
 
   // GUI-triggered generative texture enhance (Convert tab).
   // Streams SSE progress (mirroring /encode) while each atlas-*.png is POSTed to a local SD-Forge
-  // instance. tier "resrgan": extras API — upscaler_2 (R-ESRGAN 4x+) blended over upscaler_1
+  // instance. tier "resrgan": extras API; upscaler_2 (R-ESRGAN 4x+) blended over upscaler_1
   // (Lanczos) at `strength` via extras_upscaler_2_visibility, so the strength dial runs inside
   // Forge (parameter names verified against Forge's modules/api/models.py, ExtrasBaseRequest).
-  // tier "sd": script-less img2img at source resolution, denoise = strength*0.5 (hero frames —
+  // tier "sd": script-less img2img at source resolution, denoise = strength*0.5 (hero frames:
   // minutes/frame). Output goes to a SIBLING folder that /encode can consume directly.
   if (path === "/enhance") {
     const q = url.searchParams;
@@ -1507,7 +1507,7 @@ data: ${JSON.stringify(data)}
           all = (await readdir(srcDir)).sort();
           atlases = atlasesIn(all);
         } else if (hits.length > 1) {
-          send("error", { message: `multiple subfolders under ${dir} contain atlas-*.png — point enhance at the specific frames folder`, hint: hits.map((p) => basename(p)).join(", ") });
+          send("error", { message: `multiple subfolders under ${dir} contain atlas-*.png: point enhance at the specific frames folder`, hint: hits.map((p) => basename(p)).join(", ") });
           res.end(); return;
         }
       }
@@ -1552,7 +1552,7 @@ data: ${JSON.stringify(data)}
           inflight = null;
           if (closed) return;
           const outB64 = r.images && r.images[0];
-          if (!outB64) throw new Error("Forge returned no image (is a checkpoint loaded?)");
+          if (!outB64) throw new Error("Forge returned no image (no checkpoint loaded)");
           await writeFile(join(outDir, f), Buffer.from(outB64, "base64"));
         } else {
           // ncnn upscales to 2× → tmp; an optional ffmpeg pass handles scale=1 (downscale to source

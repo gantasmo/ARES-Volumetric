@@ -259,7 +259,7 @@ type SplatKind = "spz" | "splat" | "sog" | "gltf" | "ply";
 async function audioFromFlags(a: string[], fps: number, from: number, frameCount: number): Promise<AudioTrackData | null> {
   const src = flag(a, "--audio");
   if (!src) return null;
-  if (!(await ffmpegAvailable())) throw new Error("--audio needs ffmpeg (set FFMPEG or install it)");
+  if (!(await ffmpegAvailable())) throw new Error("--audio needs ffmpeg: none found (FFMPEG, FFMPEG_PATH, C:/FFmpeg/bin, PATH)");
   const offset = numFlag(a, "--audio-offset", 0);
   const bitrate = numFlag(a, "--audio-bitrate", 96, { min: 6, max: 510, int: true });
   const t0 = performance.now();
@@ -759,7 +759,7 @@ async function encode(a: string[]) {
   const noTexture = has(a, "--no-texture");
   if (!noTexture && atlasFiles.length >= files.length) {
     if (!(await ffmpegAvailable())) {
-      console.warn("[ares] ffmpeg not found — skipping texture (set FFMPEG or install ffmpeg). Geometry-only.");
+      console.warn("[ares] ffmpeg not found (FFMPEG, FFMPEG_PATH, C:/FFmpeg/bin, PATH): texture skipped, geometry only");
     } else {
       const pat = detectPattern(atlasFiles);
       if (!pat) console.warn("[ares] could not detect atlas filename pattern — skipping texture.");

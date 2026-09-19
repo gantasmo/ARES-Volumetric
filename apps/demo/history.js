@@ -62,14 +62,14 @@ export function initHistoryPanel({ host, kinds, actions }) {
       .filter((e) => kinds.includes(e.kind))
       .filter((e) => !q || (e.name || "").toLowerCase().includes(q) || (e.path || "").toLowerCase().includes(q));
     if (!items.length) {
-      list.innerHTML = `<div class="note" style="margin:2px 0 4px">${all.some((e) => kinds.includes(e.kind)) ? "no matches" : "No history yet. Analyses, probes, and encodes are recorded here."}</div>`;
+      list.innerHTML = `<div class="note" style="margin:2px 0 4px">${all.some((e) => kinds.includes(e.kind)) ? "no matches" : "no entries"}</div>`;
       return;
     }
     list.innerHTML = items.slice(0, 40).map((e, i) => {
       const k = KINDS[e.kind] || { label: e.kind };
       return `<div class="hrow" data-h="${i}">
         <span class="chip" style="border:1px solid var(--border-st);color:var(--text-dim)">${k.label}</span>
-        <span class="nm" title="${esc(e.name)}">${esc(e.name || "—")}</span>
+        <span class="nm" title="${esc(e.name)}">${esc(e.name || ": ")}</span>
         <span class="pth" title="${esc(e.path)}">${esc(e.path || "")}</span>
         <span class="mt">${esc(metaSummary(e))}</span>
         <span class="dt">${fmtWhen(e.at)}</span>

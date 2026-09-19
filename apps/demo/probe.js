@@ -110,25 +110,23 @@ function splitBar(geom, tex, total) {
 export function render4ds(r) {
   const eq = 9.0667 / r.dur; // normalize to the 272f/9.07s ARES clip
   return `<div class="card">
-    <h3>4DViews <code>.4ds</code> <span class="badge">temporal</span> <span class="badge warn">reads structure only</span></h3>
+    <h3>4DViews <code>.4ds</code> <span class="badge">temporal</span> <span class="badge warn">structure only</span></h3>
     <div class="kv">
       ${row("file", r.name)}
-      ${row("format", `4DS0 v${r.verMajor}.${r.verMinor} — single container, geometry + texture embedded`)}
+      ${row("format", `4DS0 v${r.verMajor}.${r.verMinor}: single container, geometry + texture embedded`)}
       ${row("size", `${r.size.toLocaleString()} B (${fmtMB(r.size)})`)}
       ${row("frames", `${r.frameCount} @ ${r.fps.toFixed(3)} fps = ${r.dur.toFixed(1)} s`)}
       ${row("texture", `${r.texW} × ${r.texH}, embedded per-frame`)}
-      ${row("geometry codec", `temporal — ${r.keyframes} intra keyframes + ${r.frameCount - r.keyframes} inter/P frames (adaptive GOP)`)}
+      ${row("geometry codec", `temporal: ${r.keyframes} intra keyframes + ${r.frameCount - r.keyframes} inter/P frames (adaptive GOP)`)}
       ${row("blocks", `${r.blocks} = 2 × ${r.frameCount} (geometry + texture per frame)`)}
     </div>
     ${splitBar(r.geom, r.tex, r.size)}
     <div class="kv" style="margin-top:8px">
-      ${row("geometry", `<b>${fmtMB(r.geom)}</b> · ${pct(r.geom, r.size)} — temporal mesh (small blocks)`)}
-      ${row("texture", `<b>${fmtMB(r.tex)}</b> · ${pct(r.tex, r.size)} — per-frame ${r.texW}² image, no inter-frame compression`)}
+      ${row("geometry", `<b>${fmtMB(r.geom)}</b> · ${pct(r.geom, r.size)}: temporal mesh (small blocks)`)}
+      ${row("texture", `<b>${fmtMB(r.tex)}</b> · ${pct(r.tex, r.size)}: per-frame ${r.texW}² image, no inter-frame compression`)}
       ${row("reconciles", `${r.geom.toLocaleString()} + ${r.tex.toLocaleString()} + ${r.overhead.toLocaleString()} = ${(r.geom + r.tex + r.overhead).toLocaleString()} ${(r.geom + r.tex + r.overhead) === r.size ? "<span class='good'>exact ✓</span>" : `<span class='warn'>off by ${Math.abs(r.size - (r.geom + r.tex + r.overhead)).toLocaleString()} B</span>`}`)}
       ${row("per-9.07s equiv", `geometry ${(r.geom * eq / 1048576).toFixed(1)} MiB · texture ${(r.tex * eq / 1048576).toFixed(1)} MiB`)}
     </div>
-    <div class="note">Mirror image of ARES: 4DViews spends ~${pct(r.geom, r.size)} on geometry (temporal) and ~${pct(r.tex, r.size)} on texture
-      (per-frame block, no video codec). ARES is the opposite — heavy intra geometry, tiny VP9 video texture. The target codec is the union of both.</div>
   </div>`;
 }
 
@@ -146,10 +144,8 @@ export function renderAres(r) {
     ${splitBar(r.geom, r.tex, r.size)}
     <div class="kv" style="margin-top:8px">
       ${row("geometry", `<b>${fmtMB(r.geom)}</b> · ${pct(r.geom, r.size)}`)}
-      ${row("texture", `<b>${fmtMB(r.tex)}</b> · ${pct(r.tex, r.size)} — VP9 video`)}
+      ${row("texture", `<b>${fmtMB(r.tex)}</b> · ${pct(r.tex, r.size)}: VP9 video`)}
     </div>
-    <div class="note">ARES puts most bytes in geometry (intra re-stores topology per frame) and keeps texture tiny via a video codec —
-      the inverse of a 4DViews .4ds.</div>
   </div>`;
 }
 
@@ -173,4 +169,4 @@ export function renderProbe(probe) {
  *  real conversion through the licensed BridgeCodec4DS decoder (tools/4ds/decode_4ds.py) — this
  *  probe stays byte-level/content-free as before, but a convert row now runs the actual codec on this
  *  machine. See the convert row rendered below this card for output name / max-frames / mirror-X. */
-export const FOURDS_STATUS = "4DViews container recognized — structure shown above. Content conversion runs the licensed BridgeCodec4DS decoder on this machine (DXT1 desktop captures only) — see the convert row below.";
+export const FOURDS_STATUS = "Decode requires the licensed BridgeCodec4DS · DXT1 desktop captures only";

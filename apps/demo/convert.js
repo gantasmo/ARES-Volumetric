@@ -573,7 +573,7 @@ async function runEnhance() {
   es.addEventListener("log", (e) => line("· " + JSON.parse(e.data)));
   es.addEventListener("progress", (e) => {
     const d = JSON.parse(e.data);
-    line(`✓ ${d.file} (${(d.ms / 1000).toFixed(1)} s) — ${d.frame}/${d.of}`);
+    line(`✓ ${d.file} (${(d.ms / 1000).toFixed(1)} s): ${d.frame}/${d.of}`);
     prog.firstChild.style.width = Math.max(4, Math.round((d.frame / d.of) * 100)) + "%";
   });
   es.addEventListener("done", (e) => {

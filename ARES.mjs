@@ -110,7 +110,7 @@ function parseArgs(argv) {
   for (let i = 0; i < argv.length; i++) {
     const a = argv[i];
     if (!a.startsWith("-")) { positional.push(a); continue; }
-    if (!OPTIONS.includes(a)) fail(`unknown option ${a} — run with --help`);
+    if (!OPTIONS.includes(a)) fail(`unknown option ${a}: run with --help`);
     if (a === "--port" || a === "--src") {
       const v = argv[++i];
       // A value flag followed by another flag (or by nothing) is a usage error, not a value.
@@ -126,9 +126,9 @@ function parseArgs(argv) {
     else if (a === "--no-build") out.build = false;
     else if (a === "--no-install") out.install = false;
   }
-  if (positional.length > 1) fail(`unexpected argument ${JSON.stringify(positional[1])} — one mode at a time; run with --help`);
+  if (positional.length > 1) fail(`unexpected argument ${JSON.stringify(positional[1])}, one mode at a time; run with --help`);
   const mode = positional[0] ?? "app";
-  if (!MODES.has(mode)) fail(`unknown mode ${JSON.stringify(mode)} — expected one of ${[...MODES].join(", ")}`);
+  if (!MODES.has(mode)) fail(`unknown mode ${JSON.stringify(mode)}: expected one of ${[...MODES].join(", ")}`);
   return { mode, ...out };
 }
 
@@ -153,7 +153,7 @@ async function build(enabled, fatal) {
     : await run(NPM, ["run", "build"], { shell: process.platform === "win32" });
   if (code === 0) return;
   if (fatal) fail(`build failed (exit ${code}). See ${LOG_FILE}.`);
-  log(`WARNING: build failed (exit ${code}) — this page does not need the packages; see ${LOG_FILE}`);
+  log(`WARNING: build failed (exit ${code}); this page does not need the packages; see ${LOG_FILE}`);
 }
 
 async function ensureClip(src) {
@@ -161,7 +161,7 @@ async function ensureClip(src) {
   const demoDir = join(ROOT, "apps", "demo");
   const present = CLIP_CANDIDATES.find((c) => existsSync(join(demoDir, c)));
   if (present) return present;
-  log("no clip in apps/demo — synthesizing demo.ares...");
+  log("no clip in apps/demo: synthesizing demo.ares...");
   if (!existsSync(CLI_JS)) fail("the encoder is not built, so no demo clip can be generated. Run without --no-build.");
   const code = await run(process.execPath, [CLI_JS, "synth", "-o", "apps/demo/demo.ares", "--shape", "object", "--frames", "60", "--fps", "30"]);
   if (code !== 0) fail(`demo clip generation failed (exit ${code}). See ${LOG_FILE}.`);
@@ -223,7 +223,7 @@ function openBrowser(url) {
   // A missing opener (headless Linux without xdg-utils) surfaces as an async 'error' event,
   // never as a throw, so the listener — not a try/catch — is what keeps the URL visible.
   const child = spawn(cmd, args, { detached: true, stdio: "ignore", windowsHide: true });
-  child.on("error", (e) => log(`could not open a browser (${e.message}) — go to ${url}`));
+  child.on("error", (e) => log(`could not open a browser (${e.message}): go to ${url}`));
   child.unref();
 }
 
@@ -234,7 +234,7 @@ function startSamService() {
   spawn("powershell.exe", ["-NoProfile", "-ExecutionPolicy", "Bypass", "-WindowStyle", "Hidden", "-File", SAM_PS1], {
     detached: true, stdio: "ignore", windowsHide: true,
   }).unref();
-  log("SAM service starting on http://127.0.0.1:7263 — log: tools/sam-service/sam-service.log");
+  log("SAM service starting on http://127.0.0.1:7263; log: tools/sam-service/sam-service.log");
 }
 
 // --- main --------------------------------------------------------------------
@@ -267,4 +267,4 @@ if (opts.open) { openBrowser(url); log(`opened ${url}`); }
 else log(`ready at ${url}`);
 
 if (opts.detach || !ownsServer) process.exit(0); // the server outlives us; foreground waits on it
-log("serving — Ctrl-C to stop");
+log("serving: Ctrl-C to stop");
