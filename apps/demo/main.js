@@ -7,6 +7,7 @@
 // matrix the pixels do, so a guide can never drift from the geometry it claims to cut.
 import { AresPlayer, rleEncodeMask, keepPredicateAt, orbitViewProj, orbitViewHeight, growKeyframe, mirrorKeyframe } from "@ares/core";
 import { aact } from "./log.js";
+import { showMenu, closeMenu, menuOpen } from "./menu.js";
 import { accessPrompt, sseErrorData } from "./ensure.js";
 
 const $ = (id) => document.getElementById(id);
@@ -3135,7 +3136,10 @@ function initEditor(player) {
 
   // Exposed to the global keyboard handler in main() — that's the one place with `player` in scope
   // for Space/arrows/tool letters too, so it stays the single keydown listener for the whole app.
-  return { undo, redo, deleteActiveRange, flushSave, hasPendingSamSelection, commitSamSelection, commitPendingSelectionOrRemoveRow };
+  return { undo, redo, deleteActiveRange, flushSave, hasPendingSamSelection, commitSamSelection,
+    commitPendingSelectionOrRemoveRow,
+    // Read-only views the viewport context menu needs; it is built in main(), outside this closure.
+    samSelClear, getTool: () => tool, activeRange: () => activeRange };
 }
 
 async function main() {
@@ -3354,6 +3358,7 @@ async function main() {
     ["W E R", "move / rotate / scale the model"], ["X Y Z (held)", "constrain a transform drag"],
     ["= / −", "grow / shrink the active range (Shift 5×)"], ["I", "invert the active delete range"], ["C", "cycle camera bookmarks"],
     ["Ctrl+Z / Ctrl+Y", "undo / redo"], ["Ctrl+S", "save the sidecar now"], ["Delete", "commit a pending SAM selection as delete, else remove the active range"], ["Esc", "back to navigate; leave a tool tab; close this panel"], ["?", "this panel"],
+    ["Right-click", "viewport menu: commit a selection, switch tool, view and range actions"],
   ];
   const keysPanel = document.createElement("div");
   keysPanel.id = "keysPanel";
@@ -3371,10 +3376,77 @@ async function main() {
   //  W wireframe · O orbit (no-op while locked) · Esc back to Nav · Delete/Backspace: with a
   //  pending SAM selection, commits it as a delete range; otherwise removes the active (▶) range
   //  row (only when not typing in an input)
+  // A collapsed rail hides its buttons behind a ~30px strip (display:none on .railBody), so any
+  // action that changes tool state must expand it first or the change is invisible until the user
+  // notices and expands manually (the "clickable but not visible" trap). Shared by the keyboard
+  // shortcuts and the context menu.
+  const expandRail = () => { const r = $("editPanel"); if (r.classList.contains("collapsed")) $("railCollapse").click(); };
+  const clickTool = (name) => { expandRail(); document.querySelector(`#editPanel .tool[data-tool="${name}"]`)?.click(); };
+
+  // ---- Viewport context menu -----------------------------------------------------------------
+  // The rails are ~270 px pinned to the screen edges, so committing a selection meant crossing the
+  // viewport to the rail and back. Right-click puts the operations that apply to what is under the
+  // cursor at the cursor. The menu is built per open, so it only ever offers what is actually
+  // available right now: with a selection pending it is the commit actions and nothing else.
+  const isPressed = (id) => $(id)?.getAttribute("aria-pressed") === "true";
+  function viewportMenu(ev) {
+    if (document.querySelector("div.tool.active")) return;   // a tool tab is front-most
+    ev.preventDefault();
+    const tool = editorApi.getTool();
+
+    if (editorApi.hasPendingSamSelection()) {
+      // Isolate first and marked primary: a selection is a mask until you say otherwise, and the
+      // destructive option should never be the one the cursor lands on.
+      const commit = (a) => () => { editorApi.commitSamSelection(a); };
+      showMenu(ev, [
+        { cap: "Selection" },
+        { label: "Isolate", hint: "keep only this", run: commit("isolate"), primary: true },
+        { label: "Recolor…", run: commit("recolor") },
+        { label: "Paint…", run: commit("paint") },
+        { label: "Sculpt…", run: commit("sculpt") },
+        { label: "Copy…", run: commit("copy") },
+        "-",
+        { label: "Delete", hint: "Del", run: commit("delete"), danger: true },
+        "-",
+        { label: "Clear selection", hint: "Esc", run: () => editorApi.samSelClear() },
+      ]);
+      return;
+    }
+
+    const range = editorApi.activeRange();
+    showMenu(ev, [
+      { cap: "Tool" },
+      { label: "Navigate", hint: "V", checked: tool === "nav", run: () => clickTool("nav") },
+      { label: "Box select", hint: "M", checked: tool === "sbox", run: () => clickTool("sbox") },
+      { label: "Lasso", hint: "A", checked: tool === "lasso", run: () => clickTool("lasso") },
+      { label: "Brush", hint: "B", checked: tool === "brush", run: () => clickTool("brush") },
+      { label: "Smart select", hint: "S", checked: tool === "sam", run: () => clickTool("sam") },
+      { label: "Measure", hint: "T", checked: tool === "measure", run: () => clickTool("measure") },
+      "-",
+      { cap: "View" },
+      { label: "X-ray", hint: "X", checked: isPressed("xray"), run: () => { expandRail(); $("xray").click(); } },
+      { label: "Lock view", hint: "L", checked: isPressed("viewLock"), run: () => $("viewLock").click() },
+      { label: "Frame object", hint: "F", run: () => window.__aresXform?.focus() },
+      { label: "Bookmark camera", hint: "C", run: () => $("camSave").click() },
+      ...(range ? ["-", { cap: "Active range" },
+        { label: "Grow", hint: "=", run: () => window.__aresSel?.grow(1) },
+        { label: "Shrink", hint: "−", run: () => window.__aresSel?.grow(-1) },
+        { label: "Invert keep / delete", hint: "I", run: () => window.__aresSel?.invert() },
+        { label: "Mirror across X", run: () => window.__aresSel?.mirror() },
+      ] : []),
+      "-",
+      { label: "Undo", hint: "Ctrl+Z", run: () => editorApi.undo() },
+      { label: "Redo", hint: "Ctrl+Y", run: () => editorApi.redo() },
+    ]);
+  }
+  for (const el of [$("view"), $("selectOverlay")]) if (el) el.addEventListener("contextmenu", viewportMenu);
+
   // Frame-indexed, not seconds: stepping is an integer operation on the frame the HUD is showing, and
   // routing it through seconds made every step on a non-30 fps clip land on the wrong frame.
   const holdFrame = (f) => { player.pause(); $("play").textContent = "▶︎"; player.seekFrame(f); };
   window.addEventListener("keydown", (e) => {
+    // An open menu owns the keyboard (it handles arrows/Enter/Esc itself, in the capture phase).
+    if (menuOpen()) return;
     const ctrl = e.ctrlKey || e.metaKey;
 
     // Ctrl+S: ALWAYS flush the sidecar save + block the browser's native Save-page dialog —
@@ -3411,15 +3483,6 @@ async function main() {
     const st = player.getStats();
     const n = Math.max(1, st.frameCount);
     const step = (d) => holdFrame(((st.frameIndex + d) % n + n) % n);
-    const rail = $("editPanel");
-    // A collapsed rail hides its buttons behind a ~30px strip (display:none on .railBody) — a
-    // shortcut that changes tool state must expand it first, or the change is invisible until the
-    // user notices and expands manually (the "clickable but not visible" trap).
-    const expandRail = () => { if (rail.classList.contains("collapsed")) $("railCollapse").click(); };
-    const clickTool = (name) => {
-      expandRail();
-      document.querySelector(`#editPanel .tool[data-tool="${name}"]`)?.click();
-    };
     switch (e.key) {
       case " ": e.preventDefault(); $("play").click(); break;
       case "ArrowLeft": e.preventDefault(); step(e.shiftKey ? -10 : -1); break;
