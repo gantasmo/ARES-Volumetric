@@ -348,6 +348,16 @@ export function catalog(ROOT, gpu) {
     .find((d) => existsSync(join(d, "config.json")) && existsSync(join(d, "model.safetensors")));
   const liteSnap = hfSnapshot("vil-uob/sam3-litetext-s0", ["config.json"]);
   const dreamSnap = hfSnapshot("Lykon/dreamshaper-8", ["model_index.json"]);
+  // SAM 3D Body ships as a gated Meta repo plus an ungated community mirror of the same weights
+  // (validated 2026-07-13, and re-checked against the Hub 2026-09-08: model.ckpt 2.1 GB +
+  // assets/mhr_model.pt 696 MB). Either satisfies the component, so probe both.
+  // Name the WEIGHTS, not the config: model_config.yaml is 1.5 KB and lands in the first second
+  // of a 2.8 GB download, so probing for it alone reports an interrupted fetch as installed.
+  const SAM3D_BODY_FILES = ["model_config.yaml", "model.ckpt", "assets/mhr_model.pt"];
+  const sam3dBodySnap = hfSnapshot("facebook/sam-3d-body-dinov3", SAM3D_BODY_FILES)
+    || hfSnapshot("jetjodh/sam-3d-body-dinov3", SAM3D_BODY_FILES);
+  const sam3dObjSnap = hfSnapshot("facebook/sam-3d-objects",
+    ["checkpoints/pipeline.yaml", "checkpoints/slat_generator.ckpt", "checkpoints/ss_generator.ckpt"]);
   const gitExe = findGit(ROOT);
   const ff = findFfmpeg(ROOT);
   const enc = encoderState(ROOT);
@@ -527,6 +537,83 @@ export function catalog(ROOT, gpu) {
   // still has to be able to answer "why can't I do X". They render in a separate, quieter list.
   const fourdsDll = [join(P.ROOT, "tools", "4ds", "bin", "BridgeCodec4DS.dll"), process.env.FOURDS_DLL].filter(Boolean).find(existsSync);
   const forgeRoot = process.env.FORGE_ROOT || join(homedir(), "webui_forge");
+  // ---- SAM 3D ---------------------------------------------------------------------------
+  // Body is the completion prior the RGBD pipeline already fits per frame (fixed-topology MHR,
+  // 18,439 vertices, identity-consistent across a take). Objects reconstructs props and sets but
+  // wants ~32 GB of VRAM, so on most machines the profile maths drops it — correctly.
+  const sam3d = [
+    {
+      id: "sam3d-body",
+      group: "SAM 3D",
+      label: "SAM 3D Body weights (MHR)",
+      enables: "the full-body template that completes the unseen side of a capture",
+      why: "2.8 GB: DINOv3-H+ checkpoint plus the Momentum Human Rig asset. Falls back to the ungated mirror, so no licence is needed.",
+      sizeMB: 2800,
+      vramMB: 6000,
+      optional: true,
+      requires: ["python-env"],
+      ...(sam3dBodySnap ? found(true, sam3dBodySnap) : found(false)),
+      install: { kind: "hf", repo: "jetjodh/sam-3d-body-dinov3" },
+    },
+    {
+      id: "sam3d-body-code",
+      group: "SAM 3D",
+      label: "SAM 3D Body source",
+      enables: "running the body model locally instead of on a rented GPU",
+      why: "shallow git clone of facebookresearch/sam-3d-body into tools/ext",
+      sizeMB: 80,
+      optional: true,
+      requires: ["git"],
+      ...(existsSync(join(P.ext, "sam-3d-body", ".git")) ? found(true, join(P.ext, "sam-3d-body")) : found(false)),
+      install: { kind: "git", url: "https://github.com/facebookresearch/sam-3d-body.git", into: join(P.ext, "sam-3d-body") },
+    },
+    {
+      id: "sam3d-body-deps",
+      group: "SAM 3D",
+      label: "SAM 3D Body Python dependencies",
+      enables: "the body model's own inference entry points",
+      // Kept separate from the clone on purpose: detectron2 compiles from source and needs a C++
+      // toolchain, so it is the one step here that can genuinely fail on a clean Windows box.
+      // Cloning stays useful on its own, and this row is the part you opt into.
+      why: "builds detectron2 from source with MSVC Build Tools (installed first when absent), about 10 minutes",
+      sizeMB: 400,
+      optional: true,
+      requires: ["sam3d-body-code", "python-env", "msvc-build-tools"],
+      ...(existsSync(join(P.envDir, "Lib", "site-packages", "detectron2")) ? found(true, join(P.envDir, "Lib", "site-packages", "detectron2")) : found(false)),
+      install: { kind: "git", url: "https://github.com/facebookresearch/sam-3d-body.git", into: join(P.ext, "sam-3d-body"), pip: ["-e", "."] },
+    },
+    {
+      id: "msvc-build-tools",
+      group: "Runtime",
+      label: "MSVC Build Tools",
+      enables: "compiling Python packages that ship C++ (detectron2)",
+      why: "C++ workload with the Windows SDK, through winget or the Microsoft bootstrapper; Windows shows one elevation prompt",
+      sizeMB: 2500,
+      optional: true,
+      ...(findVcvars() ? found(true, findVcvars()) : found(false)),
+      install: {
+        kind: "winget", id: "Microsoft.VisualStudio.2022.BuildTools", verify: "vcvars",
+        // Without the workload the package installs a bootstrapper and no compiler.
+        override: "--quiet --wait --norestart --add Microsoft.VisualStudio.Workload.VCTools --includeRecommended",
+        bootstrapper: "https://aka.ms/vs/17/release/vs_BuildTools.exe",
+      },
+    },
+    {
+      id: "sam3d-objects",
+      group: "SAM 3D",
+      label: "SAM 3D Objects",
+      enables: "single-image reconstruction of props and sets",
+      why: "~14 GB of checkpoints and about 32 GB of VRAM: a rented-GPU component on most machines",
+      sizeMB: 14000,
+      vramMB: 32000,
+      optional: true,
+      requires: ["python-env"],
+      gated: { url: "https://huggingface.co/facebook/sam-3d-objects", why: "Meta gates this repo: accept the licence once, with the account your HF token belongs to" },
+      ...(sam3dObjSnap ? found(true, sam3dObjSnap) : found(false)),
+      install: { kind: "hf", repo: "facebook/sam-3d-objects" },
+    },
+  ];
+
   const status = [
     {
       id: "encoder", group: "Project", label: "Encoder build (tsc output)",
@@ -583,7 +670,7 @@ export function catalog(ROOT, gpu) {
     },
   ];
 
-  return [...items, ...status];
+  return [...items, ...sam3d, ...status];
 }
 
 // ------------------------------------------------------------ profiles ----
