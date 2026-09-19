@@ -13,7 +13,7 @@
 import { createServer, request as httpRequest } from "node:http";
 import { stat, readFile, writeFile, appendFile, readdir, mkdir, link, copyFile, unlink, rename, mkdtemp, rm, statfs, open } from "node:fs/promises";
 import { totalmem, freemem, homedir } from "node:os";
-import { statSync, existsSync } from "node:fs";
+import { statSync, existsSync, createReadStream } from "node:fs";
 import { spawn } from "node:child_process";
 import { join, normalize, extname, dirname, basename, sep } from "node:path";
 import zlib from "node:zlib";
@@ -446,6 +446,33 @@ function run4dsInfo(inputPath) {
       try { resolve(JSON.parse(out)); } catch { reject(new Error("decode_4ds.py --info returned non-JSON: " + out.slice(0, 300))); }
     });
   });
+}
+
+/**
+ * Stream one file, honouring a single `Range: bytes=` request (206, or 416 when unsatisfiable) and
+ * HEAD. Throws when the file cannot be stat'ed, before any header is written.
+ */
+async function sendFileRange(req, res, file, type) {
+  const st = await stat(file);
+  if (!st.isFile()) throw new Error(`not a file: ${file}`);
+  const size = st.size;
+  const m = /^bytes=(\d*)-(\d*)$/.exec(req.headers.range || "");
+  let start = 0, end = size - 1;
+  if (m && (m[1] || m[2])) {
+    if (m[1]) { start = Number(m[1]); end = m[2] ? Math.min(Number(m[2]), size - 1) : size - 1; }
+    else { start = Math.max(0, size - Number(m[2])); }
+    if (!(start <= end && start < size)) { res.writeHead(416, { ...HEADERS, "Content-Range": `bytes */${size}` }); res.end(); return; }
+  }
+  const partial = !!(m && (m[1] || m[2]));
+  res.writeHead(partial ? 206 : 200, {
+    ...HEADERS, "Content-Type": type, "Accept-Ranges": "bytes", "Content-Length": size ? end - start + 1 : 0,
+    ...(partial ? { "Content-Range": `bytes ${start}-${end}/${size}` } : {}),
+  });
+  if (req.method === "HEAD" || !size) { res.end(); return; }
+  const rs = createReadStream(file, { start, end });
+  rs.on("error", () => { try { res.destroy(); } catch { /* gone */ } });
+  res.on("close", () => rs.destroy());
+  rs.pipe(res);
 }
 
 // Routes that do work, spend money, open dialogs or write files. Browsers stamp Sec-Fetch-Site on
@@ -1611,10 +1638,8 @@ data: ${JSON.stringify(data)}
       }
       target = join(target, "index.html");
     }
-    const body = await readFile(target);
-    const type = MIME[extname(target).toLowerCase()] ?? "application/octet-stream";
-    res.writeHead(200, { ...HEADERS, "Content-Type": type, "Content-Length": body.length });
-    res.end(body);
+    // Streamed, never read whole: a long .ares clip runs to gigabytes, and readFile stops at 2 GiB.
+    await sendFileRange(req, res, target, MIME[extname(target).toLowerCase()] ?? "application/octet-stream");
   } catch {
     res.writeHead(404, { ...HEADERS, "Content-Type": "text/plain" });
     res.end(`404 ${path}`);
