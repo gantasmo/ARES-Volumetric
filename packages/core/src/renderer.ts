@@ -235,6 +235,13 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
   n = normalize(n);
   let L = normalize(vec3<f32>(0.35, 0.75, 0.55));
   let diff = abs(dot(n, L));                 // two-sided (winding-agnostic)
+  // Soft fill from the opposing, mostly-horizontal side. One key alone dropped every face at its
+  // terminator to 0.4 — a hard single-source look, worst on captures whose atlas already carries
+  // the room's light. Because lighting is two-sided, -L would be identical to L; the fill has to
+  // sit on a DIFFERENT axis to reach the faces the key misses, so it is mostly sideways where the
+  // key is mostly up. Key swing 0.6 -> 0.40, fill adds 0.15, floor 0.45; peak stays 1.0.
+  let Lf = normalize(vec3<f32>(-0.6, 0.2, 0.5));
+  let fill = abs(dot(n, Lf));
   // texMix 0 = untextured "clay" (neutral paper grey, same lighting) so form reads without the
   // atlas; sampled unconditionally to keep derivatives/control flow uniform.
   let albedo = mix(vec3<f32>(0.72, 0.71, 0.68), textureSample(tex, samp, in.uv).rgb, u.texMix);
@@ -247,7 +254,7 @@ fn fs(in : VSOut) -> @location(0) vec4<f32> {
   if (u.reliefDepthMax > 0.0 && dot(rv, u.reliefFwd) > u.reliefDepthMax) { discard; }
   let faceLen = length(faceN);
   if (u.reliefSlope > 0.0 && faceLen > 0.0 && abs(dot(faceN / faceLen, normalize(rv))) < u.reliefSlope) { discard; }
-  let lit = mix(1.0, 0.4 + 0.6 * diff, u.litMix);
+  let lit = mix(1.0, 0.45 + 0.40 * diff + 0.15 * fill, u.litMix);
   var col = albedo * lit;
   let mode = u32(u.shadeMode + 0.5);
   if (mode == 1u) { col = n * 0.5 + vec3<f32>(0.5, 0.5, 0.5); }

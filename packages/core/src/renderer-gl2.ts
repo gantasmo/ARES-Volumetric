@@ -234,6 +234,9 @@ void main() {
   vec3 n = normalize(dot(vNormal, vNormal) > 0.01 ? vNormal : faceN);
   vec3 L = normalize(vec3(0.35, 0.75, 0.55));
   float diff = abs(dot(n, L));               // two-sided (winding-agnostic)
+  // Soft fill on the opposing axis — see the WGSL twin in renderer.ts for the reasoning.
+  vec3 Lf = normalize(vec3(-0.6, 0.2, 0.5));
+  float fill = abs(dot(n, Lf));
   // Matches the WebGPU path's clay colour so the two renderers agree.
   vec3 albedo = mix(vec3(0.72, 0.71, 0.68), texture(uTex, vUV).rgb, uTexMix);
   // Crop preview: discard LAST so the derivatives above stay uniform (same order as the WGSL).
@@ -244,7 +247,7 @@ void main() {
   if (uRelief.y > 0.0 && dot(rv, uReliefFwd) > uRelief.y) discard;
   float faceLen = length(faceN);
   if (uRelief.x > 0.0 && faceLen > 0.0 && abs(dot(faceN / faceLen, normalize(rv))) < uRelief.x) discard;
-  float lit = mix(1.0, 0.4 + 0.6 * diff, uLitMix);
+  float lit = mix(1.0, 0.45 + 0.40 * diff + 0.15 * fill, uLitMix);
   vec3 col = albedo * lit;
   if (uShadeMode == 1) col = n * 0.5 + 0.5;
   else if (uShadeMode == 2) {
