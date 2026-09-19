@@ -852,12 +852,13 @@
         <div id="samTextChips" style="display:none;gap:4px;flex-wrap:wrap;margin-top:5px"></div>
         <div id="samSelRow" class="row" style="display:none;margin-top:4px;flex-wrap:wrap">
           <span id="samSelInfo" style="flex:1;min-width:90px;font:10px ui-monospace,monospace;color:var(--text-dim)"></span>
-          <select id="samActSel" class="inp" title="the action the commit button below performs on this selection">
-            <option value="delete">Delete</option>
+          <select id="samActSel" class="inp" title="what the button beside it does with this selection. Isolate keeps only the selection and is the default: selecting an object does not presume you want it deleted.">
+            <option value="isolate">Isolate</option>
             <option value="recolor">Recolor…</option>
             <option value="paint">Paint…</option>
             <option value="sculpt">Sculpt…</option>
             <option value="copy">Copy…</option>
+            <option value="delete">Delete</option>
           </select>
           <button id="samApply" class="u primary" title="Commit this selection as the action chosen beside it, keyframed at the current frame. The Del key always commits as a delete.">Commit</button>
           <button id="samClear" class="u" title="Discard the pending SAM selection and start over (Esc).">Clear</button>

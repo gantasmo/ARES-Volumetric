@@ -2574,7 +2574,10 @@ function initEditor(player) {
   // Commit button label ALWAYS names the action it performs (Apply/bake means "do it", not "delete
   // it", so a button reading "Apply" over a delete-producing control reads backwards). The select
   // next to it decides Delete/Recolor/Copy…; the button text mirrors whichever is picked.
-  const SAM_COMMIT_LABEL = { delete: "Delete", recolor: "Recolor…", paint: "Paint…", sculpt: "Sculpt…", copy: "Copy…" };
+  // "isolate" is not a new range action — it is the existing delete range with mode "keep", which
+  // the renderer and the bake already evaluate. It is the DEFAULT because selecting an object
+  // should not presume you want it destroyed; delete is one choice among several.
+  const SAM_COMMIT_LABEL = { isolate: "Isolate", delete: "Delete", recolor: "Recolor…", paint: "Paint…", sculpt: "Sculpt…", copy: "Copy…" };
   const samActSel = $("samActSel"), samApplyBtn = $("samApply");
   function syncSamCommitLabel() { samApplyBtn.textContent = SAM_COMMIT_LABEL[samActSel.value] || "Commit"; }
   samActSel.onchange = syncSamCommitLabel;
@@ -2590,9 +2593,12 @@ function initEditor(player) {
    *  — caller decides the fallback, e.g. the Delete key falling through to "remove active row"). */
   function commitSamSelection(action) {
     if (!samSel || !samSel.bits) { samSelClear(); return false; }
-    if (!xrayOn() && !samSel.depth) { samSelInfo.textContent = "mask covers only background — nothing to delete"; return false; }
+    if (!xrayOn() && !samSel.depth) { samSelInfo.textContent = "mask covers only background: nothing selected"; return false; }
+    const isolate = action === "isolate";
     doMutation(() => {
-      setRangeAction(ensureRange(), action);
+      const r = ensureRange();
+      setRangeAction(r, isolate ? "delete" : action);
+      if (isolate) r.mode = "keep";                  // keep-inside: everything else is removed
       addVolumeAtCurrent(samVolume());
     });
     samSelClear();
