@@ -3353,7 +3353,7 @@ async function main() {
     ["V / Q", "navigate"], ["M", "box select"], ["B", "brush"], ["S", "SAM select"], ["A", "lasso"], ["T", "measure"], ["X", "x-ray"],
     ["W E R", "move / rotate / scale the model"], ["X Y Z (held)", "constrain a transform drag"],
     ["= / −", "grow / shrink the active range (Shift 5×)"], ["I", "invert the active delete range"], ["C", "cycle camera bookmarks"],
-    ["Ctrl+Z / Ctrl+Y", "undo / redo"], ["Ctrl+S", "save the sidecar now"], ["Delete", "commit a pending SAM selection as delete, else remove the active range"], ["Esc", "back to navigate; close this panel"], ["?", "this panel"],
+    ["Ctrl+Z / Ctrl+Y", "undo / redo"], ["Ctrl+S", "save the sidecar now"], ["Delete", "commit a pending SAM selection as delete, else remove the active range"], ["Esc", "back to navigate; leave a tool tab; close this panel"], ["?", "this panel"],
   ];
   const keysPanel = document.createElement("div");
   keysPanel.id = "keysPanel";
@@ -3381,7 +3381,15 @@ async function main() {
     // regardless of focus or active tab, since that dialog would otherwise pop up anywhere.
     if (ctrl && !e.altKey && (e.key === "s" || e.key === "S")) { e.preventDefault(); editorApi.flushSave(); return; }
 
-    if (document.querySelector("div.tool.active")) return;   // Convert/Compare/Settings front-most
+    // Convert / Compare / Settings are full overlays. They swallowed every shortcut, including
+    // the one that gets you out of them, so Esc now closes the overlay back to the Viewer unless
+    // a field has focus (where Esc belongs to the field).
+    if (document.querySelector("div.tool.active")) {
+      const el = document.activeElement;
+      const typing = el && (el.tagName === "INPUT" || el.tagName === "TEXTAREA" || el.isContentEditable);
+      if (e.key === "Escape" && !typing && !menuOpen()) { e.preventDefault(); setTab("viewer"); }
+      return;
+    }
 
     // View presets (Blender numbers): Digit1/3/7 OR Numpad1/3/7 via e.code, so NumLock state and
     // keyboard layout can't break them (e.key for a numpad digit changes with NumLock; e.code
