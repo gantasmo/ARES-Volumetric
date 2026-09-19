@@ -32,6 +32,14 @@ export interface Mask2dVolume {
   mask?: { width: number; height: number; rle: number[] };
   camera?: {
     azimuth: number; elevation: number; distance: number; target: [number, number, number]; aspect: number;
+    /**
+     * Orthographic capture (camera.ts OrbitState.ortho). MUST reach orbitViewProj below or the
+     * region is tested through a projection the mask was never drawn in — under ortho an
+     * axis-aligned plane projects to a line and under perspective to a region, so the two
+     * disagree by more than a rounding. The demo has serialized this field since the SAM tool
+     * shipped (player.getCamera → samSel.cam, P toggles it live) while this type dropped it.
+     */
+    ortho?: boolean;
     /** Vertical field of view in degrees (camera.ts OrbitState.fov); absent is the orbit default.
      *  A relief is viewed through its own FOV, and a mask drawn there must be tested through it. */
     fov?: number;
@@ -265,9 +273,19 @@ function prepareVolume(v: EditVolume): SdfFn | null {
   if (v.type === "brushStrokes") return (x, y, z) => brushSdf(v, x, y, z);
   if (v.type === "mask2d" && v.camera && (v.kind === "rect" ? v.rect : v.kind === "bitmap" && v.mask)) {
     const m = orbitViewProj(
-      { azimuth: v.camera.azimuth, elevation: v.camera.elevation, distance: v.camera.distance, target: v.camera.target, fov: v.camera.fov },
+      // `ortho` travels with the rest of the OrbitState: a mask captured in orthographic that is
+      // re-projected through a perspective frustum tests the wrong pixels for every point off the
+      // view axis (camera.ts orbitMatrices branches on it).
+      { azimuth: v.camera.azimuth, elevation: v.camera.elevation, distance: v.camera.distance, target: v.camera.target, ortho: v.camera.ortho, fov: v.camera.fov },
       v.camera.aspect || 1);
     const depth = v.depth;
+    // An ortho matrix's bottom row is [0,0,0,1] (camera.ts orthographic sets m[11]=0, m[15]=1, and
+    // lookAt's is already that), so `cw` below is exactly 1 everywhere and the behind-the-camera
+    // guard can NEVER fire for an ortho capture. Its replacement is the clip window itself, which
+    // is the same [0,1] near/far test the renderer applies — without it an ortho mask with no
+    // depth band (every X-ray capture: main.js only attaches `depth` when X-ray is off) is an
+    // infinite prism in BOTH directions instead of a forward one.
+    const ortho = !!v.camera.ortho;
     const r = v.rect;
     let bits: Uint8Array | null = null, mw = 0, mh = 0;
     if (v.kind === "bitmap" && v.mask) {
@@ -281,9 +299,10 @@ function prepareVolume(v: EditVolume): SdfFn | null {
       const inv = 1 / cw;
       const nx = (m[0]! * x + m[4]! * y + m[8]! * z + m[12]!) * inv;
       const ny = (m[1]! * x + m[5]! * y + m[9]! * z + m[13]!) * inv;
-      if (depth) {
+      if (ortho || depth) {
         const nz = (m[2]! * x + m[6]! * y + m[10]! * z + m[14]!) * inv;
-        if (nz < depth.zmin || nz > depth.zmax) return 1;   // outside the visible-only depth band
+        if (ortho && (nz < 0 || nz > 1)) return 1;           // outside the captured near/far window
+        if (depth && (nz < depth.zmin || nz > depth.zmax)) return 1;   // outside the visible-only depth band
       }
       if (bits) {
         // Bitmap lookup: the mask covers the full captured viewport (NDC [-1,1]², y flips to rows).
