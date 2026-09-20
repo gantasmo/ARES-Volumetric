@@ -52,6 +52,12 @@
 # written next to depth.f32, and the depth pass sees every frame with the background painted black.
 # Two decodes of the same frame set, mask pass then depth pass, so a prompt that matches nothing
 # fails before any depth is computed and the two models are never active on the card together.
+#
+# VOLUMETRIC. `volumetric: true` (requires `subject`) adds two phases after the depth pass, run by
+# depth_volume.py as one volume_worker.py process per CUDA device: "geometry" (MoGe-2 metric depth,
+# normals and intrinsics from the unmasked frame) then "body" (a SAM 3D Body mesh per frame from the
+# subject box). Their files join depth.f32 in the run directory and their keys join depth.json
+# (intrinsics, metric, normals, body); `done` stays false until both phases have finished.
 
 import json
 import os
@@ -69,6 +75,7 @@ from pydantic import BaseModel
 
 import depth_subject as _subject
 import depth_vda as _vda
+import depth_volume as _volume
 
 router = APIRouter(prefix="/depth")
 
@@ -117,6 +124,13 @@ DEPTH_JOB_TTL_S = float(os.environ.get("DEPTH_JOB_TTL_S", "600"))
 # is two multi-gigabyte loads racing for the same card.
 DEPTH_LOAD_WAIT_S = float(os.environ.get("DEPTH_LOAD_WAIT_S", "180"))
 DEPTH_LOG_KEEP = 200             # per job; /depth/status returns the last 20
+# One byte per frame beside mask.u8: 1 where the tracker found the subject, 0 where the mask pass
+# copied a neighbouring frame's mask (see _run_mask_pass).
+MASK_DETECTED_FILE = "mask-detected.u8"
+# frames x H x W uint8 beside mask.u8: the SAM 3 tracker's object id on each pixel of the mask, 0
+# elsewhere; a copied frame copies its ids too. One id per tracked person until the tracker loses
+# every object and reseeds, after which the same person comes back under a new id.
+MASK_IDS_FILE = "mask-ids.u8"
 
 # Set by configure(), called from main.py. This module never imports main — main imports it — so it
 # stays importable, and py_compile-able, on a machine with no GPU and no weights.
@@ -474,6 +488,16 @@ class DepthJob:
         self.out_fps: float | None = None
         self.cancel = False
         self.proc: subprocess.Popen | None = None
+        # Volumetric phases (depth_volume.py): per-phase counters, the manifest keys each finished
+        # phase adds, per-worker statistics, and the worker processes a cancel has to kill.
+        self.volumetric = bool(req.volumetric)
+        self.vphases: dict[str, dict] = {
+            p: {"done": 0, "total": None, "msPerFrame": None, "gpus": None, "framesPerSecond": None}
+            for p in ("geometry", "body")}
+        self.volume: dict = {}
+        self.volume_stats: dict = {}
+        self.volume_check: dict | None = None
+        self.workers: list[subprocess.Popen] = []
         self.log: list[str] = []
         self.created = time.time()
         self.finished: float | None = None
@@ -490,6 +514,8 @@ class DepthJob:
         if self.subject:
             phases = {"mask": {"done": self.mask_done, "total": self.mask_total,
                                "msPerFrame": self.mask_ms_per_frame}, **phases}
+        if self.volumetric:
+            phases.update({p: dict(v) for p, v in self.vphases.items()})
         return {
             "state": self.state, "phase": self.phase, "phases": phases,
             "done": self.done, "total": self.total,
@@ -497,6 +523,7 @@ class DepthJob:
             "errorCode": self.error_code, "missing": self.missing,
             "width": self.width, "height": self.height, "fps": self.out_fps,
             "model": self.model, "subject": self.subject, "mask": self.mask_info,
+            "volumetric": self.volumetric, "volume": self.volume or None,
             "log": self.log[-20:],
         }
 
@@ -587,6 +614,8 @@ def _write_manifest(job: DepthJob, src: dict, frames: int, done: bool) -> None:
     }
     if job.mask_info is not None:        # absent without `subject`: the key's presence IS the flag
         manifest["mask"] = job.mask_info
+    # intrinsics / metric / normals / body, each added once its phase has finished writing its files
+    manifest.update(job.volume)
     tmp = os.path.join(job.out, "depth.json.tmp")
     with open(tmp, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=2)
@@ -671,7 +700,11 @@ def _run_mask_pass(job: DepthJob, ffmpeg: str) -> bool:
     A frame where the tracker reports the subject absent repeats the last mask, and the frames
     before the first detection take the first one: an empty mask would hand the depth model an
     all-black frame, which is the failure docs/rgbd-rebuild-pipeline.md's field notes paid for.
-    `filled` in the manifest counts those frames."""
+    `filled` in the manifest counts those frames, and <run>/mask-detected.u8 (one byte per frame,
+    1 = the tracker found the subject, 0 = a copied mask) says which they are: the body phase of a
+    volumetric job fits no mesh on a copied mask, which may hold no one. <run>/mask-ids.u8 holds
+    the tracker's object id per pixel (MASK_IDS_FILE), and `objects` in the manifest lists each
+    id's detected frames, first and last frame and mean coverage."""
     import torch
 
     job.phase = "mask"
@@ -690,30 +723,45 @@ def _run_mask_pass(job: DepthJob, ffmpeg: str) -> bool:
     dec = _Decoder(job, args, edge, edge)
     job.state = "running"
     path = os.path.join(job.out, "mask.u8")
+    det_path = os.path.join(job.out, MASK_DETECTED_FILE)
+    ids_path = os.path.join(job.out, MASK_IDS_FILE)
     n, filled, lead, inside, gpu_s = 0, 0, 0, 0.0, 0.0
     last: np.ndarray | None = None
+    last_ids: np.ndarray | None = None
+    objects: dict[int, dict] = {}      # id -> {frames, first, last, cover}
     t_pass = time.time()
     try:
-        with open(path, "wb") as out_f:
+        with open(path, "wb") as out_f, open(det_path, "wb") as det_f, open(ids_path, "wb") as ids_f:
             while not job.cancel:
                 got = dec.read(1)
                 if not got:
                     break
                 t0 = time.time()
                 with _model_lock:      # per FRAME, so /segment interleaves at one frame's latency
-                    m = masker.step(n, got[0])
+                    step = masker.step(n, got[0])
                 gpu_s += time.time() - t0
+                m, ids = step if step is not None else (None, None)
                 if m is None or not m.any():
-                    m = None
+                    m, ids = None, None
+                det_f.write(b"\x00" if m is None else b"\x01")
+                if ids is not None:
+                    present, counts = np.unique(ids[ids > 0], return_counts=True)
+                    for k, c in zip(present.tolist(), counts.tolist()):
+                        o = objects.setdefault(k, {"frames": 0, "first": n, "last": n, "cover": 0.0})
+                        o["frames"] += 1
+                        o["last"] = n
+                        o["cover"] += c / ids.size
                 if m is None and last is None:
                     lead += 1          # nothing found yet: a placeholder, rewritten below
                     out_f.write(bytes(job.height * job.width))
+                    ids_f.write(bytes(job.height * job.width))
                 else:
                     if m is None:
-                        m, filled = last, filled + 1
-                    last = m
+                        m, ids, filled = last, last_ids, filled + 1
+                    last, last_ids = m, ids
                     inside += float(np.count_nonzero(m)) / m.size
                     out_f.write(np.ascontiguousarray(m).tobytes())
+                    ids_f.write(np.ascontiguousarray(ids, dtype=np.uint8).tobytes())
                 n += 1
                 job.mask_done = n
                 if job.mask_total is not None and n > job.mask_total:
@@ -723,12 +771,14 @@ def _run_mask_pass(job: DepthJob, ffmpeg: str) -> bool:
                 # The frames before the first detection take the first mask. It is `lead` frames
                 # back in the file, so it is read from there rather than kept in memory.
                 out_f.flush()
-                with open(path, "r+b") as fix:
-                    fix.seek(lead * job.height * job.width)
-                    first = fix.read(job.height * job.width)
-                    fix.seek(0)
-                    for _ in range(lead):
-                        fix.write(first)
+                ids_f.flush()
+                for p in (ids_path, path):
+                    with open(p, "r+b") as fix:
+                        fix.seek(lead * job.height * job.width)
+                        first = fix.read(job.height * job.width)
+                        fix.seek(0)
+                        for _ in range(lead):
+                            fix.write(first)
                 inside += lead * (np.count_nonzero(np.frombuffer(first, np.uint8)) / len(first))
                 filled += lead
     finally:
@@ -745,15 +795,20 @@ def _run_mask_pass(job: DepthJob, ffmpeg: str) -> bool:
     job.mask_total = n
     coverage = inside / n
     if last is None or coverage < _subject.MIN_COVERAGE:
-        try:
-            os.remove(path)            # never leave a run whose every frame is black
-        except OSError:
-            pass
+        for p in (path, det_path, ids_path):     # never leave a run whose every frame is black
+            try:
+                os.remove(p)
+            except OSError:
+                pass
         raise DepthJobError("subject-not-found",
                             f"subject '{job.subject}' was not found in the clip "
                             f"(mean coverage {coverage:.5f} over {n} frames)")
     job.mask_info = {"file": "mask.u8", "prompt": job.subject, "engine": _subject.ENGINE,
                      "coverage": round(coverage, 5), "frames": n, "filled": filled,
+                     "detected": MASK_DETECTED_FILE, "ids": MASK_IDS_FILE,
+                     "objects": [{"id": k, "frames": o["frames"], "first": o["first"], "last": o["last"],
+                                  "coverage": round(o["cover"] / max(1, o["frames"]), 5)}
+                                 for k, o in sorted(objects.items())],
                      "msPerFrame": job.mask_ms_per_frame}
     enc, trk, det, ndet, reseeds, nobj = stats
     job.say(f"mask pass done: {n} frames, {job.mask_ms_per_frame} ms/frame (encoder "
@@ -926,10 +981,12 @@ def _run_job(job: DepthJob) -> None:
     if _load_done is not None and not _load_done.wait(DEPTH_LOAD_WAIT_S):
         raise RuntimeError("sam model still loading: retry shortly")
     os.makedirs(job.out, exist_ok=True)
-    try:                               # a previous run's mask must not outlive a run without one
-        os.remove(os.path.join(job.out, "mask.u8"))
-    except OSError:
-        pass
+    for f in ("mask.u8", MASK_DETECTED_FILE, MASK_IDS_FILE):   # a previous run's mask must not outlive a run without one
+        try:
+            os.remove(os.path.join(job.out, f))
+        except OSError:
+            pass
+    _volume.remove_outputs(job.out)    # nor its volume files a run that does not rewrite them
     _write_manifest(job, src, 0, False)
 
     mask_peak = ""
@@ -1009,12 +1066,24 @@ def _run_job(job: DepthJob) -> None:
                            f"pass {written}: the two must be the same frame set")
 
     job.total = written                  # the estimate is replaced by the count that was written
-    job.state = "done"
-    _write_manifest(job, src, written, True)
     peak = ""
     if DEVICE == "cuda":
         peak = (f", peak +{(torch.cuda.max_memory_allocated() - base_alloc) / (1 << 20):.0f} MiB "
                 f"(process {torch.cuda.max_memory_allocated() / (1 << 20):.0f} MiB){mask_peak}")
+    if job.volumetric:
+        _write_manifest(job, src, written, False)    # depth complete; the volume keys follow
+        job.say(f"depth pass done: {written} frames, {job.ms_per_frame} ms/frame inference, "
+                f"{time.time() - t_start:.1f}s wall{peak}")
+        hooks = _volume.Hooks(lock=_model_lock, unload=_unload_model,
+                              decode_args=lambda w, h: _decode_args(job, ffmpeg, w, h),
+                              write_manifest=lambda done: _write_manifest(job, src, written, done),
+                              error=DepthJobError)
+        if not _volume.run(job, hooks, src, written):
+            job.state = "cancelled"
+            job.say(f"cancelled during the {job.phase} phase")
+            return
+    job.state = "done"
+    _write_manifest(job, src, written, True)
     job.say(f"done: {written} frames, {job.ms_per_frame} ms/frame inference, "
             f"{time.time() - t_start:.1f}s wall{peak}")
     print(f"[ares-sam] depth job {job.id} {job.model}: {written} frames at {job.width}x{job.height}, "
@@ -1047,6 +1116,9 @@ def depth_health():
         "temporal": {k: _model_info(k)[2] for k in ALL_MODELS},
         # `subject` needs SAM 3's weights on disk; "sam3" is its component id in a 409 body.
         "subject": {"available": _subject.sam3_weights_present(), "engine": _subject.ENGINE},
+        # `volumetric`: component ids absent, whether moge and sam_3d_body import (a cached child
+        # probe, "probe": "running" until its first answer) and the CUDA devices a job would use.
+        "volume": _volume.health(),
         "jobs": jobs,
         "models": ALL_MODELS,
     }
@@ -1064,6 +1136,8 @@ class DepthRunRequest(BaseModel):
     # Text prompt naming the subject ("person"). Set, a SAM 3 pass writes mask.u8 and the depth
     # model sees the background black. Null or empty changes nothing.
     subject: str | None = None
+    # The geometry and body phases after the depth pass (depth_volume.py). Needs `subject`.
+    volumetric: bool = False
 
 
 def _missing_components(req: "DepthRunRequest") -> list[str]:
@@ -1080,6 +1154,8 @@ def _missing_components(req: "DepthRunRequest") -> list[str]:
             trk = _subject._track_module()
             if trk is None or trk._get_concept_model() is None:
                 gone.append("sam3")
+    if req.volumetric:
+        gone += [c for c in _volume.missing() if c not in gone]
     return gone
 
 
@@ -1106,11 +1182,26 @@ def depth_run(req: DepthRunRequest):
 
     if req.subject is not None and len(req.subject) > 200:
         raise HTTPException(status_code=400, detail="subject must be at most 200 characters")
+    if req.volumetric and not (req.subject or "").strip():
+        raise HTTPException(status_code=400, detail="volumetric requires subject: the body phase runs "
+                                                    "on the subject mask's box")
+    if req.volumetric and DEVICE != "cuda":
+        raise HTTPException(status_code=400, detail=f"volumetric requires a CUDA device, service device "
+                                                    f"is {DEVICE}")
+    if req.volumetric and not _volume.selected_devices():
+        # Refused here, not after the mask and depth passes have run.
+        raise HTTPException(status_code=400, detail=_volume.no_device_reason())
     # Fail fast and machine-readably: the caller maps these ids onto its installer catalog.
     gone = _missing_components(req)
     if gone:
         return JSONResponse(status_code=409, content={
             "error": f"components not installed: {', '.join(gone)}", "missing": gone})
+    if req.volumetric:
+        # Files on disk that do not import (a missing transitive package): the cached probe's answer,
+        # when it has one for the current component state.
+        bad = _volume.import_failure()
+        if bad:
+            return JSONResponse(status_code=409, content=bad)
 
     width = max(DEPTH_PATCH, min(DEPTH_MAX_WIDTH, int(req.inferWidth or DEPTH_DEFAULT_WIDTH)))
     batch = max(1, min(DEPTH_MAX_BATCH, int(req.batch or 8)))
@@ -1146,12 +1237,14 @@ def depth_cancel(req: DepthJobRef):
     if j is None:
         raise HTTPException(status_code=404, detail=f"unknown depth job: {req.job}")
     j.cancel = True
-    proc = j.proc
-    if proc is not None and proc.poll() is None:
-        try:
-            proc.kill()
-        except OSError:
-            pass
+    # The volume workers are killed here as well as by the phase loop, which notices the flag within
+    # 0.25 s: a worker mid-forward holds its card for up to 1.6 s otherwise.
+    for proc in [j.proc, *list(j.workers)]:
+        if proc is not None and proc.poll() is None:
+            try:
+                proc.kill()
+            except OSError:
+                pass
     return {"ok": True}
 
 

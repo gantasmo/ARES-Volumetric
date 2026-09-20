@@ -14,6 +14,11 @@ an ordinary `mask2d` keyframe list.
   sparse hand-authored ranges the two keyframes are far apart and this was invisible; with a
   keyframe per frame it pinned every frame of a hold range one frame late. Linear ranges are
   unaffected in output and compile one keyframe per frame instead of two.
+- Convert tab: one `Open…` button opens every source (a 2D video, a frame sequence folder, an
+  `.ares` or `.4ds` container) through one native dialog, `/pick?type=any`
+  (`tools/pick.ps1 -Type any`). A picked frame file opens its folder, and Open with the preset name
+  `(this folder)` returns the folder the dialog shows. The `Folder…`, `File…` and `Video…` buttons
+  are removed; the drop zone's click is the same dialog.
 - A 2.5D relief clip (`ares depth`) opens at the camera that shot it, looking down the capture axis
   at the midpoint in disparity of its nearest and farthest 5 % of surface, through the capture FOV
   widened as far as the canvas needs to show the whole picture, and its auto-orbit is a sway about
@@ -40,8 +45,26 @@ an ordinary `mask2d` keyframe list.
   one buffer, which stopped at 2 GiB.
 
 ### Added
+- `tools/sam-service/test/mesh_health.py`: a per-frame report on an `avatar_mesh.py` capture folder
+  (UV seam gap, flipped faces, edge stretch, new duplicate vertices, enclosed litres against the hull's),
+  with a worst-frame summary over the clip. It exists because the mesher's own fit residual is vertex
+  distance to the hull and passes a scrambled surface: on `1_c` it read under 20 mm on frames with
+  10.8 % flipped faces and UV seams open by 37 mm (median).
+- `avatar_mesh.py --view-power` and `--top-views`: the exponent on the bake's cosine view weight and a
+  per-texel limit on how many views are blended. Defaults keep the previous bake (every view, `cos^3`).
+- 2D video to one volumetric clip per person (docs/video-to-4d-people.md). The mask pass gives every
+  tracked person an id (`mask-ids.u8`), `tools/sam-service/avatar.py` cuts each person out of their
+  best frame and writes their own fixed 9:16 clip, 4DAnyone (`tools/ext/4danyone`, patched for
+  Windows and Turing by `tools/4danyone/windows-turing.patch`) generates synchronized views around
+  them, and `tools/sam-service/avatar_mesh.py` builds a textured mesh per frame from those views:
+  BiRefNet masks, a visual hull, marching cubes, one xatlas unwrap per GOP with the following frames
+  deformed onto their own hull, and a texture baked from the views that see each texel. The frame
+  folder encodes as an ordinary capture. `/avatar-convert` (tools/avatar-run.mjs) drives the chain
+  and the Convert card's `completion` select takes `4DAnyone views`, with its own Views block.
+  Measured on two RTX 2080 Ti: 652 s for a 45-frame window at 6 views (peak 10.0 GB), then 10 to
+  12 s per keyframe and 3.6 s per deformed frame at 40,000 faces and a 1024² atlas.
 - 2D video → 2.5D conversion, ported from VJ-9000's "depthcloud" source (github.com/gantasmo/VJ-9000)
-  and rebuilt as an offline pipeline (docs/depth-2d-to-25d.md). The Convert tab's `Video…` button
+  and rebuilt as an offline pipeline (docs/depth-2d-to-25d.md). The Convert tab's `Open…` button
   (or a dropped mp4/webm/mov/mkv) opens a card that runs one of two depth engines against the same
   run contract (`depth.json` + `depth.f32`, one float32 map per sampled frame): the local Python
   service (`tools/sam-service/depth.py`, Depth-Anything-V2 small/base/large and the metric
@@ -137,8 +160,91 @@ an ordinary `mask2d` keyframe list.
 - `OrbitState.fov` (vertical degrees, `ORBIT_FOV_DEG` 50 when absent) in `@ares/core`, carried by
   `getCamera`/`setCamera`, the crop guides and the camera of every mask2d volume, so a mask drawn
   through a relief's own FOV is tested through it. `relief.aspect` records the picture's aspect.
+- 2D video to full volumetric (docs/depth-2d-to-volumetric.md). The depth service's `volumetric`
+  job adds a geometry phase (MoGe-2 metric depth, camera-space normals and intrinsics from the
+  unmasked frame) and a body phase (a SAM 3D Body mesh per frame from the subject mask's box), one
+  worker process per GPU on disjoint frame ranges, written as new optional keys of the ares-depth/1
+  run (`intrinsics`, `metric`, `normals`, `body`). `ares depth --volumetric` restricts the subject
+  mask to the body's footprint, fits the stabilized disparity onto the metric depth with a tiled
+  robust fit smoothed over +-8 frames, adds normal-map detail by a screened Poisson solve, anchors
+  the body behind the resulting shell with a per-frame scale about the camera, carves and pushes it,
+  adds a backing behind hair and cloth, and bakes the body's back texture from every frame that saw
+  each vertex into a region under the frame in the atlas. The clip carries `volumetric.*` metadata
+  instead of `relief.camera`/`relief.forward`, so the player orbits it as a turntable. New module
+  `volumetric.ts`; `depth-metric.ts` and `depth-body.ts` are exported from the encoder package.
+  `/depth-convert?volumetric=1` drives the whole chain (service engine, subject `person` by
+  default) and the Convert card's `completion` select turns it on. The encoder carries each frame's
+  metric depth onto the clip focal (MoGe-2 infers focal and depth together). A worker lost on one
+  GPU has its remaining frames re-run on another. The mask pass writes `mask-detected.u8`, and the
+  body phase fits no mesh on a frame whose mask was copied. The phases' Python packages are listed
+  in `tools/sam-service/requirements-volumetric.txt`, apart from `requirements.txt`. The mask pass
+  also writes `mask-ids.u8`, the tracker's object id per pixel (one id per tracked person), and
+  `mask.objects` in `depth.json`. Measured on a
+  90-frame 1080p clip on two RTX 2080 Ti: geometry 9.4 frames/s, body 0.9 to 1.0 frames/s; 20,267
+  triangles and 395.0 KB per frame; the fitted shell's subject depth moves 9.4 mm per frame against
+  MoGe-2's 68.6 mm on the clip focal (92.5 mm as inferred), and the body's front lies 9.3 mm (p50,
+  max 57.3 mm) from it.
 
 ### Fixed
+- `avatar_mesh.py` deforms the welded mesh. `unwrap()` returned the vertex list xatlas splits along UV
+  seams and `wrap()` moved that list, so every chart drifted as its own sheet: seam copies that coincide
+  on a keyframe sat 15.6 mm apart one frame later and 36.9 mm apart six frames later (median, `1_c`).
+  The keyframe now keeps its welded vertices, welded faces and the split map, `wrap()` runs on the
+  welded mesh and the result is re-split for baking and writing: seam gap 0.0 mm on every deformed
+  frame of `1_c` and `1_a`. A stray vertex takes the mean of its connected non-stray neighbours, ring
+  by ring; it was copied onto its nearest neighbour's position, which made zero-area triangles. The
+  deform itself still fails: flipped faces up to 10.7 % and edge stretch p99 up to 23x after this
+  change (docs/handoff-4d-people.md).
+- No version is fixed in `tools/sam-service/requirements-volumetric.txt` or in the installer's SAM 3D
+  Body runtime row. Eleven packages were held to the exact versions one install had produced and MoGe
+  to a commit, with no breakage behind any of them; upstream's INSTALL.md names the packages without
+  versions.
+- `/avatar-convert`: an omitted knob whose range contains zero took zero instead of its default.
+  `Number(null)` and `Number("")` are both 0 and the route's `num()` helper coerced before testing
+  for an absent parameter, so a caller that left `rekey` out got 0, which `avatar_mesh.py` reads as
+  "mesh every frame afresh", and one that left `pitch` out got a camera ring at eye level rather
+  than 15°. Measured on a 45-frame run of the same generated views: at `rekey` 0 the mesh stage took
+  562 s and the container came out 20.73 MB with geometry intra-only on all 45 frames; at 0.02 it
+  took 326 s for 10 keyframes and 35 deformed frames and 15.52 MB with temporal I+P and zero intra.
+  The Convert card always sent every knob, so only a script or a hand-built URL saw this.
+- 4DAnyone: the generated window defaults to 45 frames, not 61. A 61-frame window does not fit two
+  11 GB cards at the 704x1280 raster: `torch.OutOfMemoryError` in the DiT attention output
+  projection with GPU 0 full at 11.00 GiB, 9.36 GiB of it PyTorch's, refusing a 578 MiB allocation.
+  45 is the value `tools/4danyone/README.md` documents and the only window measured end to end.
+  With a SAM service still resident on `cuda:0` the same shortage arrived as a native access
+  violation (exit 3221225477) with no traceback instead of an allocator error, which is what made it
+  read as a crash rather than as a budget.
+- `samStop` reports whether the port actually went quiet, and `/avatar-convert` fails with a named
+  error rather than generating on a card it does not own. The stop is a PowerShell one-liner whose
+  output is discarded, so a service that kept the port (no listener found, an owner that is not
+  `python*`, a denied `Stop-Process`) previously left the route generating with 2 to 3 GB of
+  `cuda:0` gone while the card log read "stopped".
+- A 4DAnyone run holds the SAM service down for its duration. The `/sam` proxy auto-starts the
+  service on any refused POST, so using a SAM route from an open tab mid-run put SAM 3 and a depth
+  model back on `cuda:0` under a generation that had been given the whole card. `samEnsure` now
+  refuses while a run holds the cards, and the refusal names the run.
+- `/avatar-convert` joins the same-origin `GUARDED` routes. It spawns processes, writes into
+  `apps/demo` and holds both GPUs for the length of a run, and it was the one machine-acting route
+  the guard did not cover.
+- Convert tab: a dropped file or folder no longer needs its path typed. The browser withholds a
+  dropped item's location, so the new `/resolve-drop` route finds it on disk (`tools/locate.ps1`:
+  folders open in File Explorer and one level under them, Desktop, Downloads, Videos, Documents,
+  Pictures, Recent items, the Windows Search index, the history's folders), matching a file on name,
+  exact size and modification time and a folder on name and entry count. One match fills the path;
+  several are offered as buttons. Measured 2026-09-19 in Chrome: a dropped video located in 0.8 s,
+  a dropped capture folder in 1.6 s. `/resolve-dir` answers through the same lookup. A folder drop
+  also reads the folder name from the drop entry (a drag-drop File has no `webkitRelativePath`, so
+  the previous history lookup never ran for a drop).
+- Convert tab: clicking the drop zone and `File…` open the native file dialog, which returns the
+  full path; they opened the browser's dialog, which does not. An `.ares` or `.4ds` opened by path
+  (picker or shell verb) is probed through byte ranges from the new `/local-bytes` route; it used to
+  open the containing folder instead.
+- `/depth-convert` wrote its request provenance as `source: {video}`, which replaced the encoder's
+  own `source` block (video bytes, source size and rate) in the sidecar. The route's fields now sit
+  under `request`, which also carries `video`.
+- `/depth-convert` stopped forwarding the depth service's log once the service's 20-line tail was
+  full: it counted lines, and the count stops growing at 20. It now forwards what follows the last
+  line it sent; a volumetric job's geometry and body summaries reach the Convert log.
 - `ares depth` on a long clip failed with `File size (3427788336) is greater than 2 GiB`: it read
   the depth run with one `readFile` and held every stage of the clip in memory. It now streams.
 - `/depth-convert` installed SAM 3 for a subject run but never sent the prompt to the depth

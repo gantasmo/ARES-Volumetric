@@ -205,7 +205,14 @@ auto-launches a local Forge install headless. Jobs can queue as a batch. Known l
 the default Real-ESRGAN model invents artifacts on skin, documented in
 [docs/whitepaper.md](docs/whitepaper.md) under Known limitations.
 
-The Convert tab also takes a plain 2D video (`Video…`, or drop an mp4/webm/mov/mkv) and
+The Convert tab's `completion` select also offers `4DAnyone views`, which builds one volumetric
+clip per person in the video: the SAM 3 mask pass gives every tracked person an id, 4DAnyone
+generates synchronized views around them, and a textured mesh per frame is carved from those views
+and encoded. See [docs/video-to-4d-people.md](docs/video-to-4d-people.md) and its
+[handoff note](docs/handoff-4d-people.md); the model install is
+[tools/4danyone/README.md](tools/4danyone/README.md).
+
+The Convert tab also takes a plain 2D video (`Open…`, or drop an mp4/webm/mov/mkv) and
 produces a 2.5D clip: a monocular depth model (Depth-Anything-V2) estimates a depth map per
 frame, the encoder unprojects each map through a pinhole ray table into a relief mesh with
 silhouette cuts at depth discontinuities, and the video frame itself is the texture. Two depth
@@ -321,6 +328,7 @@ video's own audio unless `--no-audio`, and muxes. The contract and the tuning no
 | [docs/sam3d-body-colab.md](docs/sam3d-body-colab.md) | SAM-3D Body skeleton fitting via the Colab notebook |
 | [docs/targeted-temporal.md](docs/targeted-temporal.md) | Motion-gated coherent spans: the shipped temporal strategy for per-frame-reconstructed captures |
 | [docs/rgbd-rebuild-pipeline.md](docs/rgbd-rebuild-pipeline.md) | 2.5D RGBD (Depthkit-style) captures rebuilt into volumetric clips: masking, fused metric depth, shading detail, hybrid body completion |
+| [docs/depth-2d-to-volumetric.md](docs/depth-2d-to-volumetric.md) | 2D video to full volumetric: MoGe-2 metric shell with normal detail, SAM 3D Body completion on two GPUs, back texture from every frame |
 | [bench/README.md](bench/README.md) | Benchmark harness: how to run it, corpus taxonomy, measured results |
 | [ARES-Runtime-Specification.md](ARES-Runtime-Specification.md) | Built master spec (Draft 0.2), the normative document |
 | [spec/](spec/) | Specification source, one file per chapter; rebuild with `python spec/build.py` |

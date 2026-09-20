@@ -195,7 +195,9 @@ class SubjectMasker:
             self.isess.mask_inputs_per_obj[obj_idx].pop(idx, None)
 
     def step(self, idx: int, frame_u8):
-        """frame_u8: (1008, 1008, 3) uint8 numpy. Returns (out_h, out_w) uint8 numpy of 0/255."""
+        """frame_u8: (1008, 1008, 3) uint8 numpy. Returns None when no object is present, else
+        (mask, labels): (out_h, out_w) uint8 numpy of 0/255, and the tracker object id per pixel
+        (see _labels)."""
         import time
 
         import torch
@@ -215,10 +217,10 @@ class SubjectMasker:
             self.encoder_s += t1 - t0
 
             n_obj = self.isess.get_obj_num()
-            union = None
+            union, labels = None, None
             if n_obj:
                 out = self._forward(idx, px)
-                union = self._union(out)
+                union, labels = self._labels(out)
                 sync()
             t2 = time.time()
             self.track_s += t2 - t1
@@ -256,7 +258,7 @@ class SubjectMasker:
                     self.processor.add_inputs_to_inference_session(
                         inference_session=self.isess, frame_idx=idx, obj_ids=ids, input_masks=new)
                     out = self._forward(idx, px)
-                    union = self._union(out)
+                    union, labels = self._labels(out)
                     if n_obj == 0:
                         self.log(f"subject '{self.prompt}': {len(new)} instance"
                                  f"{'s' if len(new) != 1 else ''} seeded at frame {idx}")
@@ -265,11 +267,15 @@ class SubjectMasker:
             self._prune(idx)
             if union is None:
                 return None
-            return (union.to(torch.uint8) * 255).cpu().numpy()
+            return (union.to(torch.uint8) * 255).cpu().numpy(), labels.cpu().numpy()
 
-    def _union(self, out):
-        """Union of every object the tracker scores as present, at the depth map's size. Bilinear
-        on the LOGITS and thresholded after, as post_process_masks does."""
+    def _labels(self, out):
+        """(union, labels) at the depth map's size, or (None, None) when no object is present.
+        union: every object the tracker scores as present; labels: uint8, the tracker's object id
+        on each pixel of the union (the object with the highest mask logit where two overlap), 0
+        elsewhere. Bilinear on the LOGITS and thresholded after, as post_process_masks does. Ids
+        above 255 are written as 255."""
+        import torch
         import torch.nn.functional as F
 
         low = out.pred_masks.float()
@@ -277,7 +283,11 @@ class SubjectMasker:
             low = low.unsqueeze(1)
         present = out.object_score_logits.float().reshape(-1) > 0
         if not bool(present.any()):
-            return None
-        m = F.interpolate(low[present], size=(self.out_h, self.out_w), mode="bilinear",
-                          align_corners=False) > 0
-        return m.any(dim=0)[0]
+            return None, None
+        logit = F.interpolate(low[present], size=(self.out_h, self.out_w), mode="bilinear",
+                              align_corners=False)[:, 0]
+        union = (logit > 0).any(dim=0)
+        ids = torch.tensor([min(int(v), 255) for v, p in zip(out.object_ids, present.tolist()) if p],
+                           dtype=torch.uint8, device=logit.device)
+        labels = torch.where(union, ids[logit.argmax(dim=0)], torch.zeros_like(ids[:1]))
+        return union, labels

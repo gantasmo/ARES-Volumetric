@@ -34,3 +34,6 @@ einops==0.8.2
 spandrel==0.4.2
 diffusers==0.40.0
 accelerate==1.14.0
+
+# The volumetric depth job's packages (MoGe-2 from git, SAM 3D Body's runtime) are in
+# requirements-volumetric.txt: a git URL here would stop the whole install on a machine without git.

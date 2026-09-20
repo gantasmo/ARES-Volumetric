@@ -9,6 +9,10 @@ player opens a relief at the camera that shot it and sways it about the capture 
 Every stage streams. A feature-length source is gigabytes of depth maps and of mesh; nothing in
 the encoder holds a whole clip, and the dev server streams clips of any length with Range support.
 
+The volumetric mode (`ares depth --volumetric`, `/depth-convert?volumetric=1`, the card's
+`completion` select) builds on this pipeline: a metric shell from MoGe-2 plus a SAM 3D Body mesh
+for the unseen side. See [depth-2d-to-volumetric.md](depth-2d-to-volumetric.md).
+
 ## Provenance
 
 The feature is a port of the "depthcloud" live source of VJ-9000
@@ -61,7 +65,7 @@ video ──► probe ──► depth engine ──────────► r
   "video": "C:/clips/take.mp4",
   "sourceFps": 29.97, "sourceWidth": 1920, "sourceHeight": 1080, "sourceFrames": 300, "sourceDurationS": 10.01,
   "msPerFrame": 7.6, "device": "cuda", "dtype": "fp16",
-  "mask": { "file": "mask.u8", "prompt": "person", "engine": "sam3-text-tracker", "coverage": 0.21 },
+  "mask": { "file": "mask.u8", "prompt": "person", "engine": "sam3-text-tracker", "coverage": 0.21, "filled": 0, "detected": "mask-detected.u8" },
   "done": true
 }
 ```
@@ -78,7 +82,9 @@ per-frame models, whose scale and shift change from frame to frame.
 
 `mask` is present only when a subject mask pass ran. `<dir>/<mask.file>` is `frames × height ×
 width` uint8, 0 outside the subject and 255 inside, in the same frame order and orientation as
-`depth.f32`. The depth model saw each frame with the background painted black.
+`depth.f32`. The depth model saw each frame with the background painted black. `filled` counts the
+frames that repeat a neighbouring frame's mask, and `<dir>/<mask.detected>` holds one byte per
+frame: 1 where SAM 3 found the subject, 0 where the mask was repeated.
 
 **Frame sampling.** Every consumer reproduces the engine's frame set with the same ffmpeg
 filter chain, so texture frame *i* and depth frame *i* are the same source frame:
@@ -426,7 +432,9 @@ drift (the grown gate). In priority order, what is open:
    list and the editor's use of `file.buf` are what assume the whole buffer today.
 2. **Scale and FOV from the picture.** Near, far and FOV are guesses (0.5 m, 6 m, 55°). A metric
    model that also estimates focal length (MoGe-2, Depth Pro) on a few keyframes could fit the
-   relative disparity's scale and shift and give all three; not evaluated.
+   relative disparity's scale and shift and give all three. The volumetric mode does this with
+   MoGe-2 on every frame ([depth-2d-to-volumetric.md](depth-2d-to-volumetric.md)); the relief
+   path does not use it yet.
 3. **Fill layer quality.** The fill is a ring-by-ring extension of depth and colour. Measure it on
    people and rooms, compare a learned inpainter for the plate's colour, and decide whether
    `--snap-ramps` becomes the default.
