@@ -1,5 +1,5 @@
 /**
- * Convert tab — one unified import: drop/pick a folder of per-frame OBJ/PLY meshes + PNG atlases
+ * Convert tab — one unified import (one Open button, one drop zone): a folder of per-frame OBJ/PLY meshes + PNG atlases
  * (analysed, then run through the REAL encoder on this machine via the dev server's /encode
  * endpoint — streamed progress, no command line, produced .ares opens straight in the Viewer),
  * OR drop/pick a single .ares/.4ds file (structurally probed in-browser, findings shown inline —
@@ -11,7 +11,7 @@ import { accessPrompt, collectFile, fetchJsonEnsuring, sseErrorData } from "./en
 import { probeFile, renderProbe, FOURDS_STATUS } from "./probe.js";
 // 2D video → 2.5D: its own module (the menu.js/track.js precedent), ported from VJ-9000's depth
 // source. convert.js only routes a picked or dropped video to it.
-import { initDepthCard, renderDepthCard, pickVideoAndRender, isVideoName } from "./depth-card.js";
+import { initDepthCard, renderDepthCard, isVideoName } from "./depth-card.js";
 
 const $ = (id) => document.getElementById(id);
 const MB = (b) => (b >= 1073741824 ? (b / 1073741824).toFixed(2) + " GB" : (b / 1048576).toFixed(1) + " MB");
@@ -33,12 +33,39 @@ async function fromEntry(entry, out, depth) {
     });
   }
 }
+/** Files of a drop, plus the dropped item itself when there is exactly one: its name and, for a
+ *  folder, its direct entry count (what /resolve-drop matches a folder on). A drag-drop File has
+ *  no webkitRelativePath, so the folder name has to come from the entry. */
 async function gather(dt) {
   const out = [];
   const items = dt.items ? [...dt.items] : [];
   const entries = items.map((it) => it.webkitGetAsEntry && it.webkitGetAsEntry()).filter(Boolean);
-  if (entries.length) { for (const e of entries) await fromEntry(e, out, 0); return out; }
-  return [...dt.files];
+  if (!entries.length) return { files: [...dt.files], root: null };
+  for (const e of entries) await fromEntry(e, out, 0);
+  let root = null;
+  if (entries.length === 1) {
+    const e = entries[0];
+    root = { name: e.name, isDir: !!e.isDirectory, entries: 0 };
+    if (e.isDirectory) root.entries = await new Promise((res) => {
+      const reader = e.createReader(); let n = 0;
+      const batch = () => reader.readEntries((ents) => { if (!ents.length) return res(n); n += ents.length; batch(); }, () => res(n));
+      batch();
+    });
+  }
+  return { files: out, root };
+}
+
+/** Where a dropped item is on disk (serve.mjs /resolve-drop): { path } or { candidates }. */
+async function locate(q) {
+  const p = new URLSearchParams({ name: q.name, kind: q.kind });
+  if (q.size) p.set("size", String(q.size));
+  if (q.mtime) p.set("mtime", String(q.mtime));
+  if (q.files) p.set("files", String(q.files));
+  try { return await fetch("/resolve-drop?" + p).then((r) => r.json()); }
+  catch { return { candidates: [] }; }
+}
+function showLocating(name) {
+  $("convertOut").innerHTML = `<div class="card"><div class="cap">Locating</div><div class="note2">${name}</div></div>`;
 }
 
 async function pngDims(file) {
@@ -52,9 +79,9 @@ async function objVerts(file) {
 
 let lastState = null;
 
-// Normalise a drag-dropped File[] into the same stats shape /analyse returns (path unknown here —
-// the browser can't see absolute paths, so drag-drop is preview-only until a folder is picked).
-async function statsFromFiles(files) {
+// Normalise a drag-dropped File[] into the same stats shape /analyse returns. The browser gives no
+// path; analyse() below locates the folder on disk before this preview is ever shown.
+async function statsFromFiles(files, rootName = "") {
   const objs = files.filter((f) => /\.obj$/i.test(f.name)).sort((a, b) => a.name.localeCompare(b.name));
   const plys = files.filter((f) => /\.ply$/i.test(f.name)).sort((a, b) => a.name.localeCompare(b.name));
   const pngs = files.filter((f) => /\.png$/i.test(f.name)).sort((a, b) => a.name.localeCompare(b.name));
@@ -71,7 +98,7 @@ async function statsFromFiles(files) {
   }
   if (!meshes.length) return null;
   const [sampleVerts, atlasDims] = await Promise.all([objs.length ? objVerts(meshes[0]) : 0, pngs.length ? pngDims(pngs[0]) : null]);
-  const rel = (meshes[0].webkitRelativePath || "").split("/")[0] || "";
+  const rel = rootName || (meshes[0].webkitRelativePath || "").split("/")[0] || "";
   return {
     meshes: meshes.length, kind, pngs: pngs.length, atlasDims, splat, splatCount: kind === ".splat" ? Math.floor(meshes[0].size / 32) : 0,
     sampleVerts, rawBytes: files.reduce((s, f) => s + f.size, 0), files: files.length,
@@ -79,25 +106,17 @@ async function statsFromFiles(files) {
   };
 }
 
-/** A dropped folder arrives with a NAME but no location — the browser withholds the absolute path,
- *  which is why this card used to make you retype a folder you had just pointed at. The server can
- *  usually find it: it knows the folders you have converted from before. One unambiguous hit fills
- *  the field; anything else leaves it for the picker rather than guessing wrong. */
-async function resolveDroppedPath(stats) {
-  if (!stats || stats.path || !stats.folderHint) return stats;
-  try {
-    const q = "/resolve-dir?name=" + encodeURIComponent(stats.folderHint) +
-              (stats.files ? "&files=" + stats.files : "");
-    const r = await fetch(q).then((x) => x.json());
-    if (r && r.path) { stats.path = r.path; stats.resolved = true; }
-    else if (r && r.candidates && r.candidates.length) stats.candidates = r.candidates;
-  } catch { /* server not running — the field stays manual, exactly as before */ }
-  return stats;
-}
-
-async function analyse(files) {
-  const stats = await resolveDroppedPath(await statsFromFiles(files));
+/** A dropped folder: located on disk, it is analysed exactly as a picked one (path filled). When
+ *  the lookup finds no single match, the browser-side preview renders with the candidates. */
+async function analyse(files, root) {
+  const stats = await statsFromFiles(files, root && root.isDir ? root.name : "");
   if (!stats) { $("convertOut").innerHTML = `<div class="card"><div class="cap">No mesh or splat frames</div><div class="note2">Accepted inputs: ⋯ menu.</div></div>`; return; }
+  if (stats.folderHint) {
+    showLocating(stats.folderHint);
+    const r = await locate({ name: stats.folderHint, kind: "dir", files: root && root.isDir ? root.entries : 0 });
+    if (r.path) { await analyseServer(r.path); return; }
+    if (r.candidates && r.candidates.length) stats.candidates = r.candidates.map((p) => ({ path: p }));
+  }
   renderConvertCard(stats);
 }
 
@@ -111,7 +130,7 @@ function renderProbeOut(probe) {
   return html;
 }
 
-async function handleProbeFile(file) {
+async function handleProbeFile(file, path = "") {
   const out = $("convertOut");
   out.innerHTML = `<div class="card"><div class="cap">Probing ${file.name}</div></div>`;
   try {
@@ -122,6 +141,8 @@ async function handleProbeFile(file) {
       const defaultName = file.name.replace(/\.4ds$/i, "").replace(/[^a-z0-9_-]/gi, "_").slice(0, 60) || "converted";
       out.insertAdjacentHTML("beforeend", fourdsConvertRowHtml(defaultName));
       wireFourdsConvertRow();
+      const where = path || (await locate({ name: file.name, kind: "file", size: file.size, mtime: file.lastModified })).path;
+      if (where && $("cv4dsPath")) { $("cv4dsPath").value = where; probe4dsPath(where); }
     }
     // Probes never leave the browser, so the history entry carries the full result — clicking
     // the entry later re-renders this card without re-reading the (path-less) local file.
@@ -269,15 +290,50 @@ async function run4dsConvert() {
   es.onerror = () => { /* SSE stream closed by server */ };
 }
 
-/** Entry point for both drag-drop and the click-to-choose input. */
-async function handleImport(files) {
-  if (files.length === 1) {
-    const lower = files[0].name.toLowerCase();
-    if (lower.endsWith(".ares") || lower.endsWith(".4ds")) { await handleProbeFile(files[0]); return; }
-    // A dropped video arrives with a name and no path; the card asks for the path via the picker.
-    if (isVideoName(lower)) { await renderDepthCard("", { hint: files[0].name }); return; }
+/** Entry point for a drop. The browser withholds a dropped item's location, so the server locates
+ *  it by name, size and time (/resolve-drop) and the flow continues as for a native pick. */
+async function handleImport(files, root = null) {
+  if (files.length === 1 && !(root && root.isDir)) {
+    const f = files[0], lower = f.name.toLowerCase();
+    if (lower.endsWith(".ares") || lower.endsWith(".4ds")) { await handleProbeFile(f); return; }
+    if (isVideoName(lower)) {
+      showLocating(f.name);
+      const r = await locate({ name: f.name, kind: "file", size: f.size, mtime: f.lastModified });
+      await renderDepthCard(r.path || "", { hint: f.name, candidates: r.candidates || [] });
+      return;
+    }
   }
-  analyse(files);
+  analyse(files, root);
+}
+
+// Open and a click on the drop zone: the native dialog (type=any), which returns the full path of a
+// file or a folder (a browser dialog returns neither). openPath routes by what came back; a frame
+// file picked from a sequence opens its folder.
+const ANY_FILTER = "Supported|*.mp4;*.m4v;*.mov;*.webm;*.mkv;*.avi;*.mpg;*.mpeg;*.wmv;*.ares;*.4ds;*.obj;*.ply;*.spz;*.splat;*.sog;*.glb;*.gltf|All files|*.*";
+async function pickAndOpen() {
+  let picked;
+  try { picked = await fetch("/pick?type=any&for=convert&filter=" + encodeURIComponent(ANY_FILTER)).then((r) => r.json()); }
+  catch { $("convertOut").innerHTML = `<div class="card"><div class="cap" style="color:var(--bad)">Picker requires the ARES dev server</div></div>`; return; }
+  if (picked && picked.path) await openPath(picked.path);
+}
+
+/** A local .ares/.4ds read through /local-bytes byte ranges: the File surface probe.js uses
+ *  (name, size, slice().arrayBuffer()), for a container opened by path. */
+function remoteFile(path, size) {
+  const name = path.split(/[\\/]/).pop();
+  const url = "/local-bytes?path=" + encodeURIComponent(path);
+  return {
+    name, size,
+    slice(start = 0, end = size) {
+      const a = Math.max(0, Math.min(size, start)), b = Math.max(a, Math.min(size, end));
+      return { arrayBuffer: async () => {
+        if (b <= a) return new ArrayBuffer(0);
+        const r = await fetch(url, { headers: { Range: `bytes=${a}-${b - 1}` } });
+        if (!r.ok) throw new Error(`read ${name}: HTTP ${r.status}`);
+        return r.arrayBuffer();
+      } };
+    },
+  };
 }
 
 // Pick a folder natively (no typing), analyse it server-side, and render the card pre-filled.
@@ -784,8 +840,8 @@ function runEncode(job) {
  * Open whatever the Windows shell verb was pointed at. The browser cannot read a path, so the
  * server classifies it first (/open-info) and the right flow takes over:
  *   folder            -> analyse it as a frame sequence (the volumetric case)
- *   .ares             -> probe the container
- *   .4ds              -> probe, then the on-machine decode row
+ *   .ares             -> probe the container (byte ranges through /local-bytes)
+ *   .4ds              -> probe, then the on-machine decode row with the path filled
  *   a lone mesh/splat -> analyse the folder that CONTAINS it, because a sequence is a folder
  */
 export async function openPath(target) {
@@ -802,22 +858,15 @@ export async function openPath(target) {
 
   const ext = info.ext || "";
   if (isVideoName(ext)) { await renderDepthCard(info.path); return; }   // a 2D video: the depth card
-  if (ext === ".4ds" || ext === ".ares") {
-    // Both are containers the probe understands, but the probe reads BYTES and the browser has
-    // no path handle. Fall back to analysing the parent so the user is not stranded, and say why.
-    await analyseServer(info.parent);
-    if ($("cvPathNote")) $("cvPathNote").textContent = `opened the folder holding ${target.split(/[\\/]/).pop()}: pick the file itself with “File…” to probe it`;
-    return;
-  }
+  if (ext === ".4ds" || ext === ".ares") { await handleProbeFile(remoteFile(info.path, info.size || 0), info.path); return; }
   // A single mesh or splat file: a sequence lives in a folder, so analyse the folder.
   await analyseServer(info.parent);
   if ($("cvPathNote")) $("cvPathNote").textContent = `opened the folder holding ${target.split(/[\\/]/).pop()}`;
 }
 
 export function initConvert() {
-  const drop = $("convertDrop"), input = $("convertFile"), probeInput = $("convertProbeFile");
-  $("convertPick").onclick = pickAndAnalyse;   // native folder dialog — the primary, no-typing path
-  if ($("convertVideo")) $("convertVideo").onclick = pickVideoAndRender;   // 2D video → 2.5D card
+  const drop = $("convertDrop");
+  $("convertOpen").onclick = pickAndOpen;   // every source through one native dialog
   initDepthCard({ addToShowcase, refreshHistory: () => history && history.refresh() });
   // Format matrix lives behind the ⋯ button: it is reference material, not a control, and it
   // used to cost five lines of permanent vertical space above the drop zone.
@@ -828,15 +877,12 @@ export function initConvert() {
   };
   const fourdsLink = $("fourdsSettingsLink");
   if (fourdsLink) fourdsLink.onclick = (e) => { e.preventDefault(); const b = document.querySelector('#tabs button[data-tab="settings"]'); if (b) b.click(); };
-  input.addEventListener("change", () => { if (input.files.length) handleImport([...input.files]); });
-  // Secondary picker: a single .ares/.4ds file. Separate <input> because the primary one carries
-  // `webkitdirectory` (folder-only in Chrome) — a picker attribute can't do both at once. Drag-drop
-  // on the one drop zone handles both cases already (gather() doesn't care what was dropped).
-  if (probeInput) probeInput.addEventListener("change", () => { if (probeInput.files[0]) handleImport([probeInput.files[0]]); });
+  drop.addEventListener("click", pickAndOpen);
+  drop.addEventListener("keydown", (e) => { if (e.key === "Enter" || e.key === " ") { e.preventDefault(); pickAndOpen(); } });
   const stop = (e) => { e.preventDefault(); e.stopPropagation(); };
   ["dragenter", "dragover"].forEach((ev) => drop.addEventListener(ev, (e) => { stop(e); drop.classList.add("over"); }));
   ["dragleave", "drop"].forEach((ev) => drop.addEventListener(ev, (e) => { stop(e); drop.classList.remove("over"); }));
-  drop.addEventListener("drop", async (e) => { const files = await gather(e.dataTransfer); if (files.length) handleImport(files); });
+  drop.addEventListener("drop", async (e) => { const { files, root } = await gather(e.dataTransfer); if (files.length) handleImport(files, root); });
   history = initHistoryPanel({
     host: $("convertHistory"),
     kinds: ["analyse", "encode", "enhance", "inspect"],

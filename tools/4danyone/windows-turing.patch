@@ -1,0 +1,464 @@
+diff --git a/fdanyone/config.py b/fdanyone/config.py
+index 0012f00..bf2bccd 100644
+--- a/fdanyone/config.py
++++ b/fdanyone/config.py
+@@ -6,14 +6,18 @@ model and therefore stay together here instead of being exposed as knobs.
+ 
+ from __future__ import annotations
+ 
++import os
+ from dataclasses import dataclass
+ 
+ 
+ @dataclass(frozen=True)
+ class InferenceConfig:
+-    num_frames: int = 121
+-    height: int = 1280
+-    width: int = 704
++    # ARES: the released window is 121 frames at 1280x704. The DiT denoises every view of the
++    # window at once, so these set the activation size: 11 GB cards need a shorter window or a
++    # smaller raster. Frames must satisfy (n - 1) % 4 == 0 and the raster must be a multiple of 16.
++    num_frames: int = int(os.environ.get("FDANYONE_FRAMES", "121"))
++    height: int = int(os.environ.get("FDANYONE_HEIGHT", "1280"))
++    width: int = int(os.environ.get("FDANYONE_WIDTH", "704"))
+     prompt: str = "视频中的人在做动作"
+     auto_downsample_fps: tuple[tuple[int, int], ...] = (
+         (24, 1),
+@@ -27,7 +31,7 @@ class InferenceConfig:
+     target_h264_crf: int = 18
+     h264_preset: str = "medium"
+     skeleton_max_dimension: int = 2048
+-    tiled_vae: bool = False
++    tiled_vae: bool = os.environ.get("FDANYONE_TILED_VAE", "0") == "1"
+     vae_tile_size: tuple[int, int] = (52, 30)
+     vae_tile_stride: tuple[int, int] = (26, 15)
+ 
+diff --git a/fdanyone/io.py b/fdanyone/io.py
+index 463b640..8c56ba7 100644
+--- a/fdanyone/io.py
++++ b/fdanyone/io.py
+@@ -3,7 +3,6 @@
+ from __future__ import annotations
+ 
+ import errno
+-import fcntl
+ import hashlib
+ import json
+ import os
+@@ -35,11 +34,18 @@ def lock_output(path: Path):
+     """
+ 
+     lock_path = path.with_name(f".{path.name}.lock")
+-    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | os.O_NOFOLLOW, 0o666)
++    descriptor = os.open(lock_path, os.O_CREAT | os.O_RDWR | getattr(os, "O_NOFOLLOW", 0), 0o666)
+     try:
+         try:
+-            fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
+-        except BlockingIOError as exc:
++            if os.name == "nt":
++                import msvcrt
++
++                msvcrt.locking(descriptor, msvcrt.LK_NBLCK, 1)
++            else:
++                import fcntl
++
++                fcntl.flock(descriptor, fcntl.LOCK_EX | fcntl.LOCK_NB)
++        except (BlockingIOError, PermissionError, OSError) as exc:
+             raise FourDAnyoneError(f"Another inference run is using {path}.") from exc
+         yield
+     finally:
+diff --git a/fdanyone/model/conditioning.py b/fdanyone/model/conditioning.py
+index 0f7ec81..95f12ce 100644
+--- a/fdanyone/model/conditioning.py
++++ b/fdanyone/model/conditioning.py
+@@ -3,6 +3,7 @@
+ from __future__ import annotations
+ 
+ import gc
++import os
+ import logging
+ from concurrent.futures import ThreadPoolExecutor, as_completed
+ from copy import deepcopy
+@@ -28,8 +29,12 @@ PROMPT_CONTEXT_KEY = "context"
+ PROMPT_CONTEXT_SHAPE = (1, 512, 4096)
+ PROMPT_CONTEXT_SOURCE_REPO = "Wan-AI/Wan2.1-T2V-1.3B"
+ PROMPT_CONTEXT_SOURCE_REVISION = "3f40b6dc4ca5c02dd23c9db74d9d2ccb82903b86"
+-POSE_FEATURE_SHAPE = (3072, 31, 40, 22)
+-POSE_ENCODER_BATCH_LIMIT = 6
++# ARES: the release's (3072, 31, 40, 22) is the 121-frame window at 1280x704: 31 latent frames
++# ((n - 1) / 4 + 1) and the raster over the VAE's factor 32 in height and width.
++POSE_FEATURE_SHAPE = (3072, (INFERENCE.num_frames - 1) // 4 + 1, INFERENCE.height // 32, INFERENCE.width // 32)
++# ARES: settable so an 11 GB card can encode fewer full-resolution skeleton videos at once
++# (each is 121 x 1280 x 704 x 3 in bf16, about 650 MiB, and the convolutions need as much again).
++POSE_ENCODER_BATCH_LIMIT = int(os.environ.get("FDANYONE_POSE_BATCH", "6"))
+ 
+ 
+ def load_prompt_context(path: str | Path):
+@@ -241,8 +246,10 @@ def _encode_pose_batch(pose_encoder, videos):
+ 
+     import torch
+ 
+-    with torch.inference_mode(), torch.autocast(device_type="cuda", dtype=torch.bfloat16):
+-        encoded = pose_encoder(videos)
++    from fdanyone import precision
++
++    with torch.inference_mode(), precision.autocast(precision.dit_dtype()):
++        encoded = pose_encoder(videos).to(torch.bfloat16)
+     expected = (videos.shape[0], *POSE_FEATURE_SHAPE)
+     if tuple(encoded.shape) != expected or encoded.dtype != torch.bfloat16:
+         raise FourDAnyoneError(
+diff --git a/fdanyone/model/inference.py b/fdanyone/model/inference.py
+index 07c9398..361b980 100644
+--- a/fdanyone/model/inference.py
++++ b/fdanyone/model/inference.py
+@@ -115,11 +115,11 @@ def _denoiser_on_device(denoiser: Denoiser, device: str) -> Iterator[None]:
+ 
+ 
+ def _bf16_autocast():
+-    """Match Lightning's ``bf16-mixed`` inference context without Lightning."""
++    """Match Lightning's ``bf16-mixed`` inference context without Lightning (dtype: precision.py)."""
+ 
+-    import torch
++    from fdanyone import precision
+ 
+-    return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
++    return precision.autocast(precision.dit_dtype())
+ 
+ 
+ def _channels_last_source_layout(video):
+@@ -150,8 +150,10 @@ def _noise(
+         INFERENCE.width // vae.upsampling_factor,
+     )
+     generator = torch.Generator("cpu").manual_seed(seed)
++    from fdanyone import precision
++
+     return torch.randn(shape, generator=generator, device="cpu", dtype=torch.float32).to(
+-        dtype=torch.bfloat16, device=device
++        dtype=precision.dit_dtype(), device=device
+     )
+ 
+ 
+diff --git a/fdanyone/model/loader.py b/fdanyone/model/loader.py
+index ecb2758..06cc4d7 100644
+--- a/fdanyone/model/loader.py
++++ b/fdanyone/model/loader.py
+@@ -31,6 +31,25 @@ class Denoiser:
+     def prepare_on_device(self, device: str | torch.device) -> None:
+         """Move the DiT to a device and apply its configured Turbo delta once."""
+ 
++        from fdanyone import precision
++
++        secondary = precision.split_device()
++        if secondary is not None:
++            # Place the halves block by block so neither card ever holds the whole DiT, then fuse
++            # the Turbo delta in place: each weight merges on the card that holds it.
++            half = precision.split_at(len(self.model.blocks))
++            for index, block in enumerate(self.model.blocks):
++                block.to(device=device if index < half else secondary, dtype=self.dtype)
++            for name, child in self.model.named_children():
++                if name != "blocks":
++                    child.to(device=device, dtype=self.dtype)
++            precision.split_dit(self.model, device, secondary)
++            if self.turbo_lora_path is not None and not self.turbo_lora_applied:
++                from fdanyone.model.turbo_lora import fuse_turbo_lora
++
++                fuse_turbo_lora(self.model, self.turbo_lora_path)
++                self.turbo_lora_applied = True
++            return
+         self.model.to(device=device, dtype=self.dtype)
+         if self.turbo_lora_path is not None and not self.turbo_lora_applied:
+             from fdanyone.model.turbo_lora import fuse_turbo_lora
+@@ -115,7 +134,9 @@ def load_pose_encoder(checkpoint_path: str | Path, device: str):
+         pose_encoder = PoseEncoder(out_dim=MODEL_DIM, in_channels=3)
+     _strict_assign(pose_encoder, state_dict, "4DAnyone pose encoder checkpoint")
+     del state_dict
+-    return pose_encoder.to(device=device, dtype=torch.bfloat16).eval().requires_grad_(False)
++    from fdanyone import precision
++
++    return pose_encoder.to(device=device, dtype=precision.dit_dtype()).eval().requires_grad_(False)
+ 
+ 
+ def _load_vae(path: Path, dtype):
+@@ -140,7 +161,9 @@ def load_vae(path: str | Path):
+ 
+     import torch
+ 
+-    return _load_vae(Path(path), torch.bfloat16)
++    from fdanyone import precision
++
++    return _load_vae(Path(path), precision.vae_dtype())
+ 
+ 
+ def load_denoiser(
+@@ -156,7 +179,9 @@ def load_denoiser(
+ 
+     from fdanyone.vendor.diffsynth.schedulers.flow_match import FlowMatchScheduler
+ 
+-    dtype = torch.bfloat16
++    from fdanyone import precision
++
++    dtype = precision.dit_dtype()
+     checkpoint = Path(checkpoint_path).expanduser().resolve()
+     if not checkpoint.is_file():
+         raise AssetError(f"4DAnyone checkpoint does not exist: {checkpoint}")
+diff --git a/fdanyone/model/turbo_lora.py b/fdanyone/model/turbo_lora.py
+index 8e0c1ca..f5d445a 100644
+--- a/fdanyone/model/turbo_lora.py
++++ b/fdanyone/model/turbo_lora.py
+@@ -72,7 +72,7 @@ def _fuse_low_rank_delta(state_dict: Mapping[str, Tensor], adapter: Mapping[str,
+         )
+ 
+     merged = base.detach().to(dtype=torch.float32, copy=True)
+-    merged.addmm_(up.float(), down.float())
++    merged.addmm_(up.to(base.device).float(), down.to(base.device).float())
+     base.copy_(merged)
+ 
+ 
+@@ -96,7 +96,7 @@ def _fuse_direct_delta(state_dict: Mapping[str, Tensor], adapter: Mapping[str, T
+         )
+ 
+     merged = base.detach().to(dtype=torch.float32, copy=True)
+-    merged.add_(delta.float())
++    merged.add_(delta.to(base.device).float())
+     base.copy_(merged)
+ 
+ 
+@@ -121,10 +121,10 @@ def fuse_turbo_lora(model: nn.Module, adapter_path: str | Path) -> None:
+         import torch
+         from safetensors.torch import load_file
+ 
++        # ARES: the base tensors may sit on two cards (fdanyone/precision.py). The adapter is
++        # loaded once and each delta moves to the device of the tensor it merges into.
+         devices = {tensor.device for tensor in state_dict.values()}
+-        if len(devices) != 1:
+-            raise ValueError(f"Turbo base tensors must share one device, got {sorted(map(str, devices))}.")
+-        device = devices.pop()
++        device = devices.pop() if len(devices) == 1 else torch.device("cpu")
+         adapter = load_file(str(path), device=str(device))
+         adapter_dtypes = {tensor.dtype for tensor in adapter.values()}
+         if adapter_dtypes != {torch.float16}:
+diff --git a/fdanyone/model/vae.py b/fdanyone/model/vae.py
+index 4ff0c36..e80276b 100644
+--- a/fdanyone/model/vae.py
++++ b/fdanyone/model/vae.py
+@@ -28,10 +28,18 @@ LOGGER = logging.getLogger("fdanyone")
+ Output = TypeVar("Output")
+ 
+ 
++def _vae_dtype():
++    from fdanyone import precision
++
++    return precision.vae_dtype()
++
++
+ def _bf16_autocast():
+     import torch
+ 
+-    return torch.autocast(device_type="cuda", dtype=torch.bfloat16)
++    from fdanyone import precision
++
++    return precision.autocast(precision.vae_dtype())
+ 
+ 
+ def _rgb_frames(video: Tensor) -> tuple[np.ndarray, ...]:
+@@ -146,9 +154,9 @@ class VaeExecutor:
+         if INFERENCE.tiled_vae:
+             tile_size = tuple(size * model.upsampling_factor for size in INFERENCE.vae_tile_size)
+             tile_stride = tuple(stride * model.upsampling_factor for stride in INFERENCE.vae_tile_stride)
+-            batched = video.unsqueeze(0).to(dtype=torch.bfloat16, device="cpu")
++            batched = video.unsqueeze(0).to(dtype=_vae_dtype(), device="cpu")
+             return model.tiled_encode(batched, device, tile_size, tile_stride)
+-        batched = video.unsqueeze(0).to(dtype=torch.bfloat16, device=device)
++        batched = video.unsqueeze(0).to(dtype=_vae_dtype(), device=device)
+         return model.encode_view(batched)
+ 
+     @staticmethod
+@@ -156,14 +164,14 @@ class VaeExecutor:
+         import torch
+ 
+         if INFERENCE.tiled_vae:
+-            batched = latent.unsqueeze(0).to(dtype=torch.bfloat16, device="cpu")
++            batched = latent.unsqueeze(0).to(dtype=_vae_dtype(), device="cpu")
+             return model.tiled_decode(
+                 batched,
+                 device,
+                 INFERENCE.vae_tile_size,
+                 INFERENCE.vae_tile_stride,
+             )
+-        batched = latent.unsqueeze(0).to(dtype=torch.bfloat16, device=device)
++        batched = latent.unsqueeze(0).to(dtype=_vae_dtype(), device=device)
+         return model.decode_view(batched)
+ 
+     def encode(self, videos: Tensor) -> Tensor:
+diff --git a/fdanyone/motion/result.py b/fdanyone/motion/result.py
+index 85b2995..f3ba111 100644
+--- a/fdanyone/motion/result.py
++++ b/fdanyone/motion/result.py
+@@ -35,7 +35,10 @@ class MotionResult:
+     def num_frames(self) -> int:
+         return len(self.frame_timestamps_sec)
+ 
+-    def validate(self, expected_frames: int = 121) -> None:
++    def validate(self, expected_frames: int | None = None) -> None:
++        from fdanyone.config import INFERENCE
++
++        expected_frames = INFERENCE.num_frames if expected_frames is None else expected_frames
+         try:
+             import torch
+         except ImportError as exc:
+diff --git a/fdanyone/precision.py b/fdanyone/precision.py
+new file mode 100644
+index 0000000..25214da
+--- /dev/null
++++ b/fdanyone/precision.py
+@@ -0,0 +1,84 @@
++"""Compute dtypes and the second DiT device (ARES patch for GPUs without native bfloat16).
++
++Environment:
++  FDANYONE_DIT_DTYPE     bfloat16 (default) | float16 | float32: DiT and pose encoder weights and
++                         autocast. Turing (sm_75) has no bf16 tensor cores; float16 runs there.
++  FDANYONE_VAE_DTYPE     bfloat16 (default) | float16 | float32: Wan VAE weights and autocast.
++  FDANYONE_SPLIT_DEVICE  e.g. cuda:1: the second half of the DiT blocks lives there, so two
++                         11 GB cards hold the 5B DiT between them. Activations follow the blocks.
++CPU-side feature banks stay bfloat16 as the release stores them; they are cast on the way in.
++"""
++
++from __future__ import annotations
++
++import os
++
++_NAMES = ("bfloat16", "float16", "float32")
++
++
++def _dtype(variable: str):
++    import torch
++
++    name = os.environ.get(variable, "bfloat16").strip().lower()
++    if name not in _NAMES:
++        raise ValueError(f"{variable}={name!r}; expected one of {', '.join(_NAMES)}")
++    return getattr(torch, name)
++
++
++def dit_dtype():
++    return _dtype("FDANYONE_DIT_DTYPE")
++
++
++def vae_dtype():
++    return _dtype("FDANYONE_VAE_DTYPE")
++
++
++def autocast(dtype):
++    import torch
++
++    return torch.autocast(device_type="cuda", dtype=dtype, enabled=dtype != torch.float32)
++
++
++def split_at(blocks: int) -> int:
++    """Index of the first block on the second device. Fewer blocks on the first card leaves it
++    room for the activations, which are the same size on both."""
++    value = os.environ.get("FDANYONE_SPLIT_AT", "").strip()
++    return max(1, min(blocks - 1, int(value))) if value else blocks // 2
++
++
++def split_device() -> str | None:
++    value = os.environ.get("FDANYONE_SPLIT_DEVICE", "").strip()
++    return value or None
++
++
++def _to_device(value, device):
++    import torch
++
++    if isinstance(value, torch.Tensor):
++        return value.to(device, non_blocking=True)
++    if isinstance(value, tuple):
++        return tuple(_to_device(v, device) for v in value)
++    if isinstance(value, list):
++        return [_to_device(v, device) for v in value]
++    return value
++
++
++def _follow_hook(module, args, kwargs):
++    """Forward pre-hook: move every tensor argument to the module's own device."""
++
++    device = next(module.parameters()).device
++    return _to_device(args, device), _to_device(kwargs, device)
++
++
++def split_dit(model, primary, secondary: str) -> None:
++    """Place blocks[len/2:] on `secondary`; everything else stays on `primary`. Idempotent."""
++
++    blocks = model.blocks
++    half = split_at(len(blocks))
++    for block in blocks[half:]:
++        block.to(secondary)
++    if not getattr(model, "_ares_split_hooks", False):
++        for block in blocks:
++            block.register_forward_pre_hook(_follow_hook, with_kwargs=True)
++        model.head.register_forward_pre_hook(_follow_hook, with_kwargs=True)
++        model._ares_split_hooks = True
+diff --git a/fdanyone/vendor/diffsynth/models/wan_video_dit.py b/fdanyone/vendor/diffsynth/models/wan_video_dit.py
+index dba175b..cabdc77 100644
+--- a/fdanyone/vendor/diffsynth/models/wan_video_dit.py
++++ b/fdanyone/vendor/diffsynth/models/wan_video_dit.py
+@@ -10,6 +10,7 @@ runtime.
+ from __future__ import annotations
+ 
+ import math
++import os
+ 
+ import torch
+ import torch.nn as nn
+@@ -46,15 +47,17 @@ NORM_EPSILON = 1e-6
+ # A converted FP64 chunk and its complex product coexist. Accounting for both
+ # gives the same one-view production chunk as the original 768 MiB
+ # single-allocation limit, while naming the actual temporary budget.
+-ROPE_TEMPORARY_BUDGET_BYTES = 1536 * 1024**2
++# ARES: the release sizes these chunk budgets for a 24 GB card; on 11 GB they are the peak.
++_TEMP_BUDGET_MIB = int(os.environ.get("FDANYONE_TEMP_BUDGET_MB", "1536"))
++ROPE_TEMPORARY_BUDGET_BYTES = _TEMP_BUDGET_MIB * 1024**2
+ # RMSNorm keeps its FP32 input alive while materializing either the squared
+ # values or normalized result. Bound those two full-width temporaries without
+ # changing the reduction dimension or arithmetic used by the checkpoint.
+-RMS_NORM_FP32_TEMPORARY_BUDGET_BYTES = 1536 * 1024**2
++RMS_NORM_FP32_TEMPORARY_BUDGET_BYTES = _TEMP_BUDGET_MIB * 1024**2
+ # CUDA autocast keeps LayerNorm and the following modulation in FP32 until a
+ # linear consumes them as BF16. Bound the three coexisting FP32 tensors while
+ # preserving that final cast boundary.
+-NORM_MODULATION_FP32_TEMPORARY_BUDGET_BYTES = 1536 * 1024**2
++NORM_MODULATION_FP32_TEMPORARY_BUDGET_BYTES = _TEMP_BUDGET_MIB * 1024**2
+ 
+ 
+ def get_attention_backend(backend: str = "auto") -> str:
+@@ -301,6 +304,19 @@ class DiTBlock(nn.Module):
+         self.self_attn_mvs = SelfAttention(MODEL_DIM, NUM_HEADS, attention_backend=attention_backend)
+ 
+     def _feed_forward(self, x: torch.Tensor) -> torch.Tensor:
++        # ARES: the hidden tensor is FFN_DIM wide (14336), so on a full window it is the single
++        # biggest allocation in the block. Run it in token chunks bounded by the same budget as the
++        # other temporaries; the arithmetic per token is unchanged.
++        if not torch.is_grad_enabled() and x.ndim == 3:
++            tokens = x.shape[1]
++            per_token = FFN_DIM * torch.empty((), dtype=x.dtype).element_size() * x.shape[0]
++            chunk = max(1, min(tokens, int(ROPE_TEMPORARY_BUDGET_BYTES // max(1, per_token))))
++            if chunk < tokens:
++                output = torch.empty_like(x)
++                for start in range(0, tokens, chunk):
++                    piece = x[:, start:start + chunk]
++                    output[:, start:start + chunk] = self.ffn[2](gelu_tanh(self.ffn[0](piece)))
++                return output
+         hidden = self.ffn[0](x)
+         # ``x`` is the owned BF16 modulation result, not the block residual.
+         # Release it after the first projection so the allocator can reuse its
+diff --git a/fdanyone/video.py b/fdanyone/video.py
+index 69acd5e..9095bd4 100644
+--- a/fdanyone/video.py
++++ b/fdanyone/video.py
+@@ -283,7 +283,7 @@ def validate_clip_options(
+ def decode_canonical_clip(
+     video_path: str | Path,
+     *,
+-    num_frames: int = 121,
++    num_frames: int = INFERENCE.num_frames,
+     start_time: float = 0.0,
+     fps: str | int | float | Fraction | None = None,
+ ) -> CanonicalClip:
