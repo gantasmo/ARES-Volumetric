@@ -19,6 +19,8 @@
  *               [--no-audio] [--audio file] [--audio-offset s] [--audio-bitrate kbps] [--smooth-temporal N]
  *               [--up-axis x|y|z] [--center bottom|mass|none] [--scale N] [--rotate x,y,z] [--translate x,y,z]
  *               [--meta-extra-file f.json]
+ *               [--volumetric [--no-detail] [--fit-smooth 8] [--anchor-smooth 0]]   metric shell + SAM 3D Body
+ *               completion from a volumetric run (mask, metric, normals, body, intrinsics); see volumetric.ts
  *   ares export <file.ares> -o <out> [--frame N]      (.obj/.ply for meshes; .spz/.ply/.glb/.splat for splats)
  *   ares info   <file.ares>
  *   ares verify-edits <file.edits.json>               (mask2d/keyframe pre-flight, exit 1 on any issue)
@@ -57,7 +59,14 @@ import { muxClip, muxClipWithStats, type MuxClip } from "./muxer.js";
 import { synthClip, synthSplatClip } from "./synth.js";
 import { proceduralAtlas } from "./png.js";
 import { encodeTextureVideo, detectPattern, ffmpegAvailable, ffmpegPath, type TexCodec, type TextureGop } from "./texture-video.js";
-import { openDepthRun, type DepthRunMeta } from "./depth-io.js";
+import { openDepthRun, type DepthRunMeta, type DepthRunReader } from "./depth-io.js";
+import { evalTileField, type Intrinsics } from "./depth-metric.js";
+import { outwardSign, bakeBackAtlas } from "./depth-body.js";
+import {
+  BodyTrack, SubjectPass, DetailTrack, FrameStatsSum, cropIntrinsics, fovOf, fitPass, anchorPass, chooseNormalAxis, spreadFrames,
+  backAtlasUvs, composeBackAtlas, scaleBody, assembleVolumetricFrame, focalScales, median as medianOf,
+  VOLUMETRIC_METHOD, VOLUMETRIC_SMOOTH_RADIUS, ANCHOR_SMOOTH_RADIUS, VOTE_FRAMES, SUBJECT_DILATE, BODY_WINDOW, BODY_SIGMA,
+} from "./volumetric.js";
 import { stabilizeDepthStream, RgbMotionGate } from "./depth-stabilize.js";
 import { buildDepthGrid, resampleMap, depthFrameToMesh, gridDepths, fillLayerToMesh, mergeMeshes, reliefDiscard, DepthHistogram, cutEdgeCount } from "./depth-mesh.js";
 import { resizeRgbArea, resampleMask, guidedResample, buildFillLayer, composeLayeredAtlas, snapRamps, FILL_MIN_JUMP } from "./depth-layers.js";
@@ -102,7 +111,7 @@ async function writeClipMeta(a: string[], outPath: string, base: Record<string, 
   }
   const meta = { schema: "ares-clip-meta/1", createdAt: new Date().toISOString(), ...base, ...extra };
   await writeFile(outPath + ".meta.json", JSON.stringify(meta, null, 2) + "\n");
-  console.log(`[ares] wrote ${outPath}.meta.json — provenance (${Object.keys(meta).length} sections)`);
+  console.log(`[ares] wrote ${outPath}.meta.json: provenance (${Object.keys(meta).length} sections)`);
 }
 
 function atlasOf() {
@@ -1087,9 +1096,10 @@ function mapCrop(crop: CropRect, runW: number, runH: number, srcW: number, srcH:
  * The RGB motion gate for every frame of the run, streamed: one decode at the (cropped) maps' own
  * W x H, two frames resident, the gate written to `store`. Returns false when the video yielded
  * fewer frames than the run holds, in which case the stabilizer derives its gate from the depth
- * change instead.
+ * change instead. `onFrame`, when given, sees every decoded frame (t, rgb24 at w x h) after the gate.
  */
-async function rgbMotionToStore(video: string, meta: DepthRunMeta, frameCount: number, w: number, h: number, store: FrameStore<Uint8Array>, crop: CropRect | null): Promise<boolean> {
+async function rgbMotionToStore(video: string, meta: DepthRunMeta, frameCount: number, w: number, h: number, store: FrameStore<Uint8Array>, crop: CropRect | null,
+  onFrame?: (t: number, rgb: Uint8Array) => void): Promise<boolean> {
   const reader = openRawFrames(sampledRgbArgs(video, meta, frameCount, w, h, "area", crop), w * h * 3);
   const gate = new RgbMotionGate(w, h);
   const out = new Uint8Array(w * h);
@@ -1101,6 +1111,7 @@ async function rgbMotionToStore(video: string, meta: DepthRunMeta, frameCount: n
       for (const f of batch) {
         if (t >= frameCount) break;
         gate.next(f, 0, out);
+        if (onFrame) onFrame(t, f);
         store.write(t++, out);
       }
       progress("rgb", Math.min(t, frameCount), frameCount);
@@ -1190,6 +1201,21 @@ async function depth(a: string[]) {
     const guideSigma = numFlag(a, "--guide-sigma", 14, { min: 0.5, max: 255 });
     const inpaint = has(a, "--inpaint");
     const band = numFlag(a, "--inpaint-band", Math.max(4, Math.round(gridW * 0.16)), { min: 1, max: 4096, int: true });
+    // --volumetric: the metric shell plus the SAM 3D Body completion (volumetric.ts). It replaces the
+    // relief grid, so the flags that shape that grid have nothing to act on.
+    const volumetric = has(a, "--volumetric");
+    if (volumetric) {
+      for (const f of ["--sheets", "--inpaint", "--decimate", "--snap-ramps"]) {
+        if (has(a, f)) throw new Error(`--volumetric: ${f} shapes the relief grid, which a volumetric clip does not have; got ${f}${f === "--decimate" ? ` ${flag(a, f)}` : ""}`);
+      }
+      const lacks = [!run.hasMask && "mask", !run.hasMetric && "metric", !run.hasBody && "body", !run.mapIntrinsics && "intrinsics"].filter(Boolean);
+      if (lacks.length) {
+        throw new Error(`--volumetric needs the run's mask, metric, body and intrinsics; ${join(runDir, "depth.json")} lacks ${lacks.join(", ")} ` +
+          `(the service writes them for a depth job with volumetric: true)`);
+      }
+      const ignored = ["--near", "--far", "--edge", "--no-guided", "--guide-sigma", "--inpaint-band"].filter((f) => has(a, f));
+      if (ignored.length) console.log(`[ares] volumetric: ${ignored.join(", ")} apply to the relief path only; ignored`);
+    }
 
     const texSize = numFlag(a, "--tex-size", 1024, { min: 16, max: 8192, int: true });
     if (texSize % 4) throw new Error(`--tex-size: ${texSize} is not a multiple of 4; 4:2:0 video and the fill plate need it`);
@@ -1255,14 +1281,20 @@ async function depth(a: string[]) {
     if (bigClip) console.log(`[ares] long clip: working set on disk in ${scratch} (${((frames * P * 9) / 1073741824).toFixed(1)} GB)`);
 
     // ---- pass A: RGB motion gate over the SAME sampled frames the depth engine consumed ----------
+    // A volumetric encode also restricts the subject mask to the body and gathers the body's colours
+    // here, from the same map-size RGB (prepareVolumetric).
+    const tA = performance.now();
+    const vol = volumetric ? prepareVolumetric({ a, run, frames, runW, runH, W, H, mapBox, cutMap, makeU8, fov }) : null;
     let motion: FrameStore<Uint8Array> | null = null;
     if (haveFfmpeg) {
       const m = makeU8("motion");
       // Optional by design: a video ffmpeg cannot open still yields a clip from the depth alone.
-      try { if (await rgbMotionToStore(video, meta, frames, W, H, m, crop)) motion = m; }
+      try { if (await rgbMotionToStore(video, meta, frames, W, H, m, crop, vol ? vol.hook : undefined)) motion = m; }
       catch (e) { console.warn(`[ares] depth: could not decode ${basename(video)} for the motion gate (${(e as Error).message}) — falling back to the depth change`); }
       if (!motion) m.close();
     } else progress("rgb", 0, frames);
+    if (vol) vol.finishPassA();
+    const passAs = (performance.now() - tA) / 1000;
 
     // ---- pass B: stabilize ------------------------------------------------------------------------
     const ts = performance.now();
@@ -1284,6 +1316,17 @@ async function depth(a: string[]) {
       console.warn(`[ares] stabilize: ${st.clamped} of ${st.aligned} frame fits hit the [0.5, 2] scale clamp; depth may drift across the clip. A temporally consistent engine (video-small, video-large) does not need the fit.`);
     }
     if (motion) motion.close();
+
+    if (vol) {
+      await depthVolumetricTail({
+        a, video, out, runDir, run, frames, W, H, runW, runH, mapBox, crop, cropFrom, cutMap, haveFfmpeg, scratch,
+        vol, stab, strength, median, gop, smoothTemporal, noTexture, noAudio, texSize, codec: codecRaw as TexCodec, crf,
+        gridW: flag(a, "--grid") !== undefined ? gridW : W,
+        times: { passA: passAs, stabilize: (performance.now() - ts) / 1000 },
+        setWriter: (w) => { writer = w; },
+      });
+      return;
+    }
 
     // ---- grid, atlas layout -----------------------------------------------------------------------
     const aspect = srcW / srcH;
@@ -1510,6 +1553,400 @@ async function depth(a: string[]) {
   }
 }
 
+/* ================== `ares depth --volumetric`: metric shell + SAM 3D Body completion ================== */
+
+type CutMap = <T extends Float32Array | Uint8Array>(from: T, to: T) => T;
+
+/** What pass A sets up for a volumetric encode, and what the later passes read from it. */
+interface VolumetricPrep {
+  /** Intrinsics in pixels of the (cropped) maps. */
+  K: Intrinsics;
+  intrinsicsFrom: string;
+  /** The body's z multiplier (1 unless --fov replaced the run's focal). */
+  zScale: number;
+  faces: Uint32Array;
+  vertexCount: number;
+  sign: 1 | -1;
+  bodyValid: Uint8Array;
+  bodyValidFrames: number;
+  track: BodyTrack;
+  /** The subject mask restricted to the body footprint, 0/255, W x H per frame. */
+  subject: FrameStore<Uint8Array>;
+  sp: SubjectPass;
+  /** Pass A's per-frame work; `rgb` is the frame at map size, or null when it was not decoded. */
+  hook: (t: number, rgb: Uint8Array | null) => void;
+  /** Runs the hook without RGB on every frame the decode did not deliver, then logs pass A. */
+  finishPassA: () => void;
+  /** Filled by finishPassA. */
+  coverage: { before: number; after: number; dilatePx: number; framesWithoutRgb: number } | null;
+}
+
+function prepareVolumetric(o: {
+  a: string[]; run: DepthRunReader; frames: number; runW: number; runH: number; W: number; H: number;
+  mapBox: { x: number; y: number; w: number; h: number }; cutMap: CutMap; makeU8: (name: string) => FrameStore<Uint8Array>; fov: number;
+}): VolumetricPrep {
+  const { a, run, frames, runW, runH, W, H } = o;
+  const meta = run.meta;
+  const norm = meta.intrinsics!;
+  // The run's intrinsics are normalized to the full frame; after a letterbox crop the focal in map
+  // pixels is unchanged and the principal point moves by the crop's origin.
+  let K = cropIntrinsics(norm, runW, runH, o.mapBox);
+  let zScale = 1, from = norm.source ?? "run";
+  if (flag(a, "--fov") !== undefined) {
+    // --fov replaces the focal. The body was fitted with the run's focal, so its z is scaled by the
+    // focal ratio: every vertex then projects onto the pixel it projected onto before.
+    const before = fovOf(K, W, H).fovY;
+    const fy = H / 2 / Math.tan((o.fov * Math.PI) / 360);
+    zScale = fy / K.fy;
+    K = { fx: K.fx * zScale, fy, cx: K.cx, cy: K.cy };
+    from = "--fov";
+    console.log(`[ares] volumetric: --fov ${o.fov} replaces the run's fovY ${before.toFixed(2)}deg; body z scaled by ${zScale.toFixed(4)} to keep its projection`);
+  }
+  const fv = fovOf(K, W, H);
+  console.log(`[ares] volumetric: intrinsics fx ${K.fx.toFixed(2)} fy ${K.fy.toFixed(2)} cx ${K.cx.toFixed(2)} cy ${K.cy.toFixed(2)} (${W}x${H} map pixels), ` +
+    `fovY ${fv.fovY.toFixed(2)}deg fovX ${fv.fovX.toFixed(2)}deg, source ${from}`);
+  const vertexCount = meta.body!.vertices;
+  const faces = run.bodyFaces();
+  const bodyValid = run.bodyValid();
+  let bodyValidFrames = 0;
+  for (let t = 0; t < frames; t++) bodyValidFrames += bodyValid[t] ? 1 : 0;
+  const track = new BodyTrack((t, out) => run.readBody(t, 1, out), frames, vertexCount, zScale);
+  let first = 0;
+  while (first < frames - 1 && !bodyValid[first]) first++;
+  const sign = outwardSign(track.raw(first), faces);
+  const subject = o.makeU8("subject");
+  const radius = Math.max(1, Math.round(SUBJECT_DILATE * W));
+  const sp = new SubjectPass(W, H, K, faces, vertexCount, sign, radius);
+  const P = W * H;
+  const maskFull = new Uint8Array(runW * runH), maskCrop = new Uint8Array(P), restricted = new Uint8Array(P);
+  const seen = new Uint8Array(frames);
+  const prep: VolumetricPrep = {
+    K, intrinsicsFrom: from, zScale, faces, vertexCount, sign, bodyValid, bodyValidFrames, track, subject, sp, coverage: null,
+    hook: (t, rgb) => {
+      if (t < 0 || t >= frames || seen[t]) return;
+      run.readMask(t, 1, maskFull);
+      o.cutMap(maskFull, maskCrop);
+      sp.frame(track.raw(t), bodyValid[t] === 1, maskCrop, rgb, restricted);
+      subject.write(t, restricted);
+      seen[t] = 1;
+    },
+    finishPassA: () => {
+      let late = 0;
+      for (let t = 0; t < frames; t++) if (!seen[t]) { prep.hook(t, null); late++; }
+      const denom = Math.max(1, frames * P);
+      prep.coverage = { before: sp.maskPixels / denom, after: sp.keptPixels / denom, dilatePx: radius, framesWithoutRgb: late };
+      console.log(`[ares] subject: mask coverage ${(100 * prep.coverage.before).toFixed(3)}% -> ${(100 * prep.coverage.after).toFixed(3)}% of the map ` +
+        `inside the body footprint dilated ${radius} px; body fitted on ${bodyValidFrames}/${frames} frames, outward sign ${sign > 0 ? "+1" : "-1"}; ` +
+        `colour from ${sp.colourFrames} frame(s), ${(sp.visibleSum / Math.max(1, sp.colourFrames)).toFixed(0)} visible vertices/frame` +
+        `${late ? `, ${late} frame(s) without RGB` : ""}`);
+    },
+  };
+  return prep;
+}
+
+/** The picture's rows of one full run normal frame (runW x runH x 3) into `to` (W x H x 3). */
+function cutNormals(from: Int8Array, to: Int8Array, runW: number, box: { x: number; y: number; w: number; h: number }): void {
+  if (box.x === 0 && box.y === 0 && box.w === runW) { to.set(from.subarray(0, box.w * box.h * 3)); return; }
+  for (let y = 0; y < box.h; y++) { const s = ((box.y + y) * runW + box.x) * 3; to.set(from.subarray(s, s + box.w * 3), y * box.w * 3); }
+}
+
+/**
+ * Passes F, C and finish of a volumetric encode (pass A and the stabilizer ran in depth()):
+ *   fit     per frame fitTileField(stabilized d, metric, restricted mask), smoothTileFields +-8
+ *   anchor  per frame anchorScale of the window-averaged body against the fitted shell, smoothSeries +-8
+ *   C       per GOP: detail (normal-map residual, median of three frames), shell + carved body + backing
+ *           in ARES space, atlas = frame region + the body's back region, one closed texture GOP
+ *   finish  no relief.camera / relief.forward (the player frames the clip as an ordinary turntable);
+ *           the capture camera goes under volumetric.* keys, every measured figure into the sidecar
+ */
+async function depthVolumetricTail(c: {
+  a: string[]; video: string; out: string; runDir: string; run: DepthRunReader; frames: number; W: number; H: number;
+  runW: number; runH: number; mapBox: { x: number; y: number; w: number; h: number }; crop: CropRect | null; cropFrom: string;
+  cutMap: CutMap; haveFfmpeg: boolean; scratch: string; vol: VolumetricPrep; stab: ReturnType<typeof stabilizeDepthStream>;
+  strength: number; median: number; gop: number; smoothTemporal: number; noTexture: boolean; noAudio: boolean;
+  texSize: number; codec: TexCodec; crf: number; gridW: number; times: { passA: number; stabilize: number };
+  setWriter: (w: MeshClipWriter | null) => void;
+}): Promise<void> {
+  const { a, video, out, runDir, run, W, H, runW, runH, vol, stab, gop } = c;
+  const meta = run.meta;
+  let frames = c.frames;
+  const fps = meta.fps;
+  const P = W * H, runP = runW * runH;
+  const { K, faces, sign } = vol;
+  const times: Record<string, number> = { passA: +c.times.passA.toFixed(2), stabilize: +c.times.stabilize.toFixed(2) };
+  const gridW = c.gridW, gridH = c.gridW === W ? H : Math.max(2, Math.round((c.gridW * H) / W));
+
+  const metricFull = new Float32Array(runP);
+  const readEst = (t: number, o: Float32Array) => stab.out.read(t, o);
+  const readMask = (t: number, o: Uint8Array) => vol.subject.read(t, o);
+  // MoGe-2's z of frame t belongs to that frame's own focal; every consumer here uses the clip's.
+  // focalScales carries each frame onto the clip focal (the reason and the measurement are there).
+  const zFocal = focalScales(meta.intrinsics!.fy, run.perFrameIntrinsics(), c.frames);
+  const focalStats = { factorMin: Infinity, factorP50: medianOf(zFocal), factorMax: -Infinity, framesAtOne: 0 };
+  for (const v of zFocal) {
+    if (v < focalStats.factorMin) focalStats.factorMin = v;
+    if (v > focalStats.factorMax) focalStats.factorMax = v;
+    if (v === 1) focalStats.framesAtOne++;
+  }
+  console.log(`[ares] volumetric: metric z on the clip focal (normalized fy ${meta.intrinsics!.fy.toFixed(4)}), per-frame factor ` +
+    `${focalStats.factorMin.toFixed(4)}..${focalStats.factorMax.toFixed(4)}, p50 ${focalStats.factorP50.toFixed(4)}` +
+    `${focalStats.framesAtOne ? `, ${focalStats.framesAtOne} frame(s) at 1` : ""}`);
+  const readMetric = (t: number, o: Float32Array) => {
+    run.readMetric(t, 1, metricFull); c.cutMap(metricFull, o);
+    const s = zFocal[t]!;
+    if (s !== 1) for (let i = 0; i < P; i++) o[i]! *= s;
+  };
+  const useNormals = run.hasNormals && !has(a, "--no-detail");
+  const normalsFull = useNormals ? new Int8Array(runP * 3) : null;
+  const readNormals = normalsFull ? (t: number, o: Int8Array) => { run.readNormals(t, 1, normalsFull); cutNormals(normalsFull, o, runW, c.mapBox); } : null;
+
+  // ---- pass F: metric fit ---------------------------------------------------------------------------
+  let tp = performance.now();
+  const fitSmooth = numFlag(a, "--fit-smooth", VOLUMETRIC_SMOOTH_RADIUS, { min: 0, max: 1000, int: true });
+  const anchorSmooth = numFlag(a, "--anchor-smooth", ANCHOR_SMOOTH_RADIUS, { min: 0, max: 1000, int: true });
+  const fit = fitPass(frames, W, H, (t, e, m, k) => { readEst(t, e); readMetric(t, m); readMask(t, k); }, fitSmooth, (i, n) => progress("fit", i, n));
+  const fs = fit.stats;
+  times.fit = +((performance.now() - tp) / 1000).toFixed(2);
+  console.log(`[ares] fit: ${fs.fitted}/${frames} frame(s) fitted (${fs.linear} linear, ${fs.disparity} disparity; clip model ${fs.kind}), ${fs.noFit} without a fit, ` +
+    `medres p50 over every sample: global ${(fs.medresGlobalP50 * 1000).toFixed(1)} mm, tiled ${(fs.medresTiledP50 * 1000).toFixed(1)} mm ` +
+    `(global over its inliers ${(fs.medresInliersP50 * 1000).toFixed(1)} mm), ${fs.samplesP50.toFixed(0)} samples/frame, ` +
+    `tile ${fs.tile} px (${fs.tiles[0]}x${fs.tiles[1]}), fields smoothed over +-${fitSmooth} frames in ${times.fit}s`);
+
+  // ---- pass F: body anchor --------------------------------------------------------------------------
+  tp = performance.now();
+  const anc = anchorPass({
+    frames, W, H, K, fields: fit.fields, faces, body: vol.track, bodyValid: vol.bodyValid,
+    read: (t, e, m) => { readEst(t, e); readMask(t, m); }, readMetric, radius: anchorSmooth, onProgress: (i, n) => progress("anchor", i, n),
+  });
+  const as = anc.stats;
+  times.anchor = +((performance.now() - tp) / 1000).toFixed(2);
+  const mm = (v: number) => (v * 1000).toFixed(1);
+  console.log(`[ares] anchor: ${as.anchored}/${frames} frame(s), scale p50 ${as.scaleP50.toFixed(4)} (${as.scaleMin.toFixed(4)}..${as.scaleMax.toFixed(4)}), ` +
+    `mad p50 ${mm(as.madP50)} mm over ${as.sharedP50.toFixed(0)} shared pixels, +-2 median then Gaussian +-${anchorSmooth}: body front to shell p50 ${mm(as.frontOffsetP50)} mm, ` +
+    `max ${mm(as.frontOffsetMax)} mm, in ${times.anchor}s`);
+  console.log(`[ares] temporal: subject median depth step p50 ${mm(fs.metricStepP50)} mm in the metric target, ${mm(as.shellStepP50)} mm in the fitted shell; ` +
+    `shell to per-frame target p50 ${mm(as.shellVsMetricP50)} mm`);
+
+  // ---- normal axis vote, once per clip ------------------------------------------------------------
+  let axis: ReturnType<typeof chooseNormalAxis> | null = null;
+  if (readNormals) {
+    const est = new Float32Array(P), mk = new Uint8Array(P), zb = new Float32Array(P), nb = new Int8Array(P * 3);
+    axis = chooseNormalAxis(spreadFrames(frames, VOTE_FRAMES), W, H, K, (t) => {
+      readEst(t, est); readMask(t, mk); evalTileField(fit.fields[t]!, est, mk, zb); readNormals(t, nb);
+      return { zb, normals: nb };
+    });
+    console.log(`[ares] normals: axis vote ${axis.asStored.toFixed(3)} as stored, ${axis.flipped.toFixed(3)} y flipped, over frames ${axis.frames.join(",")}: y ${axis.flipY ? "flipped" : "as stored"}`);
+  } else {
+    console.log(`[ares] normals: ${run.hasNormals ? "--no-detail" : "the run has no normals"}; normal detail skipped`);
+  }
+  const detail = new DetailTrack({ frames, W, H, K, flipY: axis?.flipY ?? false, fields: fit.fields, readEst, readMask, readNormals });
+
+  // ---- the body's back region ------------------------------------------------------------------------
+  const colours = vol.sp.acc.finalize();
+  const texW = c.texSize, texH = c.texSize;
+  const bake = bakeBackAtlas(faces, colours.colors, texW);
+  const atlasH = texH + bake.height;
+  if (atlasH > 65535) throw new Error(`--tex-size ${c.texSize}: the atlas would be ${texW}x${atlasH}, past the 65535 limit of the format`);
+  const backUv = backAtlasUvs(bake.uvs, texW, texH, atlasH);
+  const frameUv = { vScale: texH / atlasH, vOffset: 0 };
+  console.log(`[ares] back texture: ${colours.observed}/${vol.vertexCount} vertices observed, ${colours.filled} filled from 1-rings, ` +
+    `${vol.vertexCount - colours.observed - colours.filled} set to the mean; region ${texW}x${bake.height} under the ${texW}x${texH} frame (atlas ${texW}x${atlasH})`);
+
+  // ---- audio ----------------------------------------------------------------------------------------
+  let audio: AudioTrackData | null = null;
+  let audioSource: string | null = null;
+  if (!c.noAudio) {
+    if (flag(a, "--audio")) { audio = await audioFromFlags(a, fps, 0, frames); audioSource = flag(a, "--audio")!; }
+    else if (c.haveFfmpeg && (await videoHasAudio(video))) { audio = await audioFromFlags([...a, "--audio", video], fps, 0, frames); audioSource = video; }
+    else if (c.haveFfmpeg) console.log(`[ares] audio: ${basename(video)} has no audio stream; none muxed`);
+  }
+
+  // ---- pass C: GOP by GOP ----------------------------------------------------------------------------
+  const modelXf: ModelTransform = parseModelTransform(a) ?? { upAxis: "y", center: "bottom", rotate: [0, 0, 0], translate: [0, 0, 0], scale: 1 };
+  const bounds: Aabb = { min: [Infinity, Infinity, Infinity], max: [-Infinity, -Infinity, -Infinity] };
+  const wantTexture = !c.noTexture && c.haveFfmpeg;
+  if (!c.noTexture && !c.haveFfmpeg) console.warn("[ares] no texture: ffmpeg is not available to the encoder. Geometry-only.");
+  const texReader = wantTexture ? openRawFrames(sampledRgbArgs(video, meta, frames, texW, texH, "lanczos", c.crop), texW * texH * 3) : null;
+  if (wantTexture) console.log(`[ares] texture video: ${c.codec} ${texW}x${atlasH}, crf ${c.crf}, one closed GOP per ${gop} frames`);
+  console.log(`[ares] mesh: ${gridW}x${gridH} grid over the ${W}x${H} map${gridW === W ? " (map resolution)" : ""}, shell edge 0.05 m, detail ${readNormals ? "on" : "off"}`);
+  const writer = await MeshClipWriter.open({
+    out, fps, gopLength: gop, audio: audio ?? undefined,
+    textureVideo: wantTexture ? { fourcc: c.codec === "av1" ? "AV01" : "VP09", width: texW, height: atlasH } : undefined,
+    temporal: { forceIntra: true, smoothTemporal: c.smoothTemporal },
+  });
+  c.setWriter(writer);
+  tp = performance.now();
+  const sums = new FrameStatsSum();
+  const rmsList: number[] = [], itersList: number[] = [];
+  let texBytes = 0, done = 0, triSum = 0;
+  const maskBuf = new Uint8Array(P);
+  const inflight: { meshes: EncodeMeshFrame[]; tex: Promise<TextureGop> | null }[] = [];
+  const drain = async (keep: number) => {
+    while (inflight.length > keep) {
+      const g = inflight.shift()!;
+      const t = g.tex ? await g.tex : null;
+      if (t) texBytes += t.frames.reduce((s, f) => s + f.data.byteLength, 0);
+      writer.writeGop(g.meshes, t ? t.frames : null);
+      done += g.meshes.length;
+      progress("texture", done, frames);
+      progress("mux", done, frames);
+    }
+  };
+  try {
+    for (let t0 = 0; t0 < frames; t0 += gop) {
+      let n = Math.min(gop, frames - t0);
+      let texFrames: Uint8Array[] | null = null;
+      if (texReader) {
+        texFrames = await texReader.read(n);
+        if (texFrames.length < n) {
+          // Never let the two halves drift: frame i of the geometry must be frame i of the texture.
+          const have = t0 + texFrames.length;
+          if (have < 1) throw new Error(`the video decode produced no frames from ${video}`);
+          console.warn(`[ares] video frames (${have}) != depth frames (${frames}); truncating the clip to ${have}`);
+          n = texFrames.length; frames = have;
+          if (!n) break;
+        }
+      }
+      const meshes: EncodeMeshFrame[] = [];
+      const atlasFrames: Uint8Array[] = [];
+      for (let k = 0; k < n; k++) {
+        const t = t0 + k;
+        const d = detail.get(t);
+        if (d.detail) { rmsList.push(d.rms); itersList.push(d.iters); }
+        readMask(t, maskBuf);
+        const body = scaleBody(vol.track.smoothed(t), anc.scales[t]!);
+        const fr = assembleVolumetricFrame({ z: d.z, mask: maskBuf, W, H, K, gridW, gridH, body, faces, sign, backUv, frameUv });
+        sums.add(fr.stats);
+        const m = fr.mesh;
+        triSum += m.indices.length / 3;
+        const p = m.positions;
+        for (let i = 0; i < p.length; i += 3) for (let q = 0; q < 3; q++) {
+          const v = p[i + q]!;
+          if (v < bounds.min[q]!) bounds.min[q] = v;
+          if (v > bounds.max[q]!) bounds.max[q] = v;
+        }
+        applyTransform(m.positions, modelXf, [0, 0, 0]);
+        meshes.push(m);
+        if (wantTexture && texFrames) atlasFrames.push(composeBackAtlas(texFrames[k]!, texW, texH, bake.pixels, bake.height));
+      }
+      progress("mesh", t0 + n, frames);
+      const tex = wantTexture
+        ? encodeRawTextureGop({ frames: atlasFrames, width: texW, height: atlasH, fps, gopLength: gop, codec: c.codec, crf: c.crf, workDir: c.scratch, tag: t0 })
+        : null;
+      tex?.catch(() => { /* surfaced by the await in drain */ });
+      inflight.push({ meshes, tex });
+      await drain(3);
+    }
+    await drain(0);
+  } finally { texReader?.close(); }
+  progress("mesh", frames, frames);
+  times.passC = +((performance.now() - tp) / 1000).toFixed(2);
+  const mean = sums.mean();
+  console.log(`[ares] meshed ${frames} frame(s): ${Math.round(triSum / Math.max(1, frames))} tris/frame (shell ${mean.shellTris}, body ${mean.bodyTris}, backing ${mean.backingTris}); ` +
+    `carve per frame: ${mean.covered} covered, ${mean.flaps} flaps, ${mean.pushed} vertices pushed; ` +
+    `detail rms p50 ${rmsList.length ? medianOf(rmsList).toFixed(5) : "n/a"} (log depth), CG iterations p50 ${itersList.length ? medianOf(itersList).toFixed(0) : "n/a"} in ${times.passC}s`);
+  if (wantTexture) console.log(`[ares] texture video: ${(texBytes / 1048576).toFixed(2)} MB (${(texBytes / Math.max(1, frames) / 1024).toFixed(1)} KB/frame)`);
+
+  // ---- finish ---------------------------------------------------------------------------------------
+  tp = performance.now();
+  const offset = resolveOffset(bounds, modelXf);
+  {
+    const after = transformAabb(bounds, modelXf);
+    const lo = after.min.map((v, i) => v + offset[i]!), hi = after.max.map((v, i) => v + offset[i]!);
+    console.log(`[ares] transform: up=${modelXf.upAxis} center=${modelXf.center} scale=${modelXf.scale} rotate=[${modelXf.rotate}] translate=[${modelXf.translate}]`);
+    console.log(`[ares]   bounds ${bounds.min.map((v) => v.toFixed(2))}..${bounds.max.map((v) => v.toFixed(2))} -> ${lo.map((v) => v.toFixed(2))}..${hi.map((v) => v.toFixed(2))}`);
+  }
+  const fov = fovOf(K, W, H);
+  const fwd = applyTransform(new Float32Array([0, 0, -1]), modelXf, [0, 0, 0]);
+  const fl = Math.hypot(fwd[0]!, fwd[1]!, fwd[2]!) || 1;
+  // No relief.* keys: reliefFromMeta returns null without relief.camera and relief.forward, so the
+  // player frames the clip as an ordinary turntable. The capture camera is kept under keys it ignores.
+  const clipMeta: Record<string, string> = {
+    title: basename(video), encoder: "ares-cli/0.2.0", source: "depth",
+    "volumetric.method": VOLUMETRIC_METHOD,
+    "volumetric.camera": offset.map((v) => +v.toFixed(6)).join(","),
+    "volumetric.forward": [fwd[0]! / fl, fwd[1]! / fl, fwd[2]! / fl].map((v) => +v.toFixed(6)).join(","),
+    "volumetric.fov": String(+fov.fovY.toFixed(4)),
+  };
+  const r = writer.finish({ meta: clipMeta, translate: offset });
+  c.setWriter(null);
+  times.finish = +((performance.now() - tp) / 1000).toFixed(2);
+  const mode = r.temporalFrames && !r.intraFrames ? "temporal (I+P)" : r.temporalFrames ? "mixed I+P/intra" : "intra-only";
+  console.log(`[ares] geometry: ${mode}, ${r.temporalFrames} temporal + ${r.intraFrames} intra frames in ${r.chunks} chunk(s)`);
+  console.log(`[ares] volumetric: camera [${clipMeta["volumetric.camera"]}] looking [${clipMeta["volumetric.forward"]}], fovY ${clipMeta["volumetric.fov"]}deg, method ${VOLUMETRIC_METHOD}`);
+  console.log(`[ares] wrote ${out}: ${(r.sizeBytes / 1048576).toFixed(2)} MB, ${(r.sizeBytes / frames / 1024).toFixed(1)} KB/frame, laid out in ${times.finish}s`);
+  console.log(`[ares] pass times (s): A ${times.passA}, stabilize ${times.stabilize}, fit ${times.fit}, anchor ${times.anchor}, C ${times.passC}, finish ${times.finish}`);
+
+  // Counted over the frames written: a short texture decode truncates the clip below the run.
+  let bodyValidOut = 0;
+  for (let t = 0; t < frames; t++) bodyValidOut += vol.bodyValid[t] ? 1 : 0;
+  let srcBytes = 0;
+  try { srcBytes = (await stat(video)).size; } catch { /* the video may be gone by now */ }
+  const cov = vol.coverage!;
+  const bm = meta.body!;
+  await writeClipMeta(a, out, {
+    output: { name: basename(out), sizeBytes: r.sizeBytes, frames, fps, durationS: +(frames / fps).toFixed(2) },
+    source: { video, kind: "2d-video+depth-run", depthRun: runDir, videoBytes: srcBytes, fileCount: 1, sourceWidth: meta.sourceWidth, sourceHeight: meta.sourceHeight, sourceFps: meta.sourceFps, sourceFrames: meta.sourceFrames },
+    depth: {
+      engine: meta.engine, model: meta.model, modelKey: meta.modelKey, kind: meta.kind, temporal: meta.temporal ?? "none",
+      mapWidth: runW, mapHeight: runH, frames, sampling: meta.sampling, device: meta.device, dtype: meta.dtype,
+      crop: c.crop ? { source: [c.crop.w, c.crop.h, c.crop.x, c.crop.y], map: [c.mapBox.w, c.mapBox.h, c.mapBox.x, c.mapBox.y], from: c.cropFrom } : null,
+      stabilize: c.strength, median: c.strength > 0 ? c.median : 1,
+      mask: meta.mask ?? null,
+      normalization: { lo: stab.lo, hi: stab.hi, units: meta.kind === "metric-depth" ? "metres" : "disparity -> [0,1], 1 = nearest" },
+      gate: stab.stats.rgbGated ? "rgb" : "depth-derived",
+    },
+    volumetric: {
+      method: VOLUMETRIC_METHOD,
+      intrinsics: {
+        map: { fx: +K.fx.toFixed(4), fy: +K.fy.toFixed(4), cx: +K.cx.toFixed(4), cy: +K.cy.toFixed(4), width: W, height: H },
+        normalized: meta.intrinsics ?? null, fovY: +fov.fovY.toFixed(3), fovX: +fov.fovX.toFixed(3), from: vol.intrinsicsFrom, bodyZScale: vol.zScale,
+        metricFocal: { factorMin: +focalStats.factorMin.toFixed(5), factorP50: +focalStats.factorP50.toFixed(5), factorMax: +focalStats.factorMax.toFixed(5), framesAtOne: focalStats.framesAtOne },
+      },
+      grid: [gridW, gridH],
+      mask: { coverageBefore: +cov.before.toFixed(6), coverageAfter: +cov.after.toFixed(6), dilatePx: cov.dilatePx, framesWithoutRgb: cov.framesWithoutRgb },
+      fit: {
+        fitted: fs.fitted, noFit: fs.noFit, linear: fs.linear, disparity: fs.disparity, kind: fs.kind,
+        medresGlobalP50: +fs.medresGlobalP50.toFixed(5), medresTiledP50: +fs.medresTiledP50.toFixed(5),
+        medresInliersP50: +fs.medresInliersP50.toFixed(5), samplesP50: fs.samplesP50,
+        tile: fs.tile, tiles: fs.tiles, smoothRadius: fitSmooth, metric: meta.metric ?? null,
+        metricStepP50: +fs.metricStepP50.toFixed(5), shellStepP50: +as.shellStepP50.toFixed(5), shellVsMetricP50: +as.shellVsMetricP50.toFixed(5),
+      },
+      anchor: {
+        anchored: as.anchored, scaleP50: +as.scaleP50.toFixed(5), scaleMin: +as.scaleMin.toFixed(5), scaleMax: +as.scaleMax.toFixed(5),
+        madP50: +as.madP50.toFixed(5), sharedP50: as.sharedP50, medianRadius: 2, smoothRadius: anchorSmooth,
+        frontOffsetP50: +as.frontOffsetP50.toFixed(5), frontOffsetMax: +as.frontOffsetMax.toFixed(5),
+      },
+      detail: readNormals && axis ? {
+        vote: { asStored: +axis.asStored.toFixed(4), flipped: +axis.flipped.toFixed(4), frames: axis.frames, flipY: axis.flipY },
+        rmsP50: +medianOf(rmsList).toFixed(6), itersP50: medianOf(itersList), frames: rmsList.length, space: meta.normals?.space ?? null,
+      } : { skipped: run.hasNormals ? "--no-detail" : "no normals" },
+      body: {
+        engine: bm.engine ?? null, model: bm.model ?? null, inference: bm.inference ?? null, vertices: bm.vertices, faces: bm.faceCount,
+        validFrames: bodyValidOut, backfilled: frames - bodyValidOut, outwardSign: sign, window: BODY_WINDOW, sigma: BODY_SIGMA,
+        conventionIoU: bm.conventionIoU ?? null, iouMean: bm.iouMean ?? null, iouMin: bm.iouMin ?? null, workers: bm.workers ?? null,
+      },
+      back: {
+        observed: colours.observed, filled: colours.filled, mean: vol.vertexCount - colours.observed - colours.filled,
+        colourFrames: vol.sp.colourFrames, visiblePerFrame: +(vol.sp.visibleSum / Math.max(1, vol.sp.colourFrames)).toFixed(1),
+        region: [texW, bake.height], atlas: [texW, atlasH],
+      },
+      perFrame: { ...mean, trisPerFrame: Math.round(triSum / Math.max(1, frames)) },
+      times,
+    },
+    encode: {
+      gop, texSize: wantTexture ? c.texSize : null, atlas: wantTexture ? [texW, atlasH] : null, textureCodec: wantTexture ? c.codec : null, crf: wantTexture ? c.crf : null,
+      noTexture: c.noTexture, forceIntra: true, smoothTemporal: c.smoothTemporal,
+      quantBitsPos: 14, quantBitsUv: 16,
+      transform: modelXf,
+      audio: audio ? { source: basename(audioSource ?? video), bitrateKbps: numFlag(a, "--audio-bitrate", 96), offsetSec: numFlag(a, "--audio-offset", 0), packets: audio.packets.length } : null,
+    },
+    geometry: { mode, temporalFrames: r.temporalFrames, intraFrames: r.intraFrames, chunks: r.chunks, trisPerFrame: Math.round(triSum / Math.max(1, frames)) },
+    tooling: { encoder: "ares-cli/0.2.0", node: process.version, generatedBy: "ares depth --volumetric" },
+  });
+  await info(["info", out]);
+}
+
 /** Locate frame `idx` in a parsed file: its chunk, its block, and the keyframe block(s) leading to it. */
 function locateFrame(file: ReturnType<typeof Demuxer.parse>, idx: number) {
   for (const gop of file.gopIndex) {
@@ -1675,6 +2112,12 @@ const USAGE = `usage:
               audio:        on by default from the video's own stream; [--no-audio] [--audio file] [--audio-offset s] [--audio-bitrate kbps]
               also:         [--gop 30] [--smooth-temporal N] [--up-axis x|y|z] [--center bottom|mass|none]
                             [--scale N] [--rotate x,y,z] [--translate x,y,z] [--meta-extra-file f.json]
+              volumetric:   [--volumetric]                      (needs the run's mask, metric, body, intrinsics: the metric shell,
+                                                                 the SAM 3D Body behind it, its back texture from every frame)
+                            [--no-detail]                       (skip the normal-map detail; also when the run has no normals)
+                            [--fit-smooth 8] [--anchor-smooth 0] (frames: tile-field and anchor-scale smoothing radii)
+                            grid defaults to the map size, fov to the run's intrinsics; refuses --sheets, --inpaint,
+                            --decimate, --snap-ramps; --near, --far, --edge do not apply
   ares export <file.ares> -o <out> [--frame N]
               mesh → .obj | .ply      splat → .spz | .ply (3DGS) | .glb (KHR_gaussian_splatting) | .splat
   ares info   <file.ares>

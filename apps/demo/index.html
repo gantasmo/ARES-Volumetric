@@ -516,7 +516,7 @@
   .tool .lead { color: var(--text-dim); font-size: 13px; margin: 0 0 14px; }
   /* display:block is load-bearing: a label is inline by default, and an inline element with
      block children fragments its dashed border into stray segments. */
-  .drop { display: block; border: 1.5px dashed var(--border-st); border-radius: var(--r); padding: 12px 16px;
+  .drop { display: block; cursor: pointer; border: 1.5px dashed var(--border-st); border-radius: var(--r); padding: 12px 16px;
     text-align: center; background: var(--wash); transition: border-color .15s, background .15s; cursor: pointer; }
   .drop.over { border-color: var(--accent); background: var(--accent-dim); }
   .drop .big { font-size: 15px; color: var(--text); margin-bottom: 5px; }
@@ -1115,10 +1115,9 @@
   </div>
 </div>
 
-<!-- Convert tab — unified import: a frames folder (Microsoft volcap / PLY sequences / DepthKit
-     exports) analyses + converts; a single .ares/.4ds file is structurally probed instead (the
-     former standalone Inspect tab was merged in here 2026-07-11 — same probe, same findings,
-     now the first step of "can I convert this" rather than a separate destination).
+<!-- Convert tab: one Open control for every source. A frames folder (Microsoft volcap / PLY
+     sequences / DepthKit exports) is analysed and converted, a 2D video opens the depth card, and a
+     single .ares/.4ds file is structurally probed (convert.js openPath routes by what was picked).
      The panel is a control surface: the format matrix and the pipeline notes that used to run
      down the page live in the ⋯ menu and in title= tooltips, so the card fits one viewport and
      only the log, the batch queue and the history list scroll. -->
@@ -1127,10 +1126,7 @@
     <div class="tbar">
       <h2>Convert to .ares</h2>
       <span class="sp"></span>
-      <button class="u primary" id="convertPick" title="Pick a capture folder: per-frame OBJ/PLY meshes plus atlas-*.png textures, or per-frame splats">Folder…</button>
-      <label class="u" for="convertProbeFile" title="Pick a single .ares or .4ds container to probe its structure">File…</label>
-      <input type="file" id="convertProbeFile" accept=".4ds,.ares" style="display:none">
-      <button class="u" id="convertVideo" title="Pick a 2D video (mp4, webm, mov, mkv): monocular depth estimation per frame, unprojected into a video-textured relief mesh">Video…</button>
+      <button class="u primary" id="convertOpen" title="Open a source: a 2D video (depth card), a frame sequence (any OBJ / PLY / splat frame opens its folder; Open with the name (this folder) selects the folder shown), or an .ares / .4ds container (probe)">Open…</button>
       <button class="u ico" id="convertInfo" aria-expanded="false" aria-controls="convertFormats" title="Supported formats">⋯</button>
     </div>
     <div class="pop" id="convertFormats" hidden>
@@ -1142,10 +1138,9 @@
       <div class="fmt"><b>2D video</b><span>mp4 / webm / mov / mkv: Depth-Anything V2 depth per frame, pinhole relief mesh, textured by the video (2.5D)</span><span class="good">converts</span></div>
       <div class="fmt"><b>.ares</b><span>container layout only, no mesh or texture content is read</span><span>probes</span></div>
     </div>
-    <label class="drop" id="convertDrop">
+    <div class="drop" id="convertDrop" role="button" tabindex="0" title="Drop a capture folder, an .ares / .4ds file or a 2D video; the location is found on disk. Click is Open.">
       <span class="big">Drop capture folder, .ares / .4ds, or a 2D video</span>
-      <input type="file" id="convertFile" multiple webkitdirectory>
-    </label>
+    </div>
     <div id="convertOut"></div>
     <div id="convertHistory"></div>
   </div>

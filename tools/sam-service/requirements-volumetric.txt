@@ -1,0 +1,32 @@
+# The geometry and body phases of a `volumetric` depth job (depth_volume.py, run by
+# volume_worker.py). The service imports none of these itself; without them /depth/run answers 409
+# for volumetric requests and every other route works. Verified in the service env 2026-09-19.
+#
+# Kept apart from requirements.txt: pip resolves a whole -r file before it installs anything, and the
+# MoGe line below needs git on PATH, so on a machine without git one line here would leave the base
+# environment without torch. The installer does not read this file: its `moge-code` row pip-installs
+# the MoGe clone and its `sam3d-body-runtime` row installs the packages below, both with the private
+# MinGit on PATH (tools/installer.mjs). By hand, with git on PATH, after requirements.txt:
+#   pip install -r requirements-volumetric.txt
+#
+# No version is fixed here: upstream's INSTALL.md (tools/ext/sam-3d-body) names these packages
+# without versions and installs MoGe from the head of its repository.
+#
+# MoGe-2 (geometry phase): the package from git. Its own git dependencies (utils3d-moge, pipeline,
+# flex-gemm) also need git while pip runs. Weights: Ruicheng/moge-2-vitl-normal (HF cache).
+moge @ git+https://github.com/microsoft/MoGe.git
+# SAM 3D Body (body phase), box-prompted: the modules its inference path imports with no person
+# detector and no FOV model, so no detectron2 and no compiler. The code is the clone under
+# tools/ext/sam-3d-body (put on sys.path by the worker, never pip-installed: upstream has no
+# setup.py); DINOv3 comes from the torch.hub cache. Weights: jetjodh/sam-3d-body-dinov3.
+opencv-python-headless
+roma
+yacs
+omegaconf
+pytorch-lightning
+timm
+braceexpand
+termcolor
+iopath
+fvcore
+submitit

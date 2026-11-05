@@ -322,6 +322,21 @@ function summarize(gpus) {
 
 // ------------------------------------------------------------- catalog ----
 
+/** Top-level modules SAM 3D Body imports on the box-prompted path (no detector, no FOV model), and
+ *  the pins that provide them, verified in the service env 2026-09-19. The same pins are in
+ *  tools/sam-service/requirements-volumetric.txt. */
+export const SAM3D_BODY_RUNTIME_MODULES = ["cv2", "roma", "yacs", "omegaconf", "pytorch_lightning", "timm",
+  "braceexpand", "termcolor", "iopath", "fvcore", "submitit"];
+const SAM3D_BODY_RUNTIME_PIP = ["opencv-python-headless", "roma", "yacs", "omegaconf", "pytorch-lightning", "timm",
+  "braceexpand", "termcolor", "iopath", "fvcore", "submitit"];
+
+/** Catalog ids a `volumetric` depth job runs on (tools/sam-service/depth_volume.py), dependencies
+ *  first; the same ids a 409 from /depth/run lists. `resolve` adds git and python-env. */
+export const VOLUMETRIC_COMPONENTS = ["moge-code", "moge-2", "sam3d-body-code", "sam3d-body", "dinov3-hub", "sam3d-body-runtime"];
+// The per-person generated-view path (docs/video-to-4d-people.md); every row is status only,
+// since the install is the sequence in tools/4danyone/README.md.
+export const AVATAR_COMPONENTS = ["4danyone-code", "4danyone-weights", "4danyone-smplx"];
+
 /**
  * Every component. `vramMB` is what it actually costs on the GPU when loaded — measured, not
  * inferred from file size, because the two differ a lot: SAM 3 is a 3.3 GB download that peaks
@@ -363,6 +378,16 @@ export function catalog(ROOT, gpu) {
     || hfSnapshot("jetjodh/sam-3d-body-dinov3", SAM3D_BODY_FILES);
   const sam3dObjSnap = hfSnapshot("facebook/sam-3d-objects",
     ["checkpoints/pipeline.yaml", "checkpoints/slat_generator.ckpt", "checkpoints/ss_generator.ckpt"]);
+  // 2D video → full volumetric (tools/sam-service/depth_volume.py). A module counts as importable
+  // when its package directory (or single-file module) is in the env's site-packages: the same
+  // lookup importlib's path finder does, without starting a Python.
+  const sitePkgs = join(P.envDir, "Lib", "site-packages");
+  const importable = (m) => existsSync(join(sitePkgs, m, "__init__.py")) || existsSync(join(sitePkgs, m + ".py"));
+  const mogeSnap = hfSnapshot("Ruicheng/moge-2-vitl-normal", ["model.pt"]);
+  const bodyRuntimeMissing = SAM3D_BODY_RUNTIME_MODULES.filter((m) => !importable(m));
+  // torch.hub's cache: $TORCH_HOME/hub, else $XDG_CACHE_HOME/torch/hub, else ~/.cache/torch/hub.
+  const torchHub = join(process.env.TORCH_HOME || join(process.env.XDG_CACHE_HOME || join(homedir(), ".cache"), "torch"), "hub");
+  const dinov3Dir = join(torchHub, "facebookresearch_dinov3_main");
   const gitExe = findGit(ROOT);
   const ff = findFfmpeg(ROOT);
   const enc = encoderState(ROOT);
@@ -649,7 +674,7 @@ export function catalog(ROOT, gpu) {
       enables: "the full-body template that completes the unseen side of a capture",
       why: "2.8 GB: DINOv3-H+ checkpoint plus the Momentum Human Rig asset. Falls back to the ungated mirror, so no licence is needed.",
       sizeMB: 2800,
-      vramMB: 6000,
+      vramMB: 3500,          // measured 2026-09-19 on an RTX 2080 Ti: 3470 MiB peak, fp16, box supplied, no detector
       optional: true,
       requires: ["python-env"],
       ...(sam3dBodySnap ? found(true, sam3dBodySnap) : found(false)),
@@ -681,6 +706,65 @@ export function catalog(ROOT, gpu) {
       requires: ["sam3d-body-code", "python-env", "msvc-build-tools"],
       ...(existsSync(join(P.envDir, "Lib", "site-packages", "detectron2")) ? found(true, join(P.envDir, "Lib", "site-packages", "detectron2")) : found(false)),
       install: { kind: "git", url: "https://github.com/facebookresearch/sam-3d-body.git", into: join(P.ext, "sam-3d-body"), pip: ["-e", "."] },
+    },
+    // ---- 2D video → full volumetric (tools/sam-service/depth_volume.py): SAM 3D Body run locally
+    // with the box taken from the subject mask, so neither the ViTDet-H detector (detectron2, the
+    // row above) nor the FOV model is loaded. What that path imports is eleven pure-Python packages
+    // and DINOv3's hub code; measured working 2026-09-19 in the service env (CPython 3.13, torch
+    // 2.6.0+cu124) at 1.6 s/frame on an RTX 2080 Ti.
+    {
+      id: "dinov3-hub",
+      group: "SAM 3D",
+      label: "DINOv3 source (torch.hub cache)",
+      enables: "offline construction of the SAM 3D Body backbone",
+      why: "facebookresearch/dinov3 hub code in the torch.hub cache, loaded with source=\"local\" by the body worker; backbone weights from the SAM 3D Body checkpoint",
+      sizeMB: 20,
+      optional: true,
+      requires: ["git"],
+      ...(existsSync(join(dinov3Dir, "hubconf.py")) ? found(true, dinov3Dir) : found(false)),
+      install: { kind: "git", url: "https://github.com/facebookresearch/dinov3.git", into: dinov3Dir },
+    },
+    {
+      id: "sam3d-body-runtime",
+      group: "SAM 3D",
+      label: "SAM 3D Body runtime packages",
+      enables: "the body phase of 2D video → full volumetric on this machine's GPUs",
+      why: `pip packages for box-prompted inference: ${SAM3D_BODY_RUNTIME_PIP.join(", ")}; no detectron2, no compiler`,
+      sizeMB: 60,
+      optional: true,
+      requires: ["sam3d-body-code", "dinov3-hub", "python-env"],
+      ...(bodyRuntimeMissing.length ? found(false) : found(true, sitePkgs)),
+      ...(bodyRuntimeMissing.length && bodyRuntimeMissing.length < SAM3D_BODY_RUNTIME_MODULES.length
+        ? { diskNote: `modules absent: ${bodyRuntimeMissing.join(", ")}` } : {}),
+      // pip only: the DINOv3 code is dinov3-hub's, a prerequisite. A git step here would clone into
+      // that directory, which torch.hub.load fills without a .git, and `git clone` into a non-empty
+      // directory exits 128 before the pip step runs.
+      install: { kind: "pip", pip: SAM3D_BODY_RUNTIME_PIP },
+    },
+    {
+      id: "moge-code",
+      group: "Depth",
+      label: "MoGe-2 source and package",
+      enables: "the geometry phase of 2D video → full volumetric: metric depth, normals and camera intrinsics per frame",
+      why: "shallow git clone of microsoft/MoGe into tools/ext, pip-installed into the service env (MIT); git dependencies utils3d-moge and flex-gemm",
+      sizeMB: 150,
+      optional: true,
+      requires: ["git", "python-env"],
+      ...(importable("moge") && existsSync(join(sitePkgs, "moge", "model", "v2.py")) ? found(true, join(sitePkgs, "moge")) : found(false)),
+      install: { kind: "git", url: "https://github.com/microsoft/MoGe.git", into: join(P.ext, "moge"), pip: ["."] },
+    },
+    {
+      id: "moge-2",
+      group: "Depth",
+      label: "MoGe-2 ViT-L normal weights",
+      enables: "the geometry phase of 2D video → full volumetric",
+      why: "Ruicheng/moge-2-vitl-normal, one 1.32 GB model.pt; 193 ms per 1280x720 frame with fp16 autocast, 2978 MiB peak on an RTX 2080 Ti (measured 2026-09-19)",
+      sizeMB: 1263,
+      vramMB: 3000,
+      optional: true,
+      requires: ["moge-code", "python-env"],
+      ...(mogeSnap ? found(true, mogeSnap, dirBytes(mogeSnap)) : found(false)),
+      install: { kind: "hf", repo: "Ruicheng/moge-2-vitl-normal", allow: ["model.pt"] },
     },
     {
       id: "msvc-build-tools",
@@ -742,6 +826,34 @@ export function catalog(ROOT, gpu) {
       enables: "re-encoding, editor Bake, enhance experiments",
       why: "your own data: any per-frame OBJ/PLY + atlas PNG folder works",
       ...(existsSync(join(P.REPO, "Daniel_Microsoft_Volcap", "Daniel_Volcap")) ? found(true, join(P.REPO, "Daniel_Microsoft_Volcap", "Daniel_Volcap")) : found(false)),
+    },
+    {
+      id: "4danyone-code", group: "4DAnyone", label: "4DAnyone source and environment", statusOnly: true, optional: true,
+      enables: "generated views around each person: the Convert card's completion 4DAnyone views",
+      why: "cloned into tools/ext/4danyone with its own Python environment and the Windows and Turing patch; tools/4danyone/README.md has the steps",
+      ...(existsSync(join(P.ext, "4danyone", "venv", "Scripts", "python.exe")) && existsSync(join(P.ext, "4danyone", "fdanyone", "precision.py"))
+        ? found(true, join(P.ext, "4danyone"))
+        : existsSync(join(P.ext, "4danyone", "inference.py")) ? found(false, join(P.ext, "4danyone")) : found(false)),
+      ...(existsSync(join(P.ext, "4danyone", "inference.py")) && !existsSync(join(P.ext, "4danyone", "fdanyone", "precision.py"))
+        ? { diskNote: "cloned, patch not applied" } : {}),
+    },
+    {
+      id: "4danyone-weights", group: "4DAnyone", label: "4DAnyone checkpoints", statusOnly: true, optional: true,
+      enables: "the generation itself: the 5B DiT, the Wan2.2 VAE, the Turbo delta, GVHMR, HMR2, ViTPose and the detector",
+      why: "scripts/download_model.py writes them into tools/ext/4danyone/models (21 GB)",
+      sizeMB: 21000,
+      requires: ["4danyone-code"],
+      ...(existsSync(join(P.ext, "4danyone", "models", "4danyone", "model.safetensors"))
+        ? found(true, join(P.ext, "4danyone", "models")) : found(false)),
+    },
+    {
+      id: "4danyone-smplx", group: "4DAnyone", label: "SMPL-X neutral body", statusOnly: true, optional: true,
+      enables: "the motion stage of a generation run (GVHMR fits SMPL-X, which drives the skeleton conditioning)",
+      why: "SMPLX_NEUTRAL.npz installed through fdanyone.download.install_smplx into tools/ext/4danyone/models/body_models/smplx",
+      sizeMB: 110,
+      requires: ["4danyone-code"],
+      ...(existsSync(join(P.ext, "4danyone", "models", "body_models", "smplx", "SMPLX_NEUTRAL.npz"))
+        ? found(true, join(P.ext, "4danyone", "models", "body_models", "smplx", "SMPLX_NEUTRAL.npz")) : found(false)),
     },
     {
       id: "4ds-codec", group: "External", label: "4DViews codec (BridgeCodec4DS.dll)", statusOnly: true, optional: true,
@@ -1154,6 +1266,19 @@ async function installGit(ROOT, item, onLine) {
   return { ok: true };
 }
 
+/** pip packages into the Python environment, with the private git on PATH when there is one (a
+ *  pin that resolves to a git URL then still installs). */
+async function installPip(ROOT, item, onLine) {
+  const P = paths(ROOT);
+  if (!existsSync(P.envPy)) return { ok: false, error: "Python environment absent (dependency order error)" };
+  const git = findGit(ROOT);
+  const env = git ? { ...process.env, PATH: dirname(git) + ";" + (process.env.PATH || "") } : process.env;
+  onLine(`pip install ${item.install.pip.join(" ")}`);
+  const code = await sh(P.envPy, ["-m", "pip", "install", ...item.install.pip], { cwd: P.svc, env }, onLine);
+  if (code !== 0) return { ok: false, error: `pip install failed (exit ${code})` };
+  return { ok: true };
+}
+
 /** The TypeScript build (`npm run build` = `tsc -b`). tsc runs straight through this node
  *  process, so npm is only needed when node_modules is missing, and then it is the npm that
  *  ships beside node. A failed rebuild keeps an existing dist in use: another engineer's
@@ -1185,6 +1310,7 @@ export async function installOne(ROOT, item, onLine) {
     case "zip": return installZip(ROOT, item, onLine);
     case "winget": return installWinget(ROOT, item, onLine);
     case "git": return installGit(ROOT, item, onLine);
+    case "pip": return installPip(ROOT, item, onLine);
     case "npm": return installNpm(ROOT, item, onLine);
     default: return { ok: false, error: "no installer for " + item.id };
   }

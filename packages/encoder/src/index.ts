@@ -29,3 +29,6 @@ export * from "./depth-mesh.js";
 export * from "./depth-store.js";
 export * from "./depth-layers.js";
 export * from "./video-frames.js";
+export * from "./depth-metric.js";
+export * from "./depth-body.js";
+export * from "./volumetric.js";

@@ -19,7 +19,8 @@ import { join, normalize, extname, dirname, basename, sep } from "node:path";
 import zlib from "node:zlib";
 import { tmpdir } from "node:os";
 import { fileURLToPath } from "node:url";
-import { catalog, encoderState, ensurePrivatePython, findFfmpeg, findGit, FORGE_PYTHON, gpuProbe, hfTokenPresent, installOne, paths as installPaths, preflight, profiles, recommend, resolve, saveHfToken } from "./installer.mjs";
+import { catalog, encoderState, ensurePrivatePython, findFfmpeg, findGit, FORGE_PYTHON, gpuProbe, hfTokenPresent, installOne, paths as installPaths, preflight, profiles, recommend, resolve, saveHfToken, VOLUMETRIC_COMPONENTS } from "./installer.mjs";
+import { AVATAR_DEFAULTS, avatarEncode, avatarGenerate, avatarMesh, avatarMissing, avatarPeople } from "./avatar-run.mjs";
 import { shellRegister, shellStatus, shellUnregister } from "./shell-integration.mjs";
 import { install as msixInstall, msixStatus, uninstall as msixUninstall } from "./msix/build.mjs";
 
@@ -178,7 +179,7 @@ function forgePost(base, apiPath, payload, onReq) {
 function pickNative(type, { timeoutMs = 180000, filter, initialDirectory } = {}) {
   return new Promise((resolve, reject) => {
     const args = ["-NoProfile", "-STA", "-WindowStyle", "Hidden",
-      "-File", join(ROOT, "tools", "pick.ps1"), "-Type", type === "file" ? "file" : "folder"];
+      "-File", join(ROOT, "tools", "pick.ps1"), "-Type", type === "file" || type === "any" ? type : "folder"];
     if (filter) args.push("-Filter", filter);
     if (initialDirectory) args.push("-InitialDirectory", initialDirectory);
     const child = spawn("powershell.exe", args, { windowsHide: true });
@@ -188,6 +189,70 @@ function pickNative(type, { timeoutMs = 180000, filter, initialDirectory } = {})
     child.on("error", (e) => { if (settled) return; settled = true; clearTimeout(timer); reject(e); });
     child.on("close", () => { if (settled) return; settled = true; clearTimeout(timer); resolve(out.trim() || null); });
   });
+}
+
+// ---- dropped-item location ------------------------------------------------------------------
+// A browser hands a dropped file or folder to the page with its name (plus size and modification
+// time for a file) and never its location. The Convert tab used to answer that by asking for the
+// path the user had just dropped. locateDropped finds it instead: tools/locate.ps1 lists the
+// folders open in File Explorer (a drag starts in one of them), the shell's known folders, the
+// Recent-items shortcut for the name and the Windows Search index hits; the history's folders are
+// added here. A file matches on name and exact size, with the modification time within 2 s when
+// the page sent one; a folder matches on name and a file count within 10 %. Measured 2026-09-19:
+// locate.ps1 answers in about 0.8 s.
+function locateCandidates(name) {
+  return new Promise((resolve) => {
+    const child = spawn("powershell.exe", ["-NoProfile", "-WindowStyle", "Hidden", "-File", join(ROOT, "tools", "locate.ps1")],
+      { windowsHide: true, env: { ...process.env, ARES_DROP_NAME: name } });
+    let out = "", done = false;
+    const finish = (v) => { if (!done) { done = true; clearTimeout(timer); resolve(v); } };
+    const timer = setTimeout(() => { try { child.kill(); } catch { /* gone */ } finish(null); }, 15000);
+    child.stdout.on("data", (d) => (out += d));
+    child.on("error", () => finish(null));
+    child.on("close", () => { try { finish(JSON.parse(out.trim() || "null")); } catch { finish(null); } });
+  });
+}
+async function locateDropped({ name, kind, size, mtime, files }) {
+  const found = await locateCandidates(name);
+  const hist = await readHistoryStore();
+  const dirs = [];
+  const add = (d) => { if (d && typeof d === "string" && !dirs.some((x) => x.toLowerCase() === d.toLowerCase())) dirs.push(d); };
+  for (const d of (found && found.windows) || []) add(d);
+  // One level under each Explorer folder too: the item is often dragged out of a subfolder
+  // listed in the window, or from a window that has since navigated up.
+  for (const d of ((found && found.windows) || []).slice()) {
+    try { const ents = await readdir(d, { withFileTypes: true }); let n = 0; for (const e of ents) if (e.isDirectory() && n++ < 200) add(join(d, e.name)); } catch { /* unreadable */ }
+  }
+  for (const d of (found && found.known) || []) add(d);
+  for (const d of Object.values(hist.lastDirs || {})) if (d) { add(d); add(dirname(d)); }
+  for (const it of (hist.items || []).slice(0, 60)) if (it.path) { add(it.path); add(dirname(it.path)); }
+  add(ROOT); add(dirname(ROOT));
+  const direct = [...((found && found.recent) || []), ...((found && found.index) || [])];
+
+  const hits = [];
+  const consider = async (cand) => {
+    if (hits.length >= 8 || hits.some((h) => h.path.toLowerCase() === cand.toLowerCase())) return;
+    if (basename(cand).toLowerCase() !== name.toLowerCase()) return;
+    let st; try { st = await stat(cand); } catch { return; }
+    if (kind === "dir") {
+      if (!st.isDirectory()) return;
+      let n = 0; try { n = (await readdir(cand)).length; } catch { return; }
+      if (files && Math.abs(n - files) > Math.max(4, files * 0.1)) return;
+      hits.push({ path: cand, files: n, exact: !!files });
+    } else {
+      if (!st.isFile()) return;
+      if (size && st.size !== size) return;
+      const exact = !!mtime && Math.abs(st.mtimeMs - mtime) <= 2000;
+      if (mtime && !exact && !size) return;
+      hits.push({ path: cand, size: st.size, exact });
+    }
+  };
+  for (const p of direct) await consider(p);
+  for (const d of dirs) await consider(join(d, name));
+  const exact = hits.filter((h) => h.exact);
+  if (exact.length === 1) return { path: exact[0].path, hits };
+  if (hits.length === 1 && (kind === "dir" || size)) return { path: hits[0].path, hits };
+  return { candidates: hits.map((h) => h.path) };
 }
 
 // ---- unified volcap history + last-used folders (apps/demo/history.json) -------------------
@@ -428,6 +493,18 @@ function depthComponents(model, subject) {
     || (/^metric-indoor-/.test(model) ? "depth-metric-indoor" : /^metric-outdoor-/.test(model) ? "depth-metric-outdoor" : null);
   return [...(id ? [id] : []), ...(subject ? ["sam3"] : [])];
 }
+/** /depth/status errorCode (tools/sam-service/depth.py, depth_volume.py) -> the label a failed
+ *  conversion reports in front of the service's own message. */
+const DEPTH_ERROR_LABEL = {
+  "subject-not-found": "subject mask: prompt not found",
+  "body-convention": "SAM 3D Body: footprint IoU below the convention threshold",
+  "body-not-found": "SAM 3D Body: no subject mesh",
+  "geometry-failed": "MoGe-2 geometry phase failure",
+  "worker-failed": "volume worker failure",
+  "no-cuda": "CUDA device absent",
+  // Raised by the mask pass (SAM 3) as well as the volumetric phases: the ids follow the label.
+  "missing-components": "components absent",
+};
 /** Components the /enhance tiers run on. */
 const ENHANCE_COMPONENTS = {
   fast: ["python-env", "esrgan-general"],
@@ -589,6 +666,9 @@ async function forgeEnsure(send) {
 const SAM_URL = process.env.SAM_URL || "http://127.0.0.1:7263";
 const SAM_PS1 = join(ROOT, "tools", "sam-service", "run-sam-service.ps1");
 let samChild = null;
+// Set while a job owns the GPUs and the service must stay down (a 4DAnyone run splits a 5B DiT
+// across both 11 GB cards). Reads the reason, so a refusal can name what holds them.
+let samHold = null;
 function samHealth(timeoutMs = 1500) {
   return new Promise((resolve) => {
     let u; try { u = new URL("/health", SAM_URL); } catch { resolve(null); return; }
@@ -610,16 +690,23 @@ async function samLogTail(n = 12) {
   } catch { return []; }
 }
 /** Stop the service that owns SAM_URL's port. Used when weights arrive after a start that latched
- *  a load failure: the service loads its model once, so new weights need a new process. Only a
- *  python process is ever stopped. */
+ *  a load failure (the service loads its model once, so new weights need a new process), and by a
+ *  job that needs the device memory back. Only a python process is ever stopped.
+ *  Returns true when the port has stopped answering: the kill is a PowerShell one-liner whose
+ *  output is discarded, so the health probe is the only evidence that it did anything. */
 async function samStop(send) {
   let port = 7263; try { port = Number(new URL(SAM_URL).port) || 80; } catch { /* default */ }
   const ps = `$c = Get-NetTCPConnection -LocalPort ${port} -State Listen -ErrorAction SilentlyContinue | Select-Object -First 1; ` +
     `if ($c) { $p = Get-Process -Id $c.OwningProcess -ErrorAction SilentlyContinue; if ($p -and $p.ProcessName -like 'python*') { Stop-Process -Id $p.Id -Force } }`;
   await runProcLines("powershell.exe", ["-NoProfile", "-Command", ps], {}, null, () => {});
   samChild = null;
-  for (let i = 0; i < 10 && (await samHealth(800)); i++) await new Promise((r) => setTimeout(r, 500));
-  if (send) send("log", "SAM service stopped for a model reload");
+  let alive = !!(await samHealth(800));
+  for (let i = 0; i < 10 && alive; i++) {
+    await new Promise((r) => setTimeout(r, 500));
+    alive = !!(await samHealth(800));
+  }
+  if (send) send("log", alive ? "the SAM service is still answering after the stop" : "SAM service stopped");
+  return !alive;
 }
 /**
  * samEnsure(send, { purpose, components })
@@ -633,6 +720,9 @@ async function samStop(send) {
 let samRestarted = false;   // one automatic restart per latched failure, never a loop
 async function samEnsure(send, { purpose = "sam", components = [] } = {}) {
   const log = (t) => { if (send) send("log", t); };
+  // A start during a held job would put SAM 3 and a depth model back on cuda:0 under a generation
+  // that was given the whole card.
+  if (samHold) return { ok: false, error: `the SAM service is held down while ${samHold} has the cards` };
   const need = ["python-env", ...components];
   if (purpose === "track") need.push("sam3");
   if (purpose === "sam") {
@@ -692,6 +782,46 @@ async function samEnsure(send, { purpose = "sam", components = [] } = {}) {
     if (h && h.error) return failed(h);
   }
   return { ok: false, error: "SAM service not ready after 180 s", log: await samLogTail() };
+}
+/**
+ * A volumetric job needs a service whose /depth/health carries `volume`: a service started from
+ * older code drops the request's `volumetric` field (pydantic ignores unknown fields) and runs a plain
+ * subject job, which the encoder then refuses after the mask and depth passes. Such a service is
+ * restarted once through samStop and samEnsure. Then the cached import probe must have answered and
+ * `volume.available` be true (components present, moge and sam_3d_body importable, a CUDA device
+ * selected); the probe is waited for up to 300 s. Resolves true, or a samEnsure-shaped failure.
+ */
+async function samVolumeReady(send) {
+  let restarted = false;
+  const deadline = Date.now() + 300000;
+  for (;;) {
+    const h = (await samJson("GET", "/depth/health", null, 15000))?.json ?? null;
+    if (h && !h.volume) {
+      if (restarted) return { ok: false, error: "SAM service: /depth/health without volume after a restart" };
+      restarted = true;
+      send("log", "[server] SAM service code predates the volumetric phases: restart");
+      await samStop(send);
+      const svc = await samEnsure(send, { purpose: "sam" });
+      if (svc !== true) return svc;
+      continue;
+    }
+    const v = h?.volume;
+    if (v && v.probe !== "running" && v.probe !== "idle") {
+      if (v.available === true) return true;
+      const errs = v.importErrors || {};
+      const why = [
+        v.missing?.length ? `components absent: ${v.missing.join(", ")}` : "",
+        v.moge === false ? `moge import failure${errs.mogeError ? ` (${errs.mogeError})` : ""}` : "",
+        v.sam3dBody === false ? `sam_3d_body import failure${errs.sam3dBodyError ? ` (${errs.sam3dBodyError})` : ""}` : "",
+        errs.error ? `import probe failure (${errs.error})` : "",
+        v.workers === 0 ? v.deviceError || "CUDA device absent" : "",
+      ].filter(Boolean);
+      return { ok: false, error: `volumetric phases unavailable on the SAM service: ${why.join("; ") || "reason absent from /depth/health"}` };
+    }
+    if (Date.now() > deadline) return { ok: false, error: "volumetric import probe unanswered after 300 s" };
+    if (!h) return { ok: false, error: "SAM service: /depth/health unanswered" };
+    await new Promise((r) => setTimeout(r, 2000));
+  }
 }
 /** Send a samEnsure / forgeEnsure failure down an SSE stream: the transcript tail as log lines,
  *  then the error event (gated fields included, so the client can raise its access prompt). */
@@ -858,7 +988,7 @@ function samJson(method, pathname, body, timeoutMs = 5000) {
 // /sam/track/ joins /sam/start for the same reason: opening a track session pins 2,263 MiB of
 // device memory (measured, tools/sam-service/track_smoke.py) and a run is 291.6 ms/frame of GPU
 // for the length of a clip. The rest of /sam/* stays unguarded — one forward pass, no state.
-const GUARDED = /^\/(encode|convert-4ds|depth-convert|depth\/(upload|source)|probe-video|enhance|sam\/(start|track\/)|forge\/start|setup\/|runpod\/(launch|stop|action|logs|key)|pick|log|edits\/|showcase|deps\/|install|shell\/|hf-token|import-ares|delete-ares|save-thumb|open-info|resolve-dir)/;
+const GUARDED = /^\/(encode|convert-4ds|depth-convert|avatar-convert|depth\/(upload|source)|probe-video|enhance|sam\/(start|track\/)|forge\/start|setup\/|runpod\/(launch|stop|action|logs|key)|pick|log|edits\/|showcase|deps\/|install|shell\/|hf-token|import-ares|delete-ares|save-thumb|open-info|resolve-dir|resolve-drop|local-bytes)/;
 const LOOPBACK = new Set(["127.0.0.1", "localhost", "[::1]", "::1"]);
 function sameOrigin(req) {
   const sfs = req.headers["sec-fetch-site"];
@@ -1068,10 +1198,10 @@ async function handle(req, res) {
       const refused = e.code === "ECONNREFUSED";
       // Auto-start on real work (POST /segment); plain health GETs stay passive so
       // status polling never spawns anything.
-      if (refused && req.method === "POST") samEnsure(null, { purpose: path.startsWith("/sam/track/") ? "track" : path.startsWith("/sam/depth/") ? "depth" : "sam" }).catch(() => {});
+      if (refused && req.method === "POST" && !samHold) samEnsure(null, { purpose: path.startsWith("/sam/track/") ? "track" : path.startsWith("/sam/depth/") ? "depth" : "sam" }).catch(() => {});
       res.writeHead(refused ? 503 : 502, { ...HEADERS, "Content-Type": "application/json" });
       res.end(JSON.stringify(refused
-        ? { error: "sam service not running", starting: req.method === "POST", start: "/sam/start" }
+        ? { error: samHold ? `sam service held down while ${samHold} has the cards` : "sam service not running", starting: req.method === "POST" && !samHold, start: "/sam/start" }
         : { error: "sam proxy failed", detail: e.message }));
     });
     req.pipe(up);
@@ -1586,7 +1716,7 @@ async function handle(req, res) {
         const names = await readdir(target);
         res.end(JSON.stringify({ kind: "dir", path: target, files: names.length }));
       } else {
-        res.end(JSON.stringify({ kind: "file", path: target, ext: extname(target).toLowerCase(), parent: dirname(target) }));
+        res.end(JSON.stringify({ kind: "file", path: target, ext: extname(target).toLowerCase(), parent: dirname(target), size: st.size }));
       }
     } catch (e) { res.end(JSON.stringify({ error: String((e && e.message) || e) })); }
     return;
@@ -1714,48 +1844,41 @@ data: ${JSON.stringify(data)}
     return;
   }
 
-  // Resolve a DROPPED folder to a real path. A browser hands a drag-drop or <input webkitdirectory>
-  // only `webkitRelativePath` — the folder's NAME, never its location — so the Convert card had to
-  // ask the user to retype a path they had just pointed at, which is a daft thing to ask.
-  // Given the name (and optionally the file count), look for it under the folders this user has
-  // actually used before (history lastDirs and their parents) plus the drives' obvious roots.
-  // Returns a single unambiguous hit, or the candidates so the UI can ask which.
-  //   GET /resolve-dir?name=Daniel_Volcap[&files=544]  ->  { path } | { candidates:[...] } | {}
-  if (path === "/resolve-dir") {
+  // Resolve a DROPPED file or folder to its real path (locateDropped above). /resolve-dir is the
+  // older folder-only name of the same lookup.
+  //   GET /resolve-drop?name=take.mp4&kind=file&size=327108056&mtime=1750000000000  ->  { path } | { candidates:[...] }
+  //   GET /resolve-drop?name=Daniel_Volcap&kind=dir[&files=544]                      ->  { path } | { candidates:[...] }
+  if (path === "/resolve-drop" || path === "/resolve-dir") {
     const want = basename(url.searchParams.get("name") || "").trim();
-    const wantFiles = Number(url.searchParams.get("files") || 0);
+    const kind = path === "/resolve-dir" || url.searchParams.get("kind") === "dir" ? "dir" : "file";
+    const num = (k) => { const v = Number(url.searchParams.get(k) || 0); return Number.isFinite(v) && v > 0 ? v : 0; };
     res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
-    if (!want || /[\/:*?"<>|]/.test(want)) { res.end(JSON.stringify({})); return; }
-    try {
-      const hist = await readHistoryStore();
-      const seeds = new Set();
-      for (const d of Object.values(hist.lastDirs || {})) if (d) { seeds.add(d); seeds.add(dirname(d)); seeds.add(dirname(dirname(d))); }
-      for (const it of (hist.items || []).slice(0, 60)) if (it.path) { seeds.add(it.path); seeds.add(dirname(it.path)); }
-      seeds.add(ROOT); seeds.add(dirname(ROOT));
-      const hits = [];
-      for (const seed of seeds) {
-        if (!seed || hits.length >= 8) continue;
-        const cand = join(seed, want);
-        try {
-          const st = await stat(cand);
-          if (!st.isDirectory()) continue;
-          const n = (await readdir(cand)).length;
-          if (wantFiles && Math.abs(n - wantFiles) > Math.max(4, wantFiles * 0.1)) continue;  // name matched, contents did not
-          if (!hits.some((h) => h.path.toLowerCase() === cand.toLowerCase())) hits.push({ path: cand, files: n });
-        } catch { /* not there */ }
-      }
-      if (hits.length === 1) { res.end(JSON.stringify({ path: hits[0].path, files: hits[0].files })); return; }
-      res.end(JSON.stringify({ candidates: hits }));
-    } catch (e) { res.end(JSON.stringify({ error: String((e && e.message) || e) })); }
+    if (!want || /[\/:*?"<>|]/.test(want)) { res.end(JSON.stringify({ candidates: [] })); return; }
+    try { res.end(JSON.stringify(await locateDropped({ name: want, kind, size: num("size"), mtime: num("mtime"), files: num("files") }))); }
+    catch (e) { res.end(JSON.stringify({ candidates: [], error: String((e && e.message) || e) })); }
+    return;
+  }
+
+  // Byte ranges of a local .ares or .4ds, so a container picked with the native dialog is probed
+  // by the same in-page reader as a dropped one (the page reads the skeleton through Range
+  // requests; nothing else of the file is sent).
+  //   GET /local-bytes?path=<abs .ares|.4ds>   (Range: bytes=a-b)
+  if (path === "/local-bytes") {
+    const p = url.searchParams.get("path") || "";
+    let st = null;
+    try { st = /.(ares|4ds)$/i.test(p) ? await stat(p) : null; } catch { st = null; }
+    if (!st || !st.isFile()) { res.writeHead(404, { ...HEADERS, "Content-Type": "text/plain" }); res.end(`not an .ares or .4ds file: ${p}`); return; }
+    await sendFileRange(req, res, p, "application/octet-stream");
     return;
   }
 
   // Native OS folder/file picker (Windows), so the user never types a filesystem path.
-  //   GET /pick?type=folder|file[&dir=<initial>][&for=<key>][&filter=<ofd filter>]  → { path | null }
+  //   GET /pick?type=folder|file|any[&dir=<initial>][&for=<key>][&filter=<ofd filter>]  → { path | null }
   // `for` keys a remembered last-used folder (history.json lastDirs): the dialog reopens there,
-  // and a successful pick updates it.
+  // and a successful pick updates it. type=any returns a file or a folder (tools/pick.ps1).
   if (path === "/pick") {
-    const type = url.searchParams.get("type") === "file" ? "file" : "folder";
+    const t = url.searchParams.get("type");
+    const type = t === "file" || t === "any" ? t : "folder";
     const forKey = (url.searchParams.get("for") || "").replace(/[^a-z0-9_-]/gi, "").slice(0, 40);
     try {
       let initial = url.searchParams.get("dir") || undefined;
@@ -1764,7 +1887,11 @@ data: ${JSON.stringify(data)}
         if (remembered && existsSync(remembered)) initial = remembered;
       }
       const picked = await pickNative(type, { filter: url.searchParams.get("filter") || undefined, initialDirectory: initial });
-      if (picked && forKey) rememberDir(forKey, type === "file" ? dirname(picked) : picked);
+      if (picked && forKey) {
+        let isDir = type === "folder";
+        if (type === "any") { try { isDir = statSync(picked).isDirectory(); } catch { isDir = false; } }
+        rememberDir(forKey, isDir ? picked : dirname(picked));
+      }
       res.writeHead(200, { ...HEADERS, "Content-Type": "application/json" });
       res.end(JSON.stringify({ path: picked }));
     } catch (e) {
@@ -1923,7 +2050,7 @@ data: ${JSON.stringify(data)}
     return;
   }
 
-  // ---- 2D video → 2.5D depth conversion (Convert tab "Video…") ----------------------------------
+  // ---- 2D video → 2.5D depth conversion (Convert tab, a video from Open…) ----------------------------------
   // Ported from VJ-9000's "depthcloud" source (github.com/gantasmo/VJ-9000, src/akvj/depthWorker.ts +
   // src/useDepthCloud.ts) and turned from a live 8 fps preview into an offline conversion. Two depth
   // ENGINES write the same run directory (depth.json + depth.f32, contract in docs/depth-2d-to-25d.md):
@@ -1955,6 +2082,8 @@ data: ${JSON.stringify(data)}
     const depthHealth = h ? (await samJson("GET", "/depth/health"))?.json ?? null : null;
     res.end(JSON.stringify({
       service: { env: existsSync(FOURDS_PY), running: !!h, samReady: !!(h && h.ok), depth: depthHealth },
+      // NVIDIA GPUs (nvidia-smi, cached 60 s): volumetric completion needs one.
+      cuda: (await gpuCached()).count,
       browser: true,
       // Status only. Nothing here gates a job: /depth-convert installs whatever reads false.
       ffmpeg: !!ffTools(),
@@ -2117,7 +2246,18 @@ data: ${JSON.stringify(data)}
     // The encoder refuses the pair; refusing here keeps a run from spending its depth pass first.
     if (sheets && knobs.decimate != null && knobs.decimate < 1) { bad("decimate re-triangulates every frame and sheets keeps one topology: use one or the other"); return; }
     // A text prompt for SAM 3; the service runs the mask pass before depth.
-    const subject = (q.get("subject") || "").trim();
+    // volumetric=1: the service adds MoGe-2 geometry and a SAM 3D Body mesh per frame, and the encoder
+    // builds the metric shell plus the body completion (docs/depth-2d-to-volumetric.md). It needs the
+    // subject mask ("person" when no prompt is given) and replaces the relief grid.
+    const volumetricRaw = q.get("volumetric");
+    if (volumetricRaw != null && volumetricRaw !== "" && volumetricRaw !== "0" && volumetricRaw !== "1") { bad(`bad volumetric (0 or 1): "${volumetricRaw}"`); return; }
+    const volumetric = volumetricRaw === "1";
+    if (volumetric && engine !== "service") { bad(`volumetric runs on the service engine only, got engine=${engine}`); return; }
+    if (volumetric) {
+      const relief = [["sheets", sheets], ["inpaint", inpaint], ["snapRamps", snapRamps], ["decimate", knobs.decimate != null && knobs.decimate < 1]].filter(([, on]) => on).map(([k]) => k);
+      if (relief.length) { bad(`volumetric replaces the relief grid; relief-grid parameters given: ${relief.join(", ")}`); return; }
+    }
+    const subject = (q.get("subject") || "").trim() || (volumetric ? "person" : "");
     if (subject.length > 200 || /[\x00-\x1f]/.test(subject)) { bad("bad subject: at most 200 printable characters"); return; }
     if (subject && engine !== "service") { bad("subject masks run on the service engine only"); return; }
     const encoderCli = join(ROOT, "packages", "encoder", "dist", "cli.js");
@@ -2129,7 +2269,7 @@ data: ${JSON.stringify(data)}
     // Everything this job runs on, installed inside the stream below when absent: the encoder
     // build and ffmpeg always; for the service engine the Python environment plus the weights of
     // the chosen model, and SAM 3 when a `subject` prompt asks for a subject mask.
-    const jobComponents = ["encoder", "ffmpeg", ...(engine === "service" ? ["python-env", ...depthComponents(model, subject)] : [])];
+    const jobComponents = ["encoder", "ffmpeg", ...(engine === "service" ? ["python-env", ...depthComponents(model, subject), ...(volumetric ? VOLUMETRIC_COMPONENTS : [])] : [])];
 
     const name = await versionedOutName(join(ROOT, "apps", "demo"), rawName); // auto -vN, never overwrite
     const outRel = `apps/demo/${name}.ares`;
@@ -2145,7 +2285,14 @@ data: ${JSON.stringify(data)}
     });
     const t0 = Date.now();
     try {
-      send("start", { video, name, out: "/" + outRel, engine, model });
+      send("start", { video, name, out: "/" + outRel, engine, model, volumetric });
+      // Refused before VOLUMETRIC_COMPONENTS (4,373 MB by catalog size) install on a machine whose
+      // service would answer 400 for want of a CUDA device.
+      if (volumetric && (await gpuCached()).count === 0) {
+        send("error", { message: "volumetric: CUDA device absent (nvidia-smi reports no NVIDIA GPU)", stage: "setup" });
+        res.end();
+        return;
+      }
       if (!(await ensureOrEnd(jobComponents, send, res))) return;
       if (engine === "browser") {
         runDir = upload.dir;
@@ -2156,18 +2303,23 @@ data: ${JSON.stringify(data)}
         const svc = await samEnsure(send, { purpose: subject ? "sam" : "depth" });
         if (svc !== true) { sendEnsureFailure(send, svc); res.end(); return; }
         if (closed) return;
+        if (volumetric) {
+          const vr = await samVolumeReady(send);
+          if (vr !== true) { sendEnsureFailure(send, vr); res.end(); return; }
+          if (closed) return;
+        }
         runDir = await mkdtemp(join(tmpdir(), "ares-depth-"));
         const submit = await samJson("POST", "/depth/run", {
           video, out: runDir, model, fps: knobs.fps, maxFrames: knobs.maxFrames, inferWidth: knobs.inferWidth ?? 518, batch: 8, ffmpeg: ffTools()?.ffmpeg ?? null,
-          subject: subject || null,
+          subject: subject || null, volumetric,
         }, 20000);
         if (!submit || !submit.json || !submit.json.job) {
           const why = submit ? (submit.json?.error || submit.json?.detail || submit.text || submit.status) : "no answer";
           throw new Error(`depth service refused the job: ${typeof why === "string" ? why : JSON.stringify(why)}`);
         }
         serviceJob = submit.json.job;
-        send("log", `[server] depth job ${serviceJob}: ${model}${subject ? `, subject mask "${subject}"` : ""} on the service (${basename(video)})`);
-        let lastLogCount = 0, misses = 0, lastState = "";
+        send("log", `[server] depth job ${serviceJob}: ${model}${subject ? `, subject mask "${subject}"` : ""}${volumetric ? ", volumetric (MoGe-2 geometry, SAM 3D Body)" : ""} on the service (${basename(video)})`);
+        let lastLine = null, misses = 0, lastState = "";
         for (;;) {
           await new Promise((r) => setTimeout(r, 700));
           if (closed) return;
@@ -2175,20 +2327,35 @@ data: ${JSON.stringify(data)}
           if (!st || !st.json) { if (++misses >= 6) throw new Error("depth service stopped answering"); continue; }
           misses = 0;
           const s = st.json;
+          if (volumetric && s.volumetric !== true) {
+            // A service whose code predates the field ran it as a plain subject job.
+            samJson("POST", "/depth/cancel", { job: serviceJob }).catch(() => {});
+            serviceJob = null;
+            throw new Error("depth service: volumetric field absent from the job status (service code predates it)");
+          }
           const lines = Array.isArray(s.log) ? s.log : [];
-          // The service keeps a rolling tail; forward only what is new (the tail is at most 20 lines,
-          // so a burst longer than that loses lines: the status numbers below never do).
-          if (lines.length >= lastLogCount) for (const l of lines.slice(lastLogCount)) send("log", `[depth] ${l}`);
-          else for (const l of lines) send("log", `[depth] ${l}`);
-          lastLogCount = lines.length;
+          // The service keeps a rolling 20-line tail of timestamped lines: what is new is what follows
+          // the last line forwarded. A count stops growing once the tail is full and then forwarded
+          // nothing (a volumetric job's geometry and body summaries were lost that way). A burst of
+          // more than 20 lines between two polls still loses lines; the status numbers never do.
+          const seen = lastLine == null ? -1 : lines.lastIndexOf(lastLine);
+          for (const l of lines.slice(seen + 1)) send("log", `[depth] ${l}`);
+          if (lines.length) lastLine = lines[lines.length - 1];
           if (s.state !== lastState) { lastState = s.state; send("log", `[server] depth: ${s.state}${s.state === "loading" ? " (model load/download)" : ""}`); }
-          // A subject run has a mask pass before the depth pass; each reports its own counters.
-          const ph = s.phase === "mask" && s.phases?.mask ? s.phases.mask : null;
+          // A subject run has a mask pass before the depth pass, a volumetric run the geometry and
+          // body phases after it; each reports its own counters (geometry and body: the frames of
+          // every GPU together, with the GPU count and the phase's frames per second).
+          const ph = ["mask", "geometry", "body"].includes(s.phase) && s.phases?.[s.phase] ? s.phases[s.phase] : null;
           send("progress", ph
-            ? { stage: "mask", frame: ph.done || 0, of: ph.total || null, msPerFrame: ph.msPerFrame ?? null, state: s.state }
+            ? { stage: s.phase, frame: ph.done || 0, of: ph.total || null, msPerFrame: ph.msPerFrame ?? null, state: s.state,
+                ...(ph.gpus != null ? { gpus: ph.gpus, framesPerSecond: ph.framesPerSecond ?? null } : {}) }
             : { stage: "depth", frame: s.done || 0, of: s.total || null, msPerFrame: s.msPerFrame ?? null, state: s.state });
           if (s.state === "done") break;
-          if (s.state === "error") throw new Error(`depth failed: ${s.error || "unknown error"}`);
+          if (s.state === "error") {
+            const missing = Array.isArray(s.missing) && s.missing.length ? `: ${s.missing.join(", ")}` : "";
+            const label = DEPTH_ERROR_LABEL[s.errorCode] ? DEPTH_ERROR_LABEL[s.errorCode] + (s.errorCode === "missing-components" ? missing : "") : null;
+            throw new Error(`depth failed${label ? ` (${label}, ${s.errorCode})` : s.errorCode ? ` (${s.errorCode})` : ""}: ${s.error || "unknown error"}`);
+          }
           if (s.state === "cancelled") throw new Error("depth cancelled");
         }
         serviceJob = null;
@@ -2200,12 +2367,18 @@ data: ${JSON.stringify(data)}
       let metaExtraArgs = [];
       try {
         const mePath = join(tmpdir(), `ares-meta-extra-${Date.now()}.json`);
-        await writeFile(mePath, JSON.stringify({ pipeline: "depth", source: { video }, request: { engine, model, ...knobs, textureCodec, center: center || null, sheets, inpaint, guided, snapRamps, crop, subject: subject || null } }));
+        // The request goes under `request` only: the encoder writes its own `source` block (video bytes,
+        // source size and rate), and the merge is shallow, so a `source` key here would replace it.
+        await writeFile(mePath, JSON.stringify({ pipeline: "depth", request: { video, engine, model, ...knobs, textureCodec, center: center || null, sheets, inpaint, guided, snapRamps, crop, subject: subject || null, volumetric } }));
         metaExtraArgs = ["--meta-extra-file", mePath];
       } catch { /* best-effort provenance */ }
       const args = [encoderCli, "depth", video, "--depth", runDir, "-o", outAbs, "--texture-codec", textureCodec, ...metaExtraArgs];
       const passK = (k, f) => { if (knobs[k] != null) args.push(f, String(knobs[k])); };
-      passK("grid", "--grid"); passK("fov", "--fov"); passK("near", "--near"); passK("far", "--far"); passK("edge", "--edge");
+      // A volumetric encode takes its focal from the run's MoGe-2 intrinsics and its depth in metres:
+      // near, far and edge (the relief's range and cut) are not passed; grid and fov only when set.
+      if (volumetric) args.push("--volumetric");
+      passK("grid", "--grid"); passK("fov", "--fov");
+      if (!volumetric) { passK("near", "--near"); passK("far", "--far"); passK("edge", "--edge"); }
       passK("stabilize", "--stabilize"); passK("texSize", "--tex-size"); passK("crf", "--crf"); passK("gop", "--gop"); passK("smoothTemporal", "--smooth-temporal");
       if (knobs.decimate != null && knobs.decimate < 1) passK("decimate", "--decimate");
       if (inpaint) { args.push("--inpaint"); passK("inpaintBand", "--inpaint-band"); }
@@ -2246,10 +2419,10 @@ data: ${JSON.stringify(data)}
       historyAdd({
         kind: "encode", path: video, name: name + ".ares", out: "/" + outRel,
         meta: { source: "depth", engine, model, codec: textureCodec, texSize: String(knobs.texSize ?? 1024), crf: String(knobs.crf ?? 30), frames, fps,
-          grid: knobs.grid ?? 256, fov: knobs.fov ?? 55, near: knobs.near ?? "", far: knobs.far ?? "", edge: knobs.edge ?? 0.08, sheets: sheets ? "1" : "",
+          grid: knobs.grid ?? (volumetric ? "map" : 256), fov: knobs.fov ?? (volumetric ? "" : 55), near: knobs.near ?? "", far: knobs.far ?? "", edge: volumetric ? "" : (knobs.edge ?? 0.08), sheets: sheets ? "1" : "",
           stabilize: knobs.stabilize ?? 0.7, maxFrames: knobs.maxFrames ?? "", sampleFps: knobs.fps ?? "", inferWidth: knobs.inferWidth ?? 518,
           subject, decimate: knobs.decimate ?? "", inpaint: inpaint ? "1" : "", inpaintBand: knobs.inpaintBand ?? "", guided: guided ? "1" : "0",
-          snapRamps: snapRamps ? "1" : "", crop },
+          snapRamps: snapRamps ? "1" : "", crop, volumetric: volumetric ? "1" : "" },
       });
       send("done", { out: "/" + outRel, frames, fps, seconds: +((Date.now() - t0) / 1000).toFixed(1) });
     } catch (e) {
@@ -2259,6 +2432,155 @@ data: ${JSON.stringify(data)}
       // unless keepRun=1 asked for it (debugging the contract between the engines and the CLI).
       if (runDir && q.get("keepRun") !== "1") { try { await rm(runDir, { recursive: true, force: true }); } catch { /* best-effort */ } }
       else if (runDir) send("log", `[server] kept depth run: ${runDir}`);
+    }
+    res.end();
+    return;
+  }
+
+  // ---- 2D video to one volumetric clip per person (4DAnyone) ------------------------------
+  //   GET /avatar-convert?video=<abs>&name=<base>[&views=6&pitch=15&frames=61&turbo=1]
+  //       [&voxel=0.01&faces=40000&tex=1024&rekey=0.02][&people=all|1,2][&minHeight=0]
+  //       [&model=video-small&maxFrames=][&textureCodec=vp9&texSize=1024&crf=30][&keepRun=1]
+  // SSE: start, progress {stage, person, ...}, log, people [...], person {id, out}, done, error.
+  // The chain and every stage live in tools/avatar-run.mjs; this route owns the mask run, the
+  // service, the history rows and the stream.
+  if (path === "/avatar-convert") {
+    const q = url.searchParams;
+    const video = q.get("video") || "";
+    let okVideo = false;
+    try { okVideo = !!video && statSync(video).isFile(); } catch { okVideo = false; }
+    if (!okVideo) { res.writeHead(400, { ...HEADERS, "Content-Type": "text/plain" }); res.end(`not a file: ${video}`); return; }
+    // Number(null) and Number("") are both 0, so an absent knob whose range contains 0 would read
+    // as 0 rather than its default: that is how an omitted `rekey` became "mesh every frame afresh"
+    // and an omitted `pitch` a camera ring at eye level.
+    const num = (k, lo, hi, dflt) => {
+      const raw = q.get(k);
+      if (raw == null || raw === "") return dflt;
+      const v = Number(raw);
+      return Number.isFinite(v) && v >= lo && v <= hi ? v : dflt;
+    };
+    const knobs = {
+      views: num("views", 6, 48, AVATAR_DEFAULTS.views),
+      pitch: num("pitch", -15, 45, AVATAR_DEFAULTS.pitch),
+      frames: num("frames", 21, 121, AVATAR_DEFAULTS.frames),
+      turbo: q.get("turbo") !== "0",
+      voxel: num("voxel", 0.004, 0.05, AVATAR_DEFAULTS.voxel),
+      faces: num("faces", 2000, 200000, AVATAR_DEFAULTS.faces),
+      tex: num("tex", 256, 4096, AVATAR_DEFAULTS.tex),
+      rekey: num("rekey", 0, 1, AVATAR_DEFAULTS.rekey),
+      height: num("height", 256, 1280, AVATAR_DEFAULTS.height),
+      width: num("width", 256, 1280, AVATAR_DEFAULTS.width),
+    };
+    if ((knobs.frames - 1) % 4 !== 0) { res.writeHead(400, { ...HEADERS, "Content-Type": "text/plain" }); res.end(`frames must satisfy (frames - 1) % 4 == 0, got ${knobs.frames}`); return; }
+    if (knobs.views % 6 !== 0) { res.writeHead(400, { ...HEADERS, "Content-Type": "text/plain" }); res.end(`views must be a multiple of 6, got ${knobs.views}`); return; }
+    const base = (q.get("name") || basename(video).replace(/\.[^.]+$/, "")).replace(/[^a-z0-9._-]/gi, "_");
+    const want = (q.get("people") || "all").trim();
+    const wanted = want === "all" ? null : new Set(want.split(",").map((v) => Number(v.trim())).filter(Number.isFinite));
+    res.writeHead(200, { ...HEADERS, "Content-Type": "text/event-stream", Connection: "keep-alive" });
+    const send = (ev, data) => { if (!res.writableEnded) res.write(`event: ${ev}\ndata: ${JSON.stringify(data)}\n\n`); };
+    let closed = false, child = null, runDir = null, serviceJob = null;
+    const onChild = (c) => { child = c; };
+    req.on("close", () => {
+      closed = true;
+      try { if (child) child.kill(); } catch { /* ignore */ }
+      if (serviceJob) samJson("POST", "/depth/cancel", { job: serviceJob }).catch(() => {});
+    });
+    const t0 = Date.now();
+    const outputs = [];
+    try {
+      send("start", { video, name: base, knobs });
+      const missing = avatarMissing(ROOT);
+      if (missing.length) {
+        send("error", { message: `missing components: ${missing.map((m) => `${m.id} (${m.why})`).join(", ")}`, stage: "setup", missing });
+        res.end();
+        return;
+      }
+      if ((await gpuCached()).count === 0) {
+        send("error", { message: "CUDA device absent (nvidia-smi reports no NVIDIA GPU)", stage: "setup" });
+        res.end();
+        return;
+      }
+      if (!(await ensureOrEnd(["encoder", "ffmpeg", "sam3"], send, res))) return;
+      // --- the subject mask pass: one tracked id per person, over the whole clip.
+      const svc = await samEnsure(send, { purpose: "sam" });
+      if (svc !== true) { sendEnsureFailure(send, svc); res.end(); return; }
+      if (closed) return;
+      runDir = await mkdtemp(join(tmpdir(), "ares-avatar-"));
+      send("progress", { stage: "mask" });
+      const submit = await samJson("POST", "/depth/run", {
+        video, out: runDir, model: q.get("model") || "video-small", fps: null,
+        maxFrames: q.get("maxFrames") ? Number(q.get("maxFrames")) : null, inferWidth: 518, batch: 8,
+        ffmpeg: ffTools()?.ffmpeg ?? null, subject: "person", volumetric: false,
+      }, 20000);
+      serviceJob = submit?.json?.job ?? null;
+      if (!serviceJob) {
+        const why = submit ? (submit.json?.error || submit.json?.detail || submit.text || submit.status) : "no answer";
+        throw new Error(`depth service refused the mask job: ${typeof why === "string" ? why : JSON.stringify(why)}`);
+      }
+      send("log", `[server] mask job ${serviceJob} on the service (${basename(video)})`);
+      let lastLine = 0;
+      for (;;) {
+        if (closed) return;
+        await new Promise((r) => setTimeout(r, 1000));
+        const st = (await samJson("GET", `/depth/status?job=${encodeURIComponent(serviceJob)}`))?.json;
+        for (const line of (st?.log ?? []).slice(lastLine)) send("log", `[mask] ${line}`);
+        lastLine = Math.max(lastLine, (st?.log ?? []).length);
+        const mp = st?.phases?.mask;
+        if (mp?.done != null && mp?.total) send("progress", { stage: "mask", frame: mp.done, of: mp.total });
+        if (st?.state === "done") break;
+        if (st?.state === "error" || st?.error) throw new Error(st?.error || st?.errorCode || "mask pass failed");
+      }
+      serviceJob = null;
+      // --- one reference cutout and one 9:16 clip per person.
+      send("progress", { stage: "people" });
+      const people = await avatarPeople({ ROOT, runDir, frames: knobs.frames, minHeight: num("minHeight", 0, 4000, 0), send, onChild });
+      send("people", people.map((p) => ({ id: p.id, start: p.start, frames: p.frames, personHeightPx: p.personHeightPx, wholeBodyFrames: p.wholeBodyFrames })));
+      const chosen = people.filter((p) => !wanted || wanted.has(p.id));
+      if (!chosen.length) throw new Error(people.length ? "no person matched the selection" : "the mask pass found nobody with a long enough track");
+      // The mask pass and the reference cutouts are the last thing that needs SAM 3. Generation
+      // wants both cards whole (the 5B DiT is split across them), and a service holding SAM 3 and
+      // a depth model on cuda:0 is the difference between a run that fits and one that does not.
+      // It starts again on its own for the next job.
+      if (!(await samStop(send))) throw new Error("the SAM service would not stop, so cuda:0 is not free for generation");
+      samHold = `a 4DAnyone run on ${basename(video)}`;
+      for (const person of chosen) {
+        if (closed) return;
+        send("progress", { stage: "generate", person: person.id });
+        const result = await avatarGenerate({ ROOT, person, knobs, send, onChild });
+        if (closed) return;
+        send("progress", { stage: "mesh", person: person.id });
+        const frames = await avatarMesh({ ROOT, person, result, knobs, send, onChild });
+        if (closed) return;
+        const name = await versionedOutName(join(ROOT, "apps", "demo"), `${base}-p${person.id}`);
+        send("progress", { stage: "encode", person: person.id, name });
+        const outRel = await avatarEncode({
+          ROOT, dir: frames, name, knobs, send, onChild,
+          encoderArgs: (dir, out) => {
+            const args = [join(ROOT, "packages/encoder/dist/cli.js"), "encode", dir, "-o", out];
+            const pass = (k, f) => { const v = q.get(k); if (v != null && v !== "") args.push(f, v); };
+            pass("textureCodec", "--texture-codec"); pass("texSize", "--tex-size"); pass("crf", "--crf"); pass("gop", "--gop");
+            return args;
+          },
+        });
+        let frameCount = null, fps = null;
+        try { const m = JSON.parse(await readFile(join(ROOT, outRel) + ".meta.json", "utf8")); frameCount = m.output?.frames ?? null; fps = m.output?.fps ?? null; } catch { /* sidecar optional */ }
+        historyAdd({
+          kind: "encode", path: video, name: `${name}.ares`, out: "/" + outRel,
+          meta: { source: "avatar", person: person.id, views: knobs.views, pitch: knobs.pitch, frames: knobs.frames,
+            voxel: knobs.voxel, faces: knobs.faces, tex: knobs.tex, rekey: knobs.rekey,
+            codec: q.get("textureCodec") || "vp9", texSize: q.get("texSize") || "1024", crf: q.get("crf") || "30",
+            frameCount, fps },
+        });
+        outputs.push({ person: person.id, out: "/" + outRel, frames: frameCount });
+        send("person", { id: person.id, out: "/" + outRel, frames: frameCount });
+      }
+      send("done", { outputs, seconds: +((Date.now() - t0) / 1000).toFixed(1) });
+    } catch (e) {
+      send("error", { message: String((e && e.message) || e) });
+    } finally {
+      samHold = null;
+      if (runDir && q.get("keepRun") !== "1") { try { await rm(runDir, { recursive: true, force: true }); } catch { /* best-effort */ } }
+      else if (runDir) send("log", `[server] kept avatar run: ${runDir}`);
     }
     res.end();
     return;

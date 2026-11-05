@@ -1,9 +1,11 @@
 # Native Windows folder/file picker for the ARES dev server (/pick endpoint).
-# Spawned as:  powershell.exe -NoProfile -STA -WindowStyle Hidden -File tools\pick.ps1 -Type folder|file
+# Spawned as:  powershell.exe -NoProfile -STA -WindowStyle Hidden -File tools\pick.ps1 -Type folder|file|any
 # -STA is load-bearing: a WinForms dialog on an MTA thread hangs forever (serve.mjs enforces a timeout).
 # Writes ONLY the chosen absolute path to stdout (empty line on cancel).
+# -Type any: one file dialog that returns a file, or the folder it is showing when Open is pressed
+# with the preset name $FolderName in the name box (Windows has no dialog that selects both).
 param(
-  [ValidateSet('folder','file')] [string]$Type = 'folder',
+  [ValidateSet('folder','file','any')] [string]$Type = 'folder',
   [string]$Filter = 'All files (*.*)|*.*',
   [string]$InitialDirectory = ''
 )
@@ -37,6 +39,28 @@ try {
     $dlg.CheckFileExists = $true
     if ($InitialDirectory -and (Test-Path $InitialDirectory)) { $dlg.InitialDirectory = $InitialDirectory }
     if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) { $selected = $dlg.FileName }
+  } elseif ($Type -eq 'any') {
+    $FolderName = '(this folder)'
+    $dlg = New-Object System.Windows.Forms.OpenFileDialog
+    $dlg.Title = 'Open: video, frame sequence folder, .ares, .4ds'
+    $dlg.Filter = $Filter
+    $dlg.Multiselect = $false
+    $dlg.ValidateNames = $false
+    $dlg.CheckFileExists = $false
+    $dlg.CheckPathExists = $true
+    $dlg.FileName = $FolderName
+    if ($InitialDirectory -and (Test-Path $InitialDirectory)) { $dlg.InitialDirectory = $InitialDirectory }
+    if ($dlg.ShowDialog($owner) -eq [System.Windows.Forms.DialogResult]::OK) {
+      $selected = $dlg.FileName
+      if (-not (Test-Path -LiteralPath $selected)) {
+        # The dialog appends the selected filter's first extension to a name that does not exist.
+        $parent = Split-Path -Parent $selected
+        $leaf = Split-Path -Leaf $selected
+        $isFolder = $leaf -eq $FolderName -or $leaf.StartsWith($FolderName + '.')
+        if ($isFolder -and (Test-Path -LiteralPath $parent -PathType Container)) { $selected = $parent }
+        else { $selected = $null }
+      }
+    }
   } else {
     $dlg = New-Object System.Windows.Forms.FolderBrowserDialog
     $dlg.Description = 'Select the frames folder (OBJ / PLY meshes + atlas PNGs)'
